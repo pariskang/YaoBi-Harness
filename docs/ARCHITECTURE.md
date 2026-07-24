@@ -1,12 +1,16 @@
-# Yaobi-Harness V0.1 Architecture
+# Yaobi-Harness V0.0 Safety Skeleton
 
-The implementation encodes the V2.0 protocol as a deterministic, testable harness:
+This repository now intentionally describes the implementation as a safety skeleton rather than a complete V0.1 clinical agent.
 
-1. `IntakeAgent` screens red-flag evidence and computes information gaps.
-2. `PlannerAgent` creates a task graph for either urgent or routine care.
-3. Urgent care enters `UrgentCareAgent`; prescription and dose tools are denied by `CapabilityBroker`.
-4. Routine care runs biomedical, TCM pattern, expert-case, formula and dose agents.
-5. `DoseAgent` blocks every herb lacking case dose evidence or required special-population data.
-6. `CriticAgent` performs independent final checks before release.
+## Implemented now
 
-The offline runner can later be swapped with LangGraph nodes because all node transitions are state-in/state-out and every conclusion is linked to `Evidence` records.
+1. Raw Excel rows are converted to deidentified structured records before retrieval; direct identifiers are dropped and research IDs are irreversible hashes.
+2. Tool calls pass through `CapabilityBroker`, which enforces role/risk permissions and consumes the run budget.
+3. Critical tool errors move the run to `failed_closed` instead of registering fake guideline/pharmacopeia evidence.
+4. Urgent care is modeled as planner → urgent action → critic, with dynamic red-flag hypotheses and no prescription tools.
+5. Dose generation requires stratified expert-case dose evidence, special-population clearance, interaction clearance and risk-herb clearance.
+6. Skill manifests are loaded at runtime and can reject tools outside each skill capability contract.
+
+## Not implemented yet
+
+Real LangGraph execution, LLM-driven planning/question generation, checkpoint resume, licensed pharmacopoeia and interaction datasets, physician review UI, claim-level EvidenceBinder/CitationGuard and large adversarial evaluation remain future work.

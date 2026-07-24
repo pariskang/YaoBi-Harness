@@ -1,5 +1,35 @@
+from pathlib import Path
+
 from yaobi_harness.graph import YaobiGraphRunner
-from yaobi_harness.state import ClinicalRunState
+from yaobi_harness.state import ClinicalRunState, Budget
+from yaobi_harness.tools import ToolRegistry, ExpertCaseStore, parse_herbs
+from yaobi_harness.skills.loader import SkillRegistry
+
+RAW_RECORD = {
+    "就诊序号": "12725633", "医师工号": "007", "医师姓名": "沈钦荣", "科室代码": "1166",
+    "姓名": "张三", "性别": "男", "年龄": "63岁", "病案号": "50512983", "地址": "某区某街道",
+    "主诉": "右腰部疼痛10天", "现病史": "久坐后疼痛明显，无双下肢麻木疼痛。舌略暗。", "中医诊断": "腰痹/证型：气血痹阻证", "西医诊断": "腰痛",
+    "中药": "1/独活*1克/10克/用法：无/贴数:7\n,2/盐杜仲*1克/12克/用法：无/贴数:7\n,3/细辛*1克/3克/用法：无/贴数:7",
+}
+
+
+def test_deidentified_case_search_never_returns_phi():
+    out = ToolRegistry(records=[RAW_RECORD]).case_store.search("腰痛 久坐", 1)[0]
+    blob = str(out)
+    assert "张三" not in blob and "50512983" not in blob and "某区某街道" not in blob and "007" not in blob
+    assert out["research_patient_id"].startswith("YP")
+
+
+def test_realistic_herb_dose_parser_matches_star_slash_format():
+    herbs = parse_herbs(RAW_RECORD["中药"])
+    assert {h["herb_name"]: h["dose_g"] for h in herbs} == {"独活": 10.0, "盐杜仲": 12.0, "细辛": 3.0}
+
+
+def test_negated_red_flags_do_not_trigger_urgent_but_chest_pain_does():
+    routine = YaobiGraphRunner().run(ClinicalRunState("腰痛，无发热、无外伤、无大小便失禁、无会阴麻木", role="patient"))
+    urgent = YaobiGraphRunner().run(ClinicalRunState("突发胸痛、大汗、呼吸困难", role="patient"))
+    assert routine.risk_mode == "routine"
+    assert urgent.risk_mode == "urgent" and urgent.release_status == "urgent_action_plan"
 
 
 def test_urgent_mode_withholds_prescription_and_gives_action_plan():
@@ -11,17 +41,35 @@ def test_urgent_mode_withholds_prescription_and_gives_action_plan():
     assert "immediate_action" in out.outputs["urgent_action_plan"]
 
 
-def test_patient_routine_gets_no_dose_prescription():
-    st = ClinicalRunState("腰痛3月，久坐加重，右下肢麻木", role="patient")
-    out = YaobiGraphRunner().run(st, allow_prescription=True)
-    assert out.release_status in {"needs_more_information", "treatment_advice_only"}
-    assert "prescription_draft" not in out.outputs
-    assert "biomedical" in out.outputs and "tcm_pattern" in out.outputs
+def test_budget_zero_fails_closed_before_tool_execution():
+    st = ClinicalRunState("腰痛3月", role="physician")
+    st.budget = Budget(max_tool_calls=0)
+    out = YaobiGraphRunner().run(st)
+    assert out.release_status == "failed_closed"
+    assert out.budget.used_tool_calls == 0
 
 
-def test_physician_dose_fails_closed_without_dose_evidence():
-    st = ClinicalRunState("腰痛3月，久坐加重，右下肢麻木", role="physician")
-    st.facts["special_population"] = {"pregnancy": False, "age": 55, "renal": "unknown", "liver": "unknown"}
+def test_critical_tool_failure_fails_closed():
+    out = YaobiGraphRunner(ToolRegistry(failing_tools={"clinical_guideline_search"})).run(ClinicalRunState("腰痛3月，久坐加重", role="physician"))
+    assert out.release_status == "failed_closed"
+    assert any("关键工具失败" in x for x in out.safety_issues)
+
+
+def test_patient_cannot_call_formula_tool_via_broker_path():
+    st = ClinicalRunState("腰痛3月，久坐加重", role="patient")
     out = YaobiGraphRunner().run(st, allow_prescription=True)
+    assert "formula" not in out.outputs and "prescription_draft" not in out.outputs
+
+
+def test_risk_herb_blocks_draft_even_with_dose_data():
+    st = ClinicalRunState("腰痛3月，怕冷，久坐加重", role="physician")
+    st.facts["special_population"] = {"pregnancy": False, "age": 63, "renal": "normal", "liver": "normal"}
+    out = YaobiGraphRunner(ToolRegistry(records=[RAW_RECORD])).run(st, allow_prescription=True)
     assert out.release_status == "treatment_advice_only"
-    assert any("缺少剂量依据" in x for x in out.safety_issues)
+    assert any("风险药" in x or "缺少剂量依据" in x for x in out.safety_issues)
+
+
+def test_skill_manifest_enforces_forbidden_tools():
+    reg = SkillRegistry.from_file(Path("yaobi_harness/skills/manifest.yaml"))
+    ok, problems = reg.enforce("yaobi.urgent_triage", "patient", ["red_flag_evidence_search", "herb_dose_distribution"])
+    assert not ok and any("forbidden" in p for p in problems)

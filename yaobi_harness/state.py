@@ -82,10 +82,16 @@ class ClinicalRunState:
     budget: Budget = field(default_factory=Budget)
     requires_physician_approval: bool = True
 
-    def add_evidence(self, level: EvidenceLevel | str, source: str, summary: str, payload: dict[str, Any] | None = None) -> str:
+    def add_evidence(self, level: EvidenceLevel | str, source: str, summary: str, payload: dict[str, Any] | None = None, *, ok: bool = True, error: str | None = None) -> str:
         eid = f"E{len(self.evidence)+1:04d}"
-        self.evidence[eid] = Evidence(eid, str(level.value if isinstance(level, EvidenceLevel) else level), source, summary, payload or {})
+        data = dict(payload or {})
+        data.update({"tool_ok": ok, "tool_error": error})
+        self.evidence[eid] = Evidence(eid, str(level.value if isinstance(level, EvidenceLevel) else level), source, summary, data)
         return eid
+
+    def fail_closed(self, reason: str) -> None:
+        self.release_status = "failed_closed"
+        self.safety_issues.append(reason)
 
     def trace(self, agent: str, action: str, input_summary: str = "", output_summary: str = "", evidence_ids: list[str] | None = None) -> None:
         self.traces.append(AgentTrace(agent, action, input_summary, output_summary, evidence_ids or []))

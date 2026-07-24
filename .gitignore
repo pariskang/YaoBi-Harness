@@ -4,3 +4,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# Raw clinical data must stay outside git
+*.xlsx
+*.xls

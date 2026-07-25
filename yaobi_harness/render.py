@@ -1,0 +1,129 @@
+"""Role-scoped rendering of a finished run.
+
+The internal state carries other patients' (pseudonymised) case records, raw
+tool payloads and the full evidence ledger. Dumping all of that to whoever ran
+the query ignores purpose limitation, so nothing reaches a caller except
+through a view built for their role.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .state import NON_RELEASABLE_LEVELS, ClinicalRunState
+
+DISCLAIMER_PATIENT = "本内容为健康信息参考，不构成诊断或处方；如症状加重或出现急症信号请立即线下就医。"
+DISCLAIMER_PHYSICIAN = "本内容为决策支持草案，所有含剂量内容必须由医师逐味审核签名后方可作为处方。"
+DISCLAIMER_RESEARCHER = "本视图仅返回聚合统计，不返回个体病例自由文本。"
+
+
+def render(state: ClinicalRunState, role: str | None = None, *, debug: bool = False) -> dict[str, Any]:
+    """Build the caller-facing view for ``role``."""
+    if debug:
+        return state.to_dict()
+    role = role or state.role
+    if role == "patient":
+        return _patient_view(state)
+    if role == "researcher":
+        return _researcher_view(state)
+    return _physician_view(state)
+
+
+def _header(state: ClinicalRunState) -> dict[str, Any]:
+    return {
+        "run_id": state.run_id,
+        "role": state.role,
+        "risk_mode": state.risk_mode,
+        "release_status": state.release_status,
+        "planner_mode": state.planner_mode,
+    }
+
+
+def _patient_view(state: ClinicalRunState) -> dict[str, Any]:
+    view: dict[str, Any] = {
+        **_header(state),
+        "disclaimer": DISCLAIMER_PATIENT,
+        "questions_for_you": state.open_questions,
+        "safety_notices": state.safety_issues + state.warnings,
+    }
+    if state.risk_mode == "urgent" and "urgent_action_plan" in state.outputs:
+        plan = state.outputs["urgent_action_plan"]
+        view["urgent"] = {
+            k: plan[k]
+            for k in ("risk_judgement", "why_urgent", "immediate_action", "transport_advice",
+                      "during_transport", "do_not", "tell_clinicians", "escalate_if", "uncertainty")
+            if k in plan
+        }
+        return view
+
+    biomedical = state.outputs.get("biomedical", {})
+    view["what_this_might_be"] = biomedical.get("differentials", [])
+    view["what_to_do_next"] = biomedical.get("exam_advice", [])
+    view["see_a_doctor_if"] = [
+        "出现大小便困难或失禁、会阴/肛周麻木",
+        "腿越来越无力、走路不稳、抬不起脚",
+        "发热寒战、夜间痛醒、体重明显下降",
+        "外伤后无法负重或剧痛进行性加重",
+    ]
+    # Expert case records and the raw evidence ledger are deliberately withheld.
+    return view
+
+
+def _physician_view(state: ClinicalRunState) -> dict[str, Any]:
+    outputs = state.outputs
+    return {
+        **_header(state),
+        "disclaimer": DISCLAIMER_PHYSICIAN,
+        "intake": outputs.get("intake"),
+        "plan": outputs.get("plan"),
+        "timeline": outputs.get("timeline"),
+        "biomedical": outputs.get("biomedical"),
+        "tcm_pattern": outputs.get("tcm_pattern"),
+        "expert_cases": outputs.get("expert_cases"),
+        "formula": outputs.get("formula"),
+        "dose_safety": outputs.get("dose_safety"),
+        "prescription_draft": outputs.get("prescription_draft"),
+        "physician_review": outputs.get("physician_review"),
+        "urgent_action_plan": outputs.get("urgent_action_plan"),
+        "safety_audit": outputs.get("safety_audit"),
+        "safety_issues": state.safety_issues,
+        "warnings": state.warnings,
+        "open_questions": state.open_questions,
+        "missing_information": state.missing_information,
+        "claims": [
+            {"id": c.claim_id, "kind": c.kind, "text": c.text, "evidence_ids": c.evidence_ids,
+             "confidence": c.confidence, "origin": c.origin}
+            for c in state.claims
+        ],
+        "evidence_ledger": [
+            {"id": e.evidence_id, "level": e.level, "source": e.source, "summary": e.summary,
+             "source_version": e.source_version, "releasable": e.level not in NON_RELEASABLE_LEVELS}
+            for e in state.evidence.values()
+        ],
+        "run_meta": outputs.get("run_meta"),
+    }
+
+
+def _researcher_view(state: ClinicalRunState) -> dict[str, Any]:
+    cases = state.outputs.get("expert_cases", {})
+    return {
+        **_header(state),
+        "disclaimer": DISCLAIMER_RESEARCHER,
+        "counts": {
+            "similar_cases": len(cases.get("similar", [])),
+            "counterexamples": len(cases.get("counterexamples", [])),
+            "evidence_items": len(state.evidence),
+            "claims": len(state.claims),
+        },
+        "dose_safety": state.outputs.get("dose_safety"),
+        "evidence_levels": _level_histogram(state),
+        "safety_issues": state.safety_issues,
+        "run_meta": state.outputs.get("run_meta"),
+    }
+
+
+def _level_histogram(state: ClinicalRunState) -> dict[str, int]:
+    histogram: dict[str, int] = {}
+    for evidence in state.evidence.values():
+        histogram[evidence.level] = histogram.get(evidence.level, 0) + 1
+    return histogram

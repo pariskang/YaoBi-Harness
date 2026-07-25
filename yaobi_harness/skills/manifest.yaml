@@ -1,0 +1,34 @@
+skills:
+  - skill_id: yaobi.timeline
+    version: 2.0.0
+    allowed_tools: [patient_timeline_search]
+    output_schema: PatientEventGraph
+  - skill_id: yaobi.intake
+    version: 2.0.0
+    allowed_tools: [red_flag_evidence_search]
+    hard_requirements: [information_gap, risk_mode]
+  - skill_id: yaobi.urgent_triage
+    version: 2.0.0
+    allowed_roles: [patient, physician]
+    allowed_tools: [red_flag_evidence_search, emergency_resource_lookup, clinical_guideline_search]
+    forbidden_tools: [formula_composition_search, herb_dose_distribution]
+    hard_requirements: [immediate_action, transport_advice, uncertainty_statement]
+    output_schema: UrgentCarePlan
+  - skill_id: yaobi.biomedical_differential
+    version: 2.0.0
+    allowed_tools: [clinical_guideline_search]
+  - skill_id: yaobi.tcm_pattern
+    version: 2.0.0
+    allowed_tools: [tcm_pattern_knowledge_search]
+  - skill_id: yaobi.expert_case_reasoning
+    version: 2.0.0
+    allowed_tools: [similar_case_search, counterexample_case_search]
+  - skill_id: yaobi.formula_design
+    version: 2.0.0
+    allowed_roles: [physician]
+    allowed_tools: [formula_composition_search]
+  - skill_id: yaobi.dose_generation
+    version: 2.0.0
+    allowed_roles: [physician]
+    allowed_tools: [herb_dose_distribution, pharmacopeia_check, interaction_check, special_population_check]
+    hard_requirements: [dose_evidence_ids, physician_review_pending]

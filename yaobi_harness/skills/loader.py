@@ -37,6 +37,8 @@ class SkillRegistry:
             specs[spec.skill_id]=spec
         return cls(specs)
     def enforce(self, skill_id: str, role: str, requested_tools: list[str]) -> tuple[bool, list[str]]:
+        if skill_id not in self.specs:
+            return False, [f"skill {skill_id} not found"]
         spec=self.specs[skill_id]; problems=[]
         if spec.allowed_roles and role not in spec.allowed_roles: problems.append(f"role {role} not allowed")
         forbidden=set(spec.forbidden_tools).intersection(requested_tools)

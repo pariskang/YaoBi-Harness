@@ -32,6 +32,7 @@ class Evidence:
     source: str
     summary: str
     payload: dict[str, Any] = field(default_factory=dict)
+    source_version: str | None = None
 
 @dataclass
 class AgentTrace:
@@ -82,11 +83,12 @@ class ClinicalRunState:
     budget: Budget = field(default_factory=Budget)
     requires_physician_approval: bool = True
 
-    def add_evidence(self, level: EvidenceLevel | str, source: str, summary: str, payload: dict[str, Any] | None = None, *, ok: bool = True, error: str | None = None) -> str:
+    def add_evidence(self, level: EvidenceLevel | str, source: str, summary: str, payload: dict[str, Any] | None = None, *, ok: bool = True, error: str | None = None, source_version: str | None = None) -> str:
         eid = f"E{len(self.evidence)+1:04d}"
         data = dict(payload or {})
         data.update({"tool_ok": ok, "tool_error": error})
-        self.evidence[eid] = Evidence(eid, str(level.value if isinstance(level, EvidenceLevel) else level), source, summary, data)
+        evidence_level = "failed_tool_event" if not ok else str(level.value if isinstance(level, EvidenceLevel) else level)
+        self.evidence[eid] = Evidence(eid, evidence_level, source, summary, data, source_version)
         return eid
 
     def fail_closed(self, reason: str) -> None:

@@ -16,10 +16,10 @@ python -m yaobi_harness inspect-xlsx /path/to/authorized_deidentified_or_local_r
 
 * `ClinicalRunState`：保存问诊、风险、任务图、证据台账、Agent 轨迹、预算和发布状态。
 * `CapabilityBroker`：按角色、风险模式、工具健康和预算动态授权；急症和患者端均禁止方剂/剂量工具。
-* `ExpertCaseStore`：读取 Excel 后删除姓名、病案号、地址、医师工号等直接标识，只返回研究 ID 与授权临床字段。
+* `ExpertCaseStore`：读取 Excel 后删除姓名、病案号、地址、医师工号、就诊序号等直接标识，日期泛化到月份，并只返回初步假名化研究 ID 与授权临床字段；尚未完成完整再识别风险评估。
 * `red_flag_evidence_search`：支持否定语境过滤，并覆盖马尾、感染/肿瘤、骨折、进展神经缺损和胸痛呼吸困难等非腰痛急症信号。
-* `DoseAgent`：按证型/年龄分层检索剂量；任一药味缺少剂量依据、特殊人群信息缺失、相互作用或风险药专项审查失败时降级为非处方建议。
-* `SkillRegistry`：加载 Skill manifest 并执行角色、allowed tools 和 forbidden tools 约束。
+* `DoseAgent`：按证型/年龄/药名别名分层检索剂量；未接入授权药典范围、样本量不足、异常值、特殊人群信息缺失、用药/过敏史未确认、相互作用或风险药专项审查失败时均禁止含克数草案。
+* `SkillRegistry`：Graph 运行时加载 Skill manifest，并在 Broker 工具调用前执行角色、allowed tools 和 forbidden tools 约束。
 
 ## 尚未完成
 

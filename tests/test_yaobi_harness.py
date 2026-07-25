@@ -66,10 +66,42 @@ def test_risk_herb_blocks_draft_even_with_dose_data():
     st.facts["special_population"] = {"pregnancy": False, "age": 63, "renal": "normal", "liver": "normal"}
     out = YaobiGraphRunner(ToolRegistry(records=[RAW_RECORD])).run(st, allow_prescription=True)
     assert out.release_status == "treatment_advice_only"
-    assert any("风险药" in x or "缺少剂量依据" in x for x in out.safety_issues)
+    assert any("风险药" in x or "可靠剂量依据" in x or "授权药典范围" in x for x in out.safety_issues)
 
 
 def test_skill_manifest_enforces_forbidden_tools():
     reg = SkillRegistry.from_file(Path("yaobi_harness/skills/manifest.yaml"))
     ok, problems = reg.enforce("yaobi.urgent_triage", "patient", ["red_flag_evidence_search", "herb_dose_distribution"])
     assert not ok and any("forbidden" in p for p in problems)
+
+
+def test_contextual_red_flags_ignore_family_hypothetical_and_past_recovered():
+    for text in ["父亲患癌，本人只是久坐腰酸", "如果以后胸痛怎么办，目前无不适", "去年曾跌倒且已经痊愈", "慢性骨质疏松，多年无新发症状", "单纯夜间腰痛"]:
+        out = YaobiGraphRunner().run(ClinicalRunState(text, role="patient"))
+        assert out.risk_mode == "routine", text
+    urgent = YaobiGraphRunner().run(ClinicalRunState("突然不能排尿、下身迟钝、双腿越来越无力", role="patient"))
+    assert urgent.risk_mode == "urgent"
+
+
+def test_single_case_999g_cannot_create_dose_draft_without_authorized_ranges_and_min_n():
+    bad = dict(RAW_RECORD)
+    bad["中药"] = "\n".join([f",{i}/{h}*1克/999克/用法：无/贴数:7" for i, h in enumerate(["独活","桑寄生","杜仲","牛膝","当归","川芎","白芍","熟地黄","党参","茯苓","甘草"], 1)])
+    st = ClinicalRunState("腰痛3月，久坐加重", role="physician")
+    st.facts.update({"special_population": {"pregnancy": False, "age": 63, "renal": "normal", "liver": "normal"}, "medications_confirmed": True, "allergies_confirmed": True})
+    out = YaobiGraphRunner(ToolRegistry(records=[bad])).run(st, allow_prescription=True)
+    assert out.release_status == "treatment_advice_only"
+    assert "prescription_draft" not in out.outputs
+
+
+def test_physician_review_rejects_incomplete_risk_herb():
+    result = ToolRegistry().physician_review_submit({"prescription_hash": "abc", "herbs": [{"herb_name": "附片"}]}, {"附片": True}, physician_id="D1", signature="sig")
+    assert not result.ok
+    assert any("risk_herb" in p or "missing_dose" in p for p in result.data["problems"])
+
+
+def test_skill_manifest_is_used_by_runner_when_deleted_or_denied(tmp_path):
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text("skills:\n  - skill_id: yaobi.intake\n    version: 2.0.0\n    allowed_tools: []\n", encoding="utf-8")
+    out = YaobiGraphRunner(skill_manifest=manifest).run(ClinicalRunState("腰痛", role="patient"))
+    assert out.release_status == "failed_closed"
+    assert any("skill_policy_denied" in x for x in out.safety_issues)

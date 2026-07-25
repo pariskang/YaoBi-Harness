@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yaobi-harness"
-version = "0.1.0"
+version = "0.0.1"
 description = "Evidence-governed multi-agent clinical decision support harness for Yaobi"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,7 @@ dependencies = []
 xlsx = ["openpyxl>=3.1"]
 langgraph = ["langgraph>=0.2"]
 llm = ["openai>=1.0"]
+test = ["pytest>=8"]
 
 [project.scripts]
 yaobi-harness = "yaobi_harness.cli:main"

@@ -6,7 +6,7 @@ from ..tools import CapabilityBroker, ToolRegistry, RISK_HERBS
 MINIMUM_INFO = ["起病时间", "疼痛部位/放射", "神经症状", "大小便/会阴感觉", "发热外伤肿瘤史", "妊娠/年龄/肝肾功能", "当前用药/过敏", "舌脉"]
 
 def record_tool(state: ClinicalRunState, result, level: EvidenceLevel | str) -> str:
-    return state.add_evidence(level, result.tool, result.summary, result.data, ok=result.ok, error=result.error)
+    return state.add_evidence(level, result.tool, result.summary, result.data, ok=result.ok, error=result.error, source_version=result.source_version)
 
 def require_ok(state: ClinicalRunState, result, context: str) -> bool:
     if result.ok: return True
@@ -77,13 +77,14 @@ class DoseAgent:
     def run(self,state,tools,broker):
         herbs=state.outputs.get("formula",{}).get("herbs",[]); pat=state.outputs.get("tcm_pattern",{}).get("primary_pattern")
         facts=state.facts.get("special_population",{}); meds=state.facts.get("medications",[]); allergies=state.facts.get("allergies",[])
-        dist=tools.call(broker,"herb_dose_distribution",herbs=herbs,pattern=pat,age=facts.get("age")); sp=tools.call(broker,"special_population_check",**facts); inter=tools.call(broker,"interaction_check",herbs=herbs,medications=meds,allergies=allergies); pharm=tools.call(broker,"pharmacopeia_check",herbs=herbs)
+        dist=tools.call(broker,"herb_dose_distribution",herbs=herbs,pattern=pat,age=facts.get("age")); sp=tools.call(broker,"special_population_check",**facts); inter=tools.call(broker,"interaction_check",herbs=herbs,medications=meds,allergies=allergies,medications_confirmed=state.facts.get("medications_confirmed", False),allergies_confirmed=state.facts.get("allergies_confirmed", False)); pharm=tools.call(broker,"pharmacopeia_check",herbs=herbs)
         ids=[record_tool(state,dist,EvidenceLevel.EXPERT_CASE),record_tool(state,sp,EvidenceLevel.TOOL),record_tool(state,inter,EvidenceLevel.TOOL),record_tool(state,pharm,EvidenceLevel.TOOL)]
         if not all(x.ok for x in [dist,sp,inter,pharm]): state.fail_closed("处方安全关键工具失败"); return state
-        missing=[h for h,v in dist.data.get("distributions",{}).items() if not v.get("median_g")]
-        risk=[c["herb"] for c in pharm.data.get("checked",[]) if not c.get("ok")]
-        if missing or not sp.data.get("pass") or not inter.data.get("pass") or risk:
-            state.safety_issues += [x for x in [f"缺少剂量依据: {missing}" if missing else "", f"特殊人群必要信息缺失或风险: {sp.data}" if not sp.data.get("pass") else "", f"相互作用/过敏风险: {inter.data.get('risk_flags')}" if not inter.data.get("pass") else "", f"风险药需专项审查: {risk}" if risk else ""] if x]
+        missing=[h for h,v in dist.data.get("distributions",{}).items() if not v.get("median_g") or not v.get("meets_min_n") or v.get("outlier_flag")]
+        range_fail=[c["herb"] for c in pharm.data.get("checked",[]) if not c.get("authorized_range_available") or not c.get("ok")]
+        risk=[c["herb"] for c in pharm.data.get("checked",[]) if c.get("risk_flags")]
+        if missing or range_fail or not sp.data.get("pass") or not inter.data.get("pass") or risk:
+            state.safety_issues += [x for x in [f"缺少可靠剂量依据/样本量不足/异常值: {missing}" if missing else "", f"缺少授权药典范围或范围未通过: {range_fail}" if range_fail else "", f"特殊人群必要信息缺失或风险: {sp.data}" if not sp.data.get("pass") else "", f"相互作用/过敏风险: {inter.data.get('risk_flags')}" if not inter.data.get("pass") else "", f"风险药需专项审查: {risk}" if risk else ""] if x]
             state.release_status="treatment_advice_only"; state.trace("DoseAgent","dose_blocked",evidence_ids=ids,output_summary="剂量/特殊人群/相互作用/风险药未通过"); return state
         state.outputs["prescription_draft"]={"formula_name":state.outputs["formula"]["formula_name"],"herbs":[{"herb_name":h,"dose_value":dist.data["distributions"][h]["median_g"],"dose_unit":"g","processing":"需药师/医师确认炮制","administration":"常规煎服","clinical_role":"按治法配伍","dose_evidence_ids":[ids[0]],"risk_flags":[],"physician_status":"pending"} for h in herbs],"decoction":{"frequency":"每日1剂","times_per_day":2,"duration_days":7},"overall_uncertainty":"medium","requires_physician_approval":True}
         state.release_status="draft_for_physician"; state.trace("DoseAgent","dose_generated",evidence_ids=ids); return state

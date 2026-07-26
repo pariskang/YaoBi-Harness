@@ -198,11 +198,60 @@ class ToolLoopTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.mode, "schema_violation")
 
-    def test_non_json_output_voids_the_answer(self):
-        loop, _ = make_loop(ScriptedModel([LLMResponse(text="我觉得是气滞血瘀证")]))
+    def test_non_json_output_still_never_becomes_an_answer(self):
+        """A prose reply gets one reformatting turn, then is rejected outright."""
+        model = ScriptedModel([LLMResponse(text="我觉得是气滞血瘀证")])
+        loop, _ = make_loop(model)
         result = loop.run("辨证", {}, "PatternAssessment")
         self.assertFalse(result.ok)
-        self.assertEqual(result.mode, "invalid_output")
+        self.assertIsNone(result.output)
+        self.assertEqual(result.repairs, 1, "exactly one repair turn is allowed")
+
+    def test_a_prose_reply_is_recovered_when_the_model_complies_on_retry(self):
+        """A formatting miss must not discard the evidence the model gathered.
+
+        Falling back wholesale over a missing code-fence is why runs reported
+        "已回退确定性逻辑" while the model had actually done the work.
+        """
+        model = ScriptedModel([
+            LLMResponse(text="我觉得是气滞血瘀证，理由如下……"),
+            LLMResponse(text=json.dumps({
+                "primary_pattern": "气滞血瘀",
+                "candidate_patterns": ["寒湿"],
+                "citations": [],
+            }, ensure_ascii=False)),
+        ])
+        loop, _ = make_loop(model)
+        result = loop.run("辨证", {}, "PatternAssessment")
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["primary_pattern"], "气滞血瘀")
+        self.assertEqual(result.repairs, 1)
+
+    def test_the_repair_turn_shows_the_schema_again(self):
+        captured: list[str] = []
+
+        def record(messages):
+            captured.append(messages[-1]["content"])
+            return LLMResponse(text=json.dumps(
+                {"primary_pattern": "气滞血瘀", "candidate_patterns": []}, ensure_ascii=False))
+
+        model = ScriptedModel([LLMResponse(text="散文回答"), record])
+        loop, _ = make_loop(model)
+        result = loop.run("辨证", {}, "PatternAssessment")
+        self.assertTrue(result.ok)
+        self.assertTrue(captured)
+        self.assertIn("只输出一个 JSON 对象", captured[0])
+        self.assertIn("primary_pattern", captured[0])
+
+    def test_a_dose_leak_is_never_given_a_second_chance(self):
+        """Re-prompting a dose leak invites a reworded dose leak."""
+        model = ScriptedModel([LLMResponse(text=json.dumps(
+            {"primary_pattern": "气滞血瘀 当归12克", "candidate_patterns": []}, ensure_ascii=False))])
+        loop, _ = make_loop(model)
+        result = loop.run("辨证", {}, "PatternAssessment")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.mode, "dose_in_output")
+        self.assertEqual(result.repairs, 0)
 
     def test_model_error_falls_back(self):
         class Broken:

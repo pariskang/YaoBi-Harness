@@ -9,7 +9,9 @@ signal or emit a dose. Every provider therefore only has to implement
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -93,8 +95,25 @@ class NullLLMClient:
         return LLMResponse(text="", provider="null", model="none")
 
 
+#: Trailing comma before a closing brace or bracket — the single most common
+#: piece of model JSON sloppiness, and strictly a syntax slip: no content is
+#: ambiguous, so repairing it changes nothing about what the model said.
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
 def extract_json(text: str, default: Any = None) -> Any:
-    """Parse JSON from a model response, tolerating code fences and prose."""
+    """Parse JSON from a model response, tolerating the ways models really answer.
+
+    Liberal in the *shape* it accepts, because every consumer validates the
+    *content* afterwards: schemas check required fields and types, the plan
+    validator checks agents and tools, the broker checks capability. Rejecting a
+    payload for a trailing comma buys none of that safety and silently drops the
+    whole model-driven path to its deterministic fallback.
+
+    Handled: code fences (with or without a language tag), prose before or after
+    the object, trailing commas, and Python-dict-literal quoting. Not handled, on
+    purpose: anything requiring a guess about meaning.
+    """
     if not text:
         return default
     candidate = text.strip()
@@ -103,15 +122,44 @@ def extract_json(text: str, default: Any = None) -> Any:
         candidate = candidate.split("\n", 1)[1] if "\n" in candidate else candidate
         if candidate.lstrip().startswith("json"):
             candidate = candidate.lstrip()[4:]
-    try:
-        return json.loads(candidate)
-    except (ValueError, TypeError):
-        pass
+
+    for attempt in _json_candidates(candidate):
+        parsed = _loads_tolerant(attempt)
+        if parsed is not None:
+            return parsed
+    return default
+
+
+def _json_candidates(candidate: str) -> list[str]:
+    """The whole string, then the widest brace- and bracket-delimited spans."""
+    spans = [candidate]
     for opener, closer in (("{", "}"), ("[", "]")):
         start, end = candidate.find(opener), candidate.rfind(closer)
         if 0 <= start < end:
-            try:
-                return json.loads(candidate[start : end + 1])
-            except (ValueError, TypeError):
-                continue
-    return default
+            spans.append(candidate[start : end + 1])
+    return spans
+
+
+def _loads_tolerant(text: str) -> Any:
+    """Strict JSON, then trailing-comma repair, then a Python literal.
+
+    ``ast.literal_eval`` is the right last resort for single-quoted output: it
+    parses dict/list literals and evaluates nothing, so it cannot execute a model
+    response. ``json.loads`` is always tried first, so well-formed JSON never
+    takes this path.
+    """
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    repaired = _TRAILING_COMMA_RE.sub(r"\1", text)
+    if repaired != text:
+        try:
+            return json.loads(repaired)
+        except (ValueError, TypeError):
+            pass
+    try:
+        value = ast.literal_eval(repaired)
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return None
+    return value if isinstance(value, (dict, list)) else None

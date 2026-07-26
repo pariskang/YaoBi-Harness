@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .knowledge import ortho_interactions
+from .knowledge.store import KnowledgeStore
 from .llm.base import ToolSpec
 from .safety import incompatibility as incompat
 from .safety import red_flags
@@ -190,6 +192,8 @@ class ToolRegistry:
         *,
         deid_key: str | None = None,
         max_attempts: int = 2,
+        knowledge: KnowledgeStore | None = None,
+        drug_normalizer: Any | None = None,
     ) -> None:
         if records is not None:
             self.case_store = ExpertCaseStore.from_records(records, deid_key=deid_key)
@@ -200,6 +204,10 @@ class ToolRegistry:
         self.failing_tools = set(failing_tools or set())
         self.authorized_ranges = dict(authorized_ranges or {})
         self.max_attempts = max(1, max_attempts)
+        #: Optional licensed knowledge store (guidelines, labels, dose ranges, DDIs).
+        self.knowledge = knowledge
+        #: Optional live RxNorm connector for medication name resolution.
+        self.drug_normalizer = drug_normalizer
         self.tools: dict[str, Callable[..., ToolResult]] = {
             "red_flag_evidence_search": self.red_flag_evidence_search,
             "similar_case_search": self.similar_case_search,
@@ -214,6 +222,9 @@ class ToolRegistry:
             "formula_composition_search": self.formula_composition_search,
             "physician_review_submit": self.physician_review_submit,
             "patient_timeline_search": self.patient_timeline_search,
+            "drug_interaction_check": self.drug_interaction_check,
+            "drug_label_lookup": self.drug_label_lookup,
+            "drug_normalize": self.drug_normalize,
         }
 
     # ------------------------------------------------------------- dispatching
@@ -273,24 +284,43 @@ class ToolRegistry:
         )
 
     # --------------------------------------------------------------- knowledge
-    def clinical_guideline_search(self, topic: str) -> ToolResult:
-        """Placeholder guideline source.
+    def clinical_guideline_search(self, topic: str, limit: int = 5) -> ToolResult:
+        """Search the licensed guideline store, falling back to a labelled stub.
 
-        Returns ``is_stub=True`` so the evidence ledger records it as
-        ``stub_not_for_clinical_use``; it can support navigation but can never
-        be cited as guideline-grade support for a released claim.
+        A hit from the store is genuine guideline-grade evidence and carries the
+        guideline name, version, publication date and evidence grade. With no
+        store configured — or no match — the result is explicitly a stub and is
+        recorded as ``stub_not_for_clinical_use``.
         """
+        if self.knowledge is not None:
+            hits = self.knowledge.search_guidelines(topic, limit=limit)
+            if hits:
+                return ToolResult(
+                    "clinical_guideline_search",
+                    True,
+                    f"授权指南库命中{len(hits)}条: {hits[0]['title']}",
+                    {
+                        "topic": topic,
+                        "guidelines": hits,
+                        "citations": [h["provenance"] for h in hits],
+                        "points": [r for h in hits for r in h.get("recommendations", [])][:12],
+                    },
+                    evidence_level=EvidenceLevel.GUIDELINE.value,
+                    source_version=hits[0]["provenance"].get("version") or hits[0]["provenance"].get("source_id"),
+                )
         return ToolResult(
             "clinical_guideline_search",
             True,
-            "本地占位指南摘要（非授权指南数据源）",
+            "本地占位指南摘要（未配置授权指南数据源）",
             {
                 "topic": topic,
                 "guideline_id": "local_stub.not_for_clinical_release",
+                "guidelines": [],
                 "points": [
                     "先筛查马尾综合征、感染、肿瘤、骨折、进行性神经缺损、骨筋膜室综合征及非腰痛急症",
                     "红旗或持续/进展神经根症状需线下评估与影像",
                 ],
+                "how_to_fix": "运行 `python -m yaobi_harness knowledge build` 并按授权摄取 NICE/VA-DoD/中华医学会 指南",
             },
             evidence_level=EvidenceLevel.GUIDELINE.value,
             source_version="stub-guideline-v3",
@@ -382,12 +412,13 @@ class ToolRegistry:
         doses = doses or {}
         checked: list[dict[str, Any]] = []
         for herb in herbs:
-            rng = self.authorized_ranges.get(herb)
+            rng, provenance = self._authorized_range(herb)
             proposed = doses.get(herb)
             entry: dict[str, Any] = {
                 "herb": herb,
                 "authorized_range_available": bool(rng),
                 "range_g": list(rng) if rng else None,
+                "range_source": provenance,
                 "proposed_dose_g": proposed,
                 "dose_checked": proposed is not None,
                 "dose_within_range": None,
@@ -406,18 +437,123 @@ class ToolRegistry:
             )
             checked.append(entry)
         unverified = [c["herb"] for c in checked if c["dose_checked"] is False]
+        from_store = [c for c in checked if (c.get("range_source") or {}).get("source_id")]
         return ToolResult(
             "pharmacopeia_check",
             True,
             "药典/正式范围与拟用剂量校验",
             {
-                "version": "authorized_ranges_stub" if self.authorized_ranges else "no_authorized_pharmacopeia_dataset",
+                "version": self._pharmacopeia_version(),
                 "checked": checked,
+                "citations": [c["range_source"] for c in from_store],
                 "doses_not_submitted_for_check": unverified,
                 "pass": all(c["ok"] for c in checked) and not unverified and bool(checked),
             },
-            evidence_level=EvidenceLevel.PHARMACOPEIA.value if self.authorized_ranges else EvidenceLevel.TOOL.value,
-            is_stub=not self.authorized_ranges,
+            # Only a licensed pharmacopoeia earns pharmacopoeia-grade evidence;
+            # a locally configured range table is an ordinary tool result.
+            evidence_level=EvidenceLevel.PHARMACOPEIA.value if from_store else EvidenceLevel.TOOL.value,
+            is_stub=not from_store and not self.authorized_ranges,
+        )
+
+    def _authorized_range(self, substance: str) -> tuple[tuple[float, float] | None, dict[str, Any] | None]:
+        """Prefer a licensed pharmacopoeia range over a locally configured one."""
+        if self.knowledge is not None:
+            entry = self.knowledge.dose_range(substance)
+            if entry:
+                return (float(entry["min_value"]), float(entry["max_value"])), {
+                    **entry["provenance"], "basis": entry.get("basis", ""), "unit": entry.get("unit", "g"),
+                }
+        rng = self.authorized_ranges.get(substance)
+        return (rng, {"source_id": "", "source": "locally_configured_ranges"} if rng else None)
+
+    def _pharmacopeia_version(self) -> str:
+        if self.knowledge is not None and self.knowledge.enabled_sources():
+            return "knowledge_store:" + ",".join(self.knowledge.enabled_sources())
+        return "authorized_ranges_stub" if self.authorized_ranges else "no_authorized_pharmacopeia_dataset"
+
+    # ------------------------------------------------------------ medications
+    def drug_interaction_check(
+        self,
+        medications: list[str],
+        conditions: list[str] | None = None,
+        include_herbs: list[str] | None = None,
+    ) -> ToolResult:
+        """Screen a medication list for orthopaedic drug-drug interactions.
+
+        Combines the in-repo orthopaedic rule pack with any licensed
+        interaction data in the knowledge store. Findings are returned most
+        severe first, each with mechanism, management and its source.
+        """
+        meds = [str(m) for m in (medications or []) if str(m).strip()]
+        rule_hits = ortho_interactions.evaluate(meds, conditions or [])
+        store_hits = self.knowledge.interactions_for(meds) if self.knowledge is not None else []
+        blocking = ortho_interactions.blocking(rule_hits) + [
+            h for h in store_hits if h.get("severity") in ortho_interactions.BLOCKING_SEVERITIES
+        ]
+        herb_violations = incompat.check_combination(include_herbs or [])
+        return ToolResult(
+            "drug_interaction_check",
+            True,
+            f"药物相互作用筛查: {len(rule_hits)}条规则命中, {len(store_hits)}条数据库命中",
+            {
+                "medications": meds,
+                "conditions": sorted({str(c) for c in (conditions or [])}),
+                "rule_findings": rule_hits,
+                "database_findings": store_hits,
+                "herb_combination_violations": herb_violations,
+                "blocking": blocking,
+                "pass": not blocking and not herb_violations,
+                "rule_pack": ortho_interactions.rule_pack_summary(),
+                "coverage_note": (
+                    "内置规则包只覆盖骨科高频高危组合；未接入授权 DDI 数据库时不能视为完整相互作用审查"
+                    if not store_hits else "内置规则包 + 授权相互作用数据库"
+                ),
+            },
+            evidence_level=EvidenceLevel.TOOL.value,
+            is_stub=not store_hits and not rule_hits,
+        )
+
+    def drug_label_lookup(self, ingredient: str, sections: list[str] | None = None) -> ToolResult:
+        """Return authorised label sections (interactions, contraindications, dosing)."""
+        if self.knowledge is None:
+            return ToolResult(
+                "drug_label_lookup", True, "未配置说明书知识库",
+                {"ingredient": ingredient, "sections": [], "how_to_fix": "运行 knowledge build 摄取 openFDA/DailyMed/NMPA 说明书"},
+                is_stub=True,
+            )
+        from .knowledge.store import LABEL_SECTIONS
+
+        found = self.knowledge.label_sections(ingredient, sections or LABEL_SECTIONS)
+        return ToolResult(
+            "drug_label_lookup",
+            True,
+            f"{ingredient}: 命中{len(found)}个说明书章节",
+            {
+                "ingredient": ingredient,
+                "sections": found,
+                "citations": [f["provenance"] for f in found],
+            },
+            evidence_level=EvidenceLevel.PHARMACOPEIA.value if found else EvidenceLevel.TOOL.value,
+            is_stub=not found,
+        )
+
+    def drug_normalize(self, name: str) -> ToolResult:
+        """Resolve a free-text medication name to RxCUI + ATC classes.
+
+        Requires a configured RxNorm connector; without one the harness falls
+        back to the rule pack's own bilingual class matching, which needs no
+        network access.
+        """
+        classes = ortho_interactions.classify(name)
+        if self.drug_normalizer is None:
+            return ToolResult(
+                "drug_normalize", True, f"{name}: 本地类别匹配",
+                {"input": name, "rxcui": None, "atc": [], "local_classes": classes, "mode": "offline_class_match"},
+            )
+        resolved = self.drug_normalizer.normalize(name)
+        return ToolResult(
+            "drug_normalize", True, f"{name}: RxNorm 标准化",
+            {**resolved, "local_classes": classes, "mode": "rxnorm"},
         )
 
     def interaction_check(
@@ -725,6 +861,17 @@ def tool_specs() -> list[ToolSpec]:
         ToolSpec("special_population_check", "妊娠/年龄/肝肾功能等特殊人群信息完备性与风险审查",
                  {"type": "object", "properties": {"pregnancy": {"type": "boolean"}, "age": {"type": "integer"},
                                                     "renal": {"type": "string"}, "liver": {"type": "string"}}}),
+        ToolSpec("drug_interaction_check", "骨科药物相互作用筛查（内置规则包 + 授权 DDI 库）",
+                 {"type": "object", "properties": {"medications": {"type": "array", "items": {"type": "string"}},
+                                                    "conditions": {"type": "array", "items": {"type": "string"},
+                                                                   "description": "如 renal_impairment, planned_neuraxial_anesthesia"},
+                                                    "include_herbs": herb_array}, "required": ["medications"]}),
+        ToolSpec("drug_label_lookup", "查询授权说明书章节（相互作用/禁忌/剂量/特殊人群）",
+                 {"type": "object", "properties": {"ingredient": {"type": "string"},
+                                                    "sections": {"type": "array", "items": {"type": "string"}}},
+                  "required": ["ingredient"]}),
+        ToolSpec("drug_normalize", "将自由文本药名标准化为 RxCUI 与 ATC 分类",
+                 {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
         ToolSpec("physician_review_submit", "提交处方草案给医师逐味审核签名",
                  {"type": "object", "properties": {"prescription": {"type": "object"}, "approvals": {"type": "object"},
                                                     "physician_id": {"type": "string"}, "signature": {"type": "string"}},

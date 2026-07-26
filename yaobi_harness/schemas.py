@@ -46,6 +46,11 @@ SCHEMAS: dict[str, dict[str, tuple[bool, tuple[type, ...]]]] = {
         "counterexamples": (True, (list,)),
         "limitation": (True, (str,)),
     },
+    "MedicationSafety": {
+        "findings": (True, (list,)),
+        "medications_reviewed": (True, (list,)),
+        "reviewed": (True, (bool,)),
+    },
     "FormulaCandidate": {
         "formula_name": (True, (str,)),
         "herbs": (True, (list,)),

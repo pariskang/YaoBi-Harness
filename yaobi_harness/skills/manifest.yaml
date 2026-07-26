@@ -62,6 +62,15 @@ skills:
     output_key: expert_cases
     hard_requirements: [similar, limitation]
 
+  - skill_id: yaobi.medication_safety
+    version: 3.1.0
+    description: 现有西药相互作用、禁忌与围术期风险筛查
+    allowed_tools: [drug_interaction_check, drug_label_lookup, drug_normalize]
+    forbidden_tools: [formula_composition_search, herb_dose_distribution, physician_review_submit]
+    output_schema: MedicationSafety
+    output_key: medication_safety
+    hard_requirements: [findings, medications_reviewed, reviewed]
+
   - skill_id: yaobi.formula_design
     version: 3.0.0
     description: 候选治法与方剂设计

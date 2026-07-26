@@ -63,12 +63,38 @@ python -m yaobi_harness run --llm-provider poe --llm-model Claude-Sonnet-4.5 --c
 未设置 `YAOBI_LLM_PROVIDER` 时使用 `NullLLMClient`，全流程确定性运行；显式指定了 provider 但凭据不全会**直接报错**，
 避免配置错误伪装成"正常的规则输出"。
 
+## 接入授权知识库
+
+指南、药典与相互作用数据不随仓库分发——仓库只提供连接器和**在写入时强制执行的许可模型**。
+完整来源目录、文件格式与摄取配方见 [docs/KNOWLEDGE.md](docs/KNOWLEDGE.md)。
+
+```bash
+export YAOBI_DEPLOYMENT_MODE=research_noncommercial     # 或 commercial
+python -m yaobi_harness knowledge sources               # 各来源当前是否可用及原因
+python -m yaobi_harness knowledge build --store ./knowledge.db --cache-dir ./.kcache
+python -m yaobi_harness knowledge check-interactions --medications 布洛芬 华法林
+python -m yaobi_harness run --role physician --knowledge-store ./knowledge.db --complaint "..."
+```
+
+* **开箱可用（CC0/公有领域）**：openFDA 说明书、DailyMed SPL、RxNorm/RxClass，以及内置的骨科相互作用规则包
+  （18 条规则 / 30 个药物类别）和十八反十九畏规则包。
+* **非商业**：WHO 指南与国际药典、DDInter 2.0 —— 在 `commercial` 模式下写入直接被拒绝。
+* **只读**：AAOS、中华医学会、NMPA 文件、香港衞生署 —— 只存标题/版本/链接/摘录要点，全文永不入库。
+* **须授权**：NICE、《中国药典》2025、NMPA 说明书、USP–NF、EP、DrugBank、BNF/Stockley's —— 未登记
+  `YAOBI_LICENSE_ATTESTATIONS` 前完全禁用。
+
+接入后的行为变化：授权指南命中即为 `guideline_or_standard` 级证据（不再是 stub）；授权药典范围优先于本地配置表
+并逐味比对拟用剂量；医师与研究者视图输出 `citations`，逐条给出来源、许可、版本、发布日期与检索时间。
+
 ## 安全能力
 
 * **红旗筛查**：子句级否定/家族史/假设语境判定，覆盖马尾、心肺、DVT/PE、感染肿瘤、化脓性关节炎/骨髓炎、骨折、
   进行性神经缺损、脊髓型颈椎病、骨筋膜室综合征；硬信号立即升级，弱信号走"需线下检查"而非丢弃；不确定时向上升级。
 * **剂量安全**：分层专家剂量 → 最小样本量/离散度/异常值 → **拟用剂量与授权药典范围逐味比对** → 特殊人群 →
   用药过敏确认 → 十八反/十九畏/妊娠禁忌；任一不通过即降级为 `treatment_advice_only`，不产出克数。
+* **用药安全**：`MedicationSafetyAgent` 对患者现有西药做骨科相互作用筛查（NSAIDs+抗凝、三重打击、阿片+镇静、
+  曲马多+SSRI、双膦酸盐+钙剂、秋水仙碱+CYP3A4 抑制剂、围术期抗凝与椎管内麻醉等）；`contraindicated`/`major`
+  会阻断并把放行状态抬到 `needs_examination`，患者视图给出通俗的处理建议。
 * **能力经纪**：角色/风险模式/技能清单/熔断/预算按序检查，**被拒绝的调用不扣预算**；技能缺失即拒绝（fail-closed）。
 * **证据台账**：等级由**工具自身**声明，占位数据源记为 `stub_not_for_clinical_use`，不可被提升为指南级；
   逐断言引用校验（CitationGuard）对高风险结论强制要求可放行证据。
@@ -80,11 +106,12 @@ python -m yaobi_harness run --llm-provider poe --llm-model Claude-Sonnet-4.5 --c
 
 ## 仍未完成
 
-真实授权指南/药典/相互作用数据库、LangGraph 原生 interrupt/resume、医师审批 UI、多轮问诊状态机、
-大规模对抗性安全评测与红旗召回率基线仍未实现。**本项目不能对外宣称为临床可用系统。**
+LangGraph 原生 interrupt/resume、医师审批 UI、多轮问诊状态机、中文指南的结构化推荐抽取、
+大规模对抗性安全评测与红旗召回率基线仍未实现。内置骨科规则包不能替代完整的相互作用数据库，
+且须经本机构药师/医师复核后启用。**本项目不能对外宣称为临床可用系统。**
 
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 77 个用例，无需 pytest
+python -m unittest discover -s tests    # 128 个用例，无需 pytest 与网络
 ```

@@ -59,6 +59,7 @@ def _patient_view(state: ClinicalRunState) -> dict[str, Any]:
     biomedical = state.outputs.get("biomedical", {})
     view["what_this_might_be"] = biomedical.get("differentials", [])
     view["what_to_do_next"] = biomedical.get("exam_advice", [])
+    view["medication_warnings"] = _patient_medication_warnings(state)
     view["see_a_doctor_if"] = [
         "出现大小便困难或失禁、会阴/肛周麻木",
         "腿越来越无力、走路不稳、抬不起脚",
@@ -67,6 +68,45 @@ def _patient_view(state: ClinicalRunState) -> dict[str, Any]:
     ]
     # Expert case records and the raw evidence ledger are deliberately withheld.
     return view
+
+
+def _patient_medication_warnings(state: ClinicalRunState) -> list[dict[str, str]]:
+    """Plain-language version of the interaction findings, without the mechanism jargon."""
+    safety = state.outputs.get("medication_safety", {})
+    return [
+        {
+            "combination": finding.get("title", ""),
+            "severity": finding.get("severity", ""),
+            "what_to_do": finding.get("management", ""),
+        }
+        for finding in safety.get("findings", [])
+        if finding.get("severity") in ("contraindicated", "major")
+    ]
+
+
+def citation_bundle(state: ClinicalRunState) -> list[dict[str, str]]:
+    """Every external source cited by this run, with version and retrieval date.
+
+    A clinical answer has to be able to say which guideline, which label version
+    and which pharmacopoeia edition it rests on; this collects them from the
+    evidence payloads so any view can show them.
+    """
+    seen: dict[str, dict[str, str]] = {}
+    for evidence in state.evidence.values():
+        for citation in evidence.payload.get("citations", []) or []:
+            if not isinstance(citation, dict):
+                continue
+            key = f"{citation.get('source_id')}|{citation.get('version')}|{citation.get('url')}"
+            seen.setdefault(key, citation)
+        for finding in evidence.payload.get("rule_findings", []) or []:
+            if isinstance(finding, dict) and finding.get("source_id"):
+                seen.setdefault(f"rule|{finding['source_id']}", {
+                    "source_id": finding["source_id"],
+                    "source": "Yaobi 骨科相互作用规则包",
+                    "license": "MIT (this repository)",
+                    "version": finding.get("rule_id", ""),
+                })
+    return list(seen.values())
 
 
 def _physician_view(state: ClinicalRunState) -> dict[str, Any]:
@@ -80,6 +120,8 @@ def _physician_view(state: ClinicalRunState) -> dict[str, Any]:
         "biomedical": outputs.get("biomedical"),
         "tcm_pattern": outputs.get("tcm_pattern"),
         "expert_cases": outputs.get("expert_cases"),
+        "medication_safety": outputs.get("medication_safety"),
+        "citations": citation_bundle(state),
         "formula": outputs.get("formula"),
         "dose_safety": outputs.get("dose_safety"),
         "prescription_draft": outputs.get("prescription_draft"),
@@ -116,6 +158,7 @@ def _researcher_view(state: ClinicalRunState) -> dict[str, Any]:
             "claims": len(state.claims),
         },
         "dose_safety": state.outputs.get("dose_safety"),
+        "citations": citation_bundle(state),
         "evidence_levels": _level_histogram(state),
         "safety_issues": state.safety_issues,
         "run_meta": state.outputs.get("run_meta"),

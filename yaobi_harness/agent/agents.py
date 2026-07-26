@@ -67,6 +67,14 @@ def record_tool(state: ClinicalRunState, result: ToolResult) -> str:
     )
 
 
+def _finding_label(finding: dict[str, Any]) -> str:
+    """Human-readable name for a rule-pack hit or a database interaction row."""
+    title = finding.get("title")
+    if title:
+        return str(title)
+    return f"{finding.get('subject', '?')}+{finding.get('object', '?')}"
+
+
 def require_ok(state: ClinicalRunState, result: ToolResult, context: str) -> bool:
     if result.ok:
         return True
@@ -287,6 +295,67 @@ class ExpertCaseAgent(BaseAgent):
             "limitation": "已脱敏的单一专家经验库，不代表因果疗效证据",
         }
         state.trace(self.name, "retrieve_cases", evidence_ids=evidence_ids)
+        return state
+
+
+class MedicationSafetyAgent(BaseAgent):
+    """Screens the patient's existing western medications.
+
+    This runs for every role on the routine path, because the highest-value
+    finding a musculoskeletal service can make is often not the diagnosis but
+    "the NSAID you are taking alongside your warfarin is a bleeding risk". A
+    blocking finding escalates the run to ``needs_examination`` rather than
+    letting ordinary advice go out unqualified.
+    """
+
+    name = "MedicationSafetyAgent"
+    skill_id = "yaobi.medication_safety"
+
+    def run(self, state, tools, broker):
+        medications = [str(m) for m in state.facts.get("medications", []) if str(m).strip()]
+        conditions = [str(c) for c in state.facts.get("conditions", []) if str(c).strip()]
+        if not medications:
+            state.outputs["medication_safety"] = {
+                "findings": [],
+                "medications_reviewed": [],
+                "note": "未提供当前用药清单；无法进行相互作用审查",
+                "reviewed": False,
+            }
+            state.missing_information = list(dict.fromkeys(state.missing_information + ["当前用药清单"]))
+            state.trace(self.name, "no_medication_list")
+            return state
+
+        result = tools.call(
+            broker, "drug_interaction_check",
+            medications=medications, conditions=conditions,
+            include_herbs=herbs_in(state.outputs.get("formula", {}).get("herbs", [])),
+        )
+        evidence_id = record_tool(state, result)
+        if not require_ok(state, result, "drug_interaction"):
+            return state
+
+        findings = result.data.get("rule_findings", []) + result.data.get("database_findings", [])
+        blocking = result.data.get("blocking", [])
+        state.outputs["medication_safety"] = {
+            "findings": findings,
+            "blocking": blocking,
+            "medications_reviewed": medications,
+            "conditions_considered": result.data.get("conditions", []),
+            "coverage_note": result.data.get("coverage_note", ""),
+            "reviewed": True,
+        }
+        for finding in findings:
+            state.add_claim(
+                "drug_interaction",
+                f"{finding.get('title') or finding.get('subject')} [{finding.get('severity')}]",
+                [evidence_id], confidence=0.7,
+            )
+        if blocking:
+            state.safety_issues += [f"用药安全: {_finding_label(f)} ({f.get('severity')})" for f in blocking]
+            if state.release_status in ("needs_more_information", "treatment_advice_only"):
+                state.release_status = "needs_examination"
+        state.trace(self.name, "interaction_screen", evidence_ids=[evidence_id],
+                    output_summary=f"{len(findings)}条发现, {len(blocking)}条需阻断")
         return state
 
 

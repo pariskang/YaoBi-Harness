@@ -42,6 +42,10 @@ AGENT_CATALOG: dict[str, AgentSpec] = {
     "BiomedicalAgent": AgentSpec("BiomedicalAgent", "yaobi.biomedical_differential", "西医鉴别诊断与查体/影像建议", ("clinical_guideline_search",)),
     "TCMPatternAgent": AgentSpec("TCMPatternAgent", "yaobi.tcm_pattern", "中医辨证与反证需求", ("tcm_pattern_knowledge_search",)),
     "ExpertCaseAgent": AgentSpec("ExpertCaseAgent", "yaobi.expert_case_reasoning", "相似病例与反例检索", ("similar_case_search", "counterexample_case_search")),
+    "MedicationSafetyAgent": AgentSpec(
+        "MedicationSafetyAgent", "yaobi.medication_safety", "现有西药相互作用、禁忌与围术期风险筛查",
+        ("drug_interaction_check", "drug_label_lookup", "drug_normalize"),
+    ),
     "FormulaAgent": AgentSpec(
         "FormulaAgent", "yaobi.formula_design", "候选治法与方剂组成", ("formula_composition_search",),
         roles=("physician",), risk_modes=("routine",), prescriptive=True,
@@ -80,6 +84,7 @@ def rule_plan(state: ClinicalRunState) -> list[Task]:
             Task("N1", "BiomedicalAgent", "西医鉴别", ["clinical_guideline_search"]),
             Task("N2", "TCMPatternAgent", "辨证论治", ["tcm_pattern_knowledge_search"]),
             Task("N3", "ExpertCaseAgent", "相似与反例病例", ["similar_case_search", "counterexample_case_search"]),
+            Task("N7", "MedicationSafetyAgent", "现有用药相互作用与禁忌筛查", ["drug_interaction_check"]),
             Task("N4", "FormulaAgent", "候选治法方剂", ["formula_composition_search"], ["N1", "N2", "N3"]),
             Task(
                 "N5", "DoseAgent", "逐味剂量与安全校验",

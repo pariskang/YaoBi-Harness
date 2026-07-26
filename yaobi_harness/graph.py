@@ -18,8 +18,8 @@ from typing import Any
 from . import schemas
 from .agent.agents import (
     BiomedicalAgent, CriticAgent, DoseAgent, ExpertCaseAgent, FormulaAgent,
-    IntakeAgent, PhysicianReviewAgent, TCMPatternAgent, TimelineAgent,
-    UrgentCareAgent, UrgentPlannerAgent,
+    IntakeAgent, MedicationSafetyAgent, PhysicianReviewAgent, TCMPatternAgent,
+    TimelineAgent, UrgentCareAgent, UrgentPlannerAgent,
 )
 from .agent.planner import AGENT_CATALOG, PlannerAgent
 from .llm.base import NullLLMClient
@@ -56,6 +56,7 @@ class YaobiGraphRunner:
             "BiomedicalAgent": BiomedicalAgent(self.llm),
             "TCMPatternAgent": TCMPatternAgent(self.llm),
             "ExpertCaseAgent": ExpertCaseAgent(self.llm),
+            "MedicationSafetyAgent": MedicationSafetyAgent(self.llm),
             "FormulaAgent": FormulaAgent(self.llm),
             "DoseAgent": DoseAgent(self.llm),
             "PhysicianReviewAgent": PhysicianReviewAgent(self.llm),
@@ -209,6 +210,21 @@ class YaobiGraphRunner:
                 "llm_tokens": f"{state.budget.used_llm_tokens}/{state.budget.max_llm_tokens}",
             },
             "tool_health": self.health.snapshot(),
+            "knowledge": self._knowledge_meta(),
+        }
+
+    def _knowledge_meta(self) -> dict[str, Any]:
+        """Which external sources backed this run, and under which licence policy."""
+        store = getattr(self.tools, "knowledge", None)
+        if store is None:
+            return {
+                "configured": False,
+                "note": "未配置授权知识库；指南与药典证据为占位数据，仅内置规则包可用",
+            }
+        return {
+            "configured": True,
+            "enabled_sources": store.enabled_sources(),
+            "policy": store.policy.to_dict(),
         }
 
     # ---------------------------------------------------------------------- run

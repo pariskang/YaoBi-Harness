@@ -17,6 +17,10 @@
    └───────────────────────────┬────────────────────────────┘
    ┌───────────────────────────▼────────────────────────────┐
    │ tools · de-identified expert-case store · safety tables│
+   └───────────────────────────┬────────────────────────────┘
+   ┌───────────────────────────▼────────────────────────────┐
+   │ knowledge (licence-gated, operator-ingested)           │
+   │  guidelines · drug labels · dose ranges · interactions │
    └────────────────────────────────────────────────────────┘
 ```
 
@@ -42,6 +46,11 @@
 6. **Screening escalates on ambiguity.** Suppression is clause-scoped and needs
    an explicit negation / third-party / hypothetical / history cue, with present
    -tense cues vetoing history cues.
+7. **Licences are enforced at write time.** `KnowledgeStore` rejects a
+   non-commercial dataset in a commercial deployment, strips body text from
+   read-only sources, and keeps credentialed sources closed without an
+   attestation. The repository therefore ships connectors, never content. See
+   [KNOWLEDGE.md](KNOWLEDGE.md).
 
 ## LLM containment
 

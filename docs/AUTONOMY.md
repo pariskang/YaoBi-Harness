@@ -40,6 +40,57 @@ system: 角色 + 风险模式 + 技能说明(instructions) + 输出 schema + 硬
 4. **预算**：LLM 调用数与 token 数受 `Budget` 限制；耗尽 → 回退。
 5. **步数**：`max_steps` 封顶；超限 → 回退。
 
+### 宽进严出：接受模型真实写出的形状，严格校验它的内容
+
+这一条是从一次真实故障里学来的。Colab 运行报 `规划来源: rule`、`计划说明: llm_responded`
+——模型答了，计划没用上，而且没有任何告警。逐一测量十二种称职模型都会写出的计划形状，
+**七种被直接丢弃**（裸任务列表、`plan` / `task_plan` / `steps` 包装、`agent` 写成
+`name` / `agent_name`、嵌套 `plan.tasks`、只给 Agent 名），另有两种解析成功但
+**悄悄丢掉了依赖结构**（`id` 没有变成 `task_id`，`dependencies` 没有变成 `depends_on`，
+任务图被拍平）。最终作答一侧同样如此：尾随逗号与单引号字典都被拒收。
+
+判断依据是：**内容在后面每一层都会被校验**——schema 查字段与类型，计划校验器查
+Agent 白名单与技能工具表，能力经纪查权限。所以为一个尾随逗号拒收一份提案买不到任何安全，
+只会把整条模型驱动路径静默降级。
+
+因此形状宽容，含义绝不猜测：
+
+| 维度 | 接受 |
+| --- | --- |
+| 计划容器 | `tasks` / `plan` / `task_plan` / `steps` / `graph` / `task_graph` / `nodes` / 裸列表 / 一层嵌套 |
+| Agent 字段 | `agent` / `agent_name` / `name` / `agent_id` |
+| 任务 ID | `task_id` / `id` / `step_id` / `node_id` |
+| 工具字段 | `required_tools` / `tools` / `tool_names` |
+| 依赖字段 | `depends_on` / `dependencies` / `depends` / `after` / `requires` |
+| 文本形状 | 代码块（带/不带语言标记）、前后散文、尾随逗号、Python 字典字面量 |
+
+**不接受任何需要猜测含义的东西**：裸字符串只在**精确命中 `AGENT_CATALOG`** 时才被当成
+Agent 名——模糊匹配等于让解析器替模型猜意图，这是它唯一不能做的事。单引号字典走
+`ast.literal_eval`（只解析字面量、不求值，无法执行模型回复），且 `json.loads` 永远先试。
+
+回退时的 `note` 会说清是哪一种，因为 `planner_mode: rule` 本身无法诊断：
+
+| note | 含义 |
+| --- | --- |
+| `llm_plan_accepted` | 提案通过校验，任务图由模型生成 |
+| `llm_not_configured` | 未配置模型（完整可用的确定性路径） |
+| `llm_plan_rejected:<原因>` | 提案越权，整体驳回，不会被部分采纳 |
+| `llm_plan_unparseable:<原因>` | 有回复，但没有可识别的 Agent 名或任务结构 |
+| `llm_budget_exhausted` | 预算用尽，规划阶段未发起请求 |
+| `llm_error:<原因>` | 调用失败；失败不会让整次运行失败 |
+
+后四种都同时写入 `state.warnings`，所以操作者在控制台和 CLI 输出里都能看到原因。
+
+### 格式失误给一次重提，安全失误不给
+
+作答不合 schema 时，工具循环补发**一轮**"只输出一个 JSON 对象"并重新附上 schema。
+理由和上一节相同：不该为少一个代码块丢掉模型已经做完的取证——那正是运行报
+「已回退确定性逻辑」而模型其实干完了活的原因。
+
+可重提：`invalid_output`、`schema_violation`。
+**不可重提：`dose_in_output`。** 重提一次剂量泄漏只会换个说法再泄一次，
+所以它一次就作废。重提次数记在自主执行台账的 `repairs` 里，控制台会显示。
+
 ### 参数错误是可恢复的，不是失败
 
 模型第一次常常传错参数。系统把这类错误与真正的工具故障**严格区分**：

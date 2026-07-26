@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-454%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-490%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -19,6 +19,16 @@ Yaobi-Harness 是一个 **证据受控的骨科/腰痹多智能体临床决策�
 LLM 在本系统中是**只能加安全、不能减安全**的执行者：它可以规划、选工具、下结论，但看不到技能未授权的工具、
 不能发明 Agent、不能清除规则层命中的风险信号、**永远不能生成剂量**。任何一步越界（越权/输出不合 schema/
 出现克数/预算或步数耗尽）都会**整体回退**到确定性逻辑，而不是带病放行。未配置模型时，全流程确定性运行。
+
+**宽进严出**：模型输出的*形状*被宽容对待，*内容*被严格校验。计划可以写成 `tasks` /
+`plan` / `task_plan` / `steps` / 裸列表，Agent 可以写在 `agent` / `agent_name` / `name`，
+依赖可以写成 `depends_on` / `dependencies` / `after`；作答可以带代码块、前后散文、
+尾随逗号、单引号字典。理由是内容在后面每一层都会被校验（schema 查字段与类型，
+计划校验器查 Agent 白名单与技能工具表，能力经纪查权限），所以为一个尾随逗号拒收
+一份提案买不到任何安全，只会把整条模型驱动路径静默降级成规则路径。
+含义则绝不猜测：裸字符串只在**精确命中 Agent 目录**时才接受。
+回退时 `note` 会说清是哪一种——未配置 / 提案被驳回 / 回复无法解析 / 预算用尽，
+而不是只显示 `rule`。
 
 自主性的确切边界见 [docs/AUTONOMY.md](docs/AUTONOMY.md)；
 问诊追问见 [docs/INTERVIEW.md](docs/INTERVIEW.md)，
@@ -155,6 +165,14 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 四个视图：**对话问诊**（多轮）、**单次运行**（完整病例检查器）、**用药速查**（只做相互作用筛查）、
 **知识库**（来源目录、许可状态、技能表、专家语料、规则包全文）。后端是普通 JSON API，可被其他前端复用。
 
+单次运行页把本文档里的每一项能力都做成了控件：**召集多学科会诊**勾选后出现
+**会诊并发线程**（1–8，并发只改调用时序不改证据台账）；**录制可复核日志**勾选后
+多出一个**离线复核**标签页——用录制的日志重新推导这次决策，先给结论
+（放行状态、风险模式、规划来源、证据条数逐项对照），并且可以**改写主诉再复核**，
+此时日志按请求内容寻址、病历一变就对不上，运行故障关闭并列出偏离的请求哈希。
+「规划与执行」页现在还会说明**为什么**用了确定性计划，而不只是显示「规则」。
+控制台的日志只存在内存里、不落盘——它和聊天记录一样是临床内容。
+
 需要分享给同事评审时可映射成公开链接（会**强制**生成访问令牌并拼进 URL）：
 
 ```bash
@@ -166,9 +184,11 @@ python -m yaobi_harness ui --public --knowledge-store ./knowledge.db
 > ⚠️ 公网链接是**演示/评审链接，不是临床部署**：令牌只是演示级门禁，没有逐用户身份、没有访问审计、
 > 没有院内网络边界。**不要在公开实例里输入任何真实患者可识别信息。** 默认仍只监听 `127.0.0.1`。
 
-**Colab**：点顶部徽章直接打开 `notebooks/Yaobi_Harness_Colab.ipynb`，十节完整走查——
+**Colab**：点顶部徽章直接打开 `notebooks/Yaobi_Harness_Colab.ipynb`，十六节完整走查——
 安装自检 → 确定性运行 → 骨科规则包 → 实时构建知识库 → 授权药典如何改变放行 →
-xlsx 变技能 → 模型自主执行 → 多轮对话 → 接入 LLM → 内嵌控制台（含 ngrok 公开链接）。
+xlsx 变技能 → 模型自主执行 → 多轮对话 → **自主追问（十问歌 × 专科）** →
+**会诊子体** → **视觉判读** → **技能库** → **并发会诊** → **重放日志** →
+接入 LLM（含模型输出形状容忍度的逐项验证）→ 内嵌控制台（含离线复核与 ngrok 公开链接）。
 
 ## 快速开始
 
@@ -312,7 +332,10 @@ python -m yaobi_harness run --role physician --knowledge-store ./knowledge.db --
 * **并发下台账仍可复现**：成员写各自的 `MemberScope`，按名单顺序合并分配证据 ID；
   `Budget` 与 `ToolHealth` 都是读-改-写，已加锁——否则"硬上限"和"两次熔断"在并发下都名不副实。
 * **重放要么复现，要么明说**：调用按内容地址记录，同序号不同调用即判偏离并故障关闭；
-  偏离被锁存，不依赖异常穿透那些合法的 catch。
+  偏离被锁存，不依赖异常穿透那些合法的 catch。日志耗尽后实跑的尾部不计入"已复现"。
+* **格式失误给一次重提，安全失误不给**：作答不合 schema 时补发一轮"只输出 JSON"并附上
+  schema，因为不该为少一个代码块丢掉模型已经做完的取证；但**输出含克数不重提**——
+  重提只会换个说法再泄一次。重提次数记录在自主执行台账里。
 
 ## 仍未完成
 
@@ -326,5 +349,5 @@ LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 454 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 490 个用例，无需 pytest 与网络
 ```

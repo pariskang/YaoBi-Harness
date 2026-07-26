@@ -35,22 +35,53 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 | `--ngrok-authtoken` / `--ngrok-region` | 覆盖 `NGROK_AUTHTOKEN` / 选择区域 |
 | `--no-vision` | 即使配置了视觉模型也禁用 |
 | `--skill-dir` | 追加 `SKILL.md` 根目录（最高优先级），可重复 |
+| `--panel-concurrency` | 会诊并发线程的默认值（页面可逐次覆盖；1 为顺序执行） |
 
 ## 四个视图
 
 **诊疗运行** — 左侧填写病例，右侧看结果。
 左侧支持：交付对象（患者/医师/研究者）、主诉、五个示例病例、当前用药（中英逗号分隔）、
-患者状态标签（决定条件门控规则是否触发）、结构化事实 JSON、是否允许含剂量草案、是否启用 LLM 规划。
+患者状态标签（决定条件门控规则是否触发）、结构化事实 JSON，以及四个开关：
+
+| 开关 | 作用 |
+| --- | --- |
+| 允许生成含剂量草案 | 仅医师角色生效，仍需逐味审核签名 |
+| 启用 LLM 规划与审查 | 关掉即可与确定性路径对照 |
+| 召集多学科会诊 | 勾选后展开**会诊并发线程**（1–8）。并发只改调用时序，不改证据台账 |
+| 录制可复核日志 | 记录每一次工具与模型调用，运行后在「离线复核」页重放 |
+
 右侧标签页：
 
 | 标签 | 内容 |
 | --- | --- |
 | 交付内容 | 该角色实际收到的答复，带角色对应的免责声明 |
-| 规划与执行 | 规划来源（LLM 提案是否被采纳）、任务图、每个 Agent 的状态、工具与输出摘要 |
+| 规划与执行 | **自主执行**面板（模型选了哪个工具、传了什么参数、格式重提了几次、绑定了哪条证据）、任务图、每个 Agent 的状态，以及**规划来源的诊断** |
+| 问诊与会诊 | 问诊轴覆盖率、实际问出的问题、充分性裁决；会诊成员意见与合议 |
 | 用药安全 | 相互作用发现，含严重度、机制、处理措施、命中药物与类别映射、触发条件 |
+| 离线复核 | 仅在录制后出现：用日志重新推导这次决策并逐项对照；可改写主诉再复核 |
 | 证据台账 | 每条证据的等级与可放行性；结论↔证据的绑定；外部来源的许可/版本/发布日期/检索时间 |
 | 安全审查 | 终结节点裁决、告警、修复请求、缺证据的结论、已执行的检查清单 |
 | 原始 JSON | 完整响应，便于排查 |
+
+### 规划来源要能被诊断
+
+「规划与执行」页此前在回退时只显示「规则」，而这三件完全不同的事都会显示成「规则」：
+没有配置模型、提案被规则层驳回、模型有回复但解析不出任务。操作者无法区分，
+也就无法处理。现在 `audit.plan.note` 随响应返回，页面把每一种翻译成一句人话，
+并把原始 note 一并显示——见 [AUTONOMY.md](AUTONOMY.md#格式失误给一次重提安全失误不给)。
+
+### 离线复核
+
+结论放在最前面，因为一次重放的价值在**对照**，而不在第二个答案：
+放行状态、风险模式、规划来源、任务状态、按台账顺序的证据逐项比对。
+时间戳与 run_id 被刻意排除——它们必然不同，比对它们会把每次重放都报成偏离。
+「已复现」还额外要求日志没有耗尽：耗尽后实跑的尾部是重新推导，不是重放。
+
+**改写主诉再复核**是这一页真正的用途："如果病史读起来不一样，这份日志还能支撑那个结论吗？"
+日志按请求内容寻址，所以答案是响亮的失败，并列出偏离的请求哈希。
+
+日志**只存在内存里、从不落盘**，保留最近 20 次；理由和控制台不持久化聊天记录相同——
+都是临床内容。要落盘用 CLI 的 `--journal`。
 
 **用药速查** — 不跑完整病例，只做相互作用筛查。适合门诊快速核对。
 
@@ -82,13 +113,19 @@ storage 被拦时，刷新只能靠它。
 | GET | `/api/health` | 存活检查 |
 | GET | `/api/bootstrap` | LLM/知识库/许可策略/规则摘要/示例病例 |
 | GET | `/api/rules` | 完整规则包与药物类别表 |
-| POST | `/api/run` | `{complaint, role, facts, allow_prescription, use_llm}` → `{delivered, audit, meta}` |
+| POST | `/api/run` | `{complaint, role, facts, allow_prescription, use_llm, enable_panel, panel_concurrency, record_journal, images}` → `{delivered, audit, meta, journal?}` |
+| POST | `/api/replay` | `{run_id, complaint?, facts?}` → `{fidelity, journal, delivered, audit, meta}` |
 | POST | `/api/interactions` | `{medications, conditions}` → 相互作用筛查结果 |
 | POST | `/api/chat` | `{message, role, session_id?}` → `{session_id, reply, audit, meta}` |
 | POST | `/api/chat/reset` | `{session_id}` → 清空该会话 |
 
 `/api/run` 的返回结构固定为三段：`delivered`（角色化答复）、`audit`（推理记录，仅操作者）、
-`meta`（放行状态、规划来源、预算、知识库与许可模式）。
+`meta`（放行状态、规划来源、预算、会诊并发、知识库与许可模式）；
+`record_journal` 时多一段 `journal`（`run_id`、条目数、重放提示）。
+
+`/api/replay` 的 `fidelity` 先给结论：`reproduced`、`against`（`recording` / `modified`）、
+`differences`、`before` / `after` 指纹、`divergences`、`live_after_exhaustion`。
+`run_id` 未知时返回 400 而不是 500——那是请求错误，不是服务故障。
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/api/run \

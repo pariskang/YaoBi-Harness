@@ -37,6 +37,8 @@ from ..tools import DeidentificationKeyError, ToolRegistry
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 256 * 1024
+#: Live conversations kept in memory before the oldest is evicted.
+MAX_SESSIONS = 50
 
 logger = logging.getLogger("yaobi.ui")
 
@@ -66,6 +68,10 @@ class ConsoleService:
         self.access_token = access_token or None
         self.llm_error: str | None = None
         self._lock = threading.Lock()
+        #: Separate from ``_lock``: session bookkeeping must not wait behind a
+        #: whole clinical run, and a run must not hold the session lock while it
+        #: fans out to a consult panel.
+        self._sessions_lock = threading.Lock()
 
         try:
             self.llm = build_client(llm_provider, **({"model": llm_model} if llm_model else {}))
@@ -204,15 +210,19 @@ class ConsoleService:
             raise ValueError(f"未知角色: {role}")
 
         session_id = str(payload.get("session_id") or "")
-        session = self.sessions.get(session_id)
-        if session is None:
-            session = ConversationSession(
-                role=role, runner=self._runner(bool(payload.get("use_llm", True))),
-                allow_prescription=bool(payload.get("allow_prescription")),
-            )
-            self.sessions[session.session_id] = session
-            if len(self.sessions) > 50:  # bound memory on a long-lived console
-                self.sessions.pop(next(iter(self.sessions)))
+        # Session creation and eviction under one lock: the console is a threading
+        # server, and ``pop(next(iter(...)))`` is a read-modify-write that raises
+        # RuntimeError if another request inserts during the iteration.
+        with self._sessions_lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                session = ConversationSession(
+                    role=role, runner=self._runner(bool(payload.get("use_llm", True))),
+                    allow_prescription=bool(payload.get("allow_prescription")),
+                )
+                self.sessions[session.session_id] = session
+                while len(self.sessions) > MAX_SESSIONS:  # bound memory on a long-lived console
+                    self.sessions.pop(next(iter(self.sessions)))
 
         for image in _coerce_images(payload.get("images")):
             session.attach_image(image["ref"], kind=image["kind"], deidentified=image["deidentified"])
@@ -229,7 +239,8 @@ class ConsoleService:
         }
 
     def reset_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        self.sessions.pop(str(payload.get("session_id") or ""), None)
+        with self._sessions_lock:
+            self.sessions.pop(str(payload.get("session_id") or ""), None)
         return {"ok": True}
 
     def check_interactions(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -468,9 +479,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._error(500, f"{type(exc).__name__}: {exc}")
 
 
+class _ConsoleServer(ThreadingHTTPServer):
+    """The console's HTTP server, with a queue deep enough for a real burst.
+
+    ``socketserver`` defaults to a listen backlog of 5. Clinical runs are slow
+    relative to HTTP, and the service serialises them, so a handful of browser
+    tabs — or one page firing several requests on load — overflows the accept
+    queue and the client sees a connection reset rather than a queued request.
+    A reset looks like the console crashed, which is a much worse diagnosis than
+    "your request waited".
+    """
+
+    request_queue_size = 128
+    #: Threads must not keep the process alive after Ctrl+C, and a Colab kernel
+    #: cell that starts the console should be interruptible.
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def create_server(service: ConsoleService, host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
     handler = type("BoundConsoleHandler", (ConsoleHandler,), {"service": service})
-    return ThreadingHTTPServer((host, port), handler)
+    return _ConsoleServer((host, port), handler)
 
 
 def serve(

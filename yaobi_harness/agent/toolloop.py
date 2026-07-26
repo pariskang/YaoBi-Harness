@@ -246,6 +246,14 @@ class ToolLoop:
 
     # ----------------------------------------------------------------- helpers
     def _system_prompt(self, schema_name: str) -> str:
+        # A caller may install a replacement — the consult panel does, so each
+        # member gets its speciality's instructions rather than the shared skill
+        # body every member would otherwise read. The safety clauses it must still
+        # obey are in the persona template itself, not bolted on here, so a
+        # replacement cannot accidentally drop them.
+        override = getattr(self, "persona_prompt", "")
+        if override:
+            return str(override)
         spec = self.skill_spec
         return SYSTEM_TEMPLATE.format(
             agent=self.agent_name,

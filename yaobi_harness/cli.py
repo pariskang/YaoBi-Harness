@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from typing import Any
 
 from .graph import YaobiGraphRunner
 from .llm.factory import build_client, describe_client
@@ -42,6 +44,12 @@ def _build_parser() -> argparse.ArgumentParser:
                           "Attaching one asserts you have removed名/ID/日期/条码/人脸")
     run.add_argument("--no-vision", action="store_true", help="disable the vision model even if configured")
     run.add_argument("--skill-dir", action="append", help="extra SKILL.md root, highest precedence; repeatable")
+    run.add_argument("--journal", metavar="PATH",
+                     help="record every tool and model call here, so this decision can be replayed offline later")
+    run.add_argument("--replay", metavar="PATH",
+                     help="replay a recorded journal instead of calling anything; diverging calls fail the run closed")
+    run.add_argument("--panel-concurrency", type=int, metavar="N",
+                     help="threads for the consult panel (default 4; 1 forces sequential)")
 
     resume = sub.add_parser("resume", help="resume a checkpointed run")
     resume.add_argument("checkpoint")
@@ -65,6 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="attach a de-identified image before the first turn; repeatable")
     chat.add_argument("--no-vision", action="store_true")
     chat.add_argument("--skill-dir", action="append")
+    chat.add_argument("--journal", metavar="PATH", help="record every call for later offline replay")
 
     inspect = sub.add_parser("inspect-xlsx", help="summarise a local authorized Excel without returning raw rows")
     inspect.add_argument("path")
@@ -88,6 +97,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--ngrok-region")
     ui.add_argument("--no-vision", action="store_true", help="disable the vision model even if configured")
     ui.add_argument("--skill-dir", action="append", help="extra SKILL.md root, highest precedence; repeatable")
+
+    journal = sub.add_parser("journal", help="inspect a recorded call journal")
+    journal.add_argument("path")
+    journal.add_argument("--entries", action="store_true", help="list every recorded call")
 
     interview = sub.add_parser("interview", help="inspect the history-taking axes (十问歌 + 骨科专科)")
     interview.add_argument("--tier", choices=["RED_FLAG", "CORE", "SPECIALTY", "TCM", "CONTEXT"])
@@ -209,6 +222,43 @@ def _parse_images(specs: list[str] | None) -> list[dict]:
             raise ValueError(f"未知图片类型 {kind!r}；支持 {list(IMAGE_KINDS)}")
         images.append({"kind": kind, "ref": path, "deidentified": True})
     return images
+
+
+def _open_journal(args) -> Any:
+    """Build the run's journal from ``--journal`` / ``--replay``."""
+    from .journal import open_journal
+
+    replay = getattr(args, "replay", None)
+    record = getattr(args, "journal", None)
+    if replay and record:
+        raise ValueError("--journal 与 --replay 不能同时使用：一次运行只能录制或重放")
+    if replay:
+        return open_journal(replay, mode="replay")
+    return open_journal(record, mode="record") if record else None
+
+
+def _journal_command(args) -> int:
+    """Show what a recorded journal contains, and how to replay it."""
+    from .journal import Journal
+
+    try:
+        journal = Journal.load(args.path, mode="replay")
+    except Exception as exc:  # noqa: BLE001
+        return _emit({"error": str(exc)})
+
+    payload = {"summary": journal.summary(), "replay_hint": journal.replay_hint()}
+    if args.entries:
+        payload["entries"] = [
+            {"seq": e.seq, "kind": e.kind, "label": e.label, "req_hash": e.req_hash[:16],
+             "result_summary": (
+                 (e.result or {}).get("summary") if e.kind == "tool"
+                 else str((e.result or {}).get("text", ""))[:120]
+             )}
+            for e in journal.entries
+        ]
+    else:
+        payload["calls"] = [f"{e.seq}. {e.kind}:{e.label}" for e in journal.entries[:40]]
+    return _emit(payload)
 
 
 def _interview_command(args) -> int:
@@ -483,6 +533,9 @@ def _open_knowledge(path: str | None):
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
 
+    if args.cmd == "journal":
+        return _journal_command(args)
+
     if args.cmd == "interview":
         return _interview_command(args)
 
@@ -566,6 +619,14 @@ def main(argv=None) -> int:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 2
 
+    try:
+        journal = _open_journal(args)
+    except Exception as exc:  # noqa: BLE001 - a bad journal path must not traceback
+        print(json.dumps({"error": f"日志打开失败: {exc}"}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
+    if getattr(args, "panel_concurrency", None):
+        os.environ["YAOBI_PANEL_CONCURRENCY"] = str(args.panel_concurrency)
+
     state = ClinicalRunState(complaint=args.complaint, role=args.role)
     state.facts.update(_load_facts(args.facts, args.facts_file))
     state.enable_panel = bool(getattr(args, "panel", False))
@@ -581,9 +642,14 @@ def main(argv=None) -> int:
     )
     runner = YaobiGraphRunner(tools, checkpoint_dir=args.checkpoint_dir,
                               skill_manifest=args.skill_manifest, llm=llm,
-                              skill_dirs=getattr(args, "skill_dir", None))
+                              skill_dirs=getattr(args, "skill_dir", None), journal=journal)
     out = runner.run(state, allow_prescription=args.allow_prescription)
     print(json.dumps(render(out, debug=args.debug_state), ensure_ascii=False, indent=2))
+    # A diverged replay has not reproduced the recording, so it must not exit 0:
+    # a script that treats exit status as "the replay confirmed the decision"
+    # would otherwise be told yes.
+    if journal is not None and journal.mode == "replay" and journal.diverged:
+        return 3
     return 0
 
 

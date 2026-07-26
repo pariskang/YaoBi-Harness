@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-379%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-454%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -101,12 +101,45 @@ python -m yaobi_harness run --complaint "左小腿肿胀2天" --image limb_surfa
 两个方向的代价不对称。任何子体都拿不到方剂、剂量、签名三类工具（`consult_mode` 只能收窄授权，
 用交集而非并集实现），深度上限 1，每位成员用切分预算并回记到父预算。
 
+成员**并发执行**（默认 4 线程，实测 5 个成员 1.56s → 0.32s），但**审计轨迹仍然可复现**：
+每个成员写进自己的 `MemberScope`，全部完成后按会诊名单顺序合并，
+**证据 ID 在合并时才分配**——所以台账取决于名单，不取决于哪个响应先到。
+四种不同抖动下的台账逐条相同，且与顺序执行一致。
+
 视觉判读**永远不是影像报告**：证据等级为 `model_reasoning`（不可放行），
 `requires_formal_read` 是必填且影像类不允许写 false，图片不落盘（只留 sha256），
 调用前必须声明已去标识化，且系统会先做一次身份信息预检——**检出即丢弃全部判读结果**。
 它只能**升级**风险（患肢发紫/张力高 → 血管或骨筋膜室信号），不能撤销规则已判定的红旗。
 
 详见 [docs/PANEL.md](docs/PANEL.md) 与 [docs/VISION.md](docs/VISION.md)。
+
+## 重放日志：过去的决策可以被离线复核
+
+检查点记录的是**状态曾是什么**，但审计要问的是"在恰好这些证据之下，为什么放行了那条建议"。
+回答它必须用当时的工具返回和当时的模型输出重跑，而不是用今天的端点重跑。
+
+```bash
+# 录制：每一次工具执行与模型补全都按内容地址追加到 JSONL
+python -m yaobi_harness run --complaint "…" --journal ./audit/case-001.jsonl
+
+python -m yaobi_harness journal ./audit/case-001.jsonl --entries   # 看里面有什么
+
+# 离线重放：不需要网络，不需要配置模型
+python -m yaobi_harness run --complaint "…" --replay ./audit/case-001.jsonl
+```
+
+三条设计要点：
+
+* **日志不是授权。** 授权在重放时重新推导——以医师身份录的日志，
+  在以患者身份重放时拿不到方剂结果，因为经纪在触及记录之前就拒绝了。
+  被篡改的日志最多让重放**偏离**，不可能把草案提升为已签名处方。
+* **偏离必须响亮。** Agent 用宽泛 `except Exception` 包住模型调用以便回退，
+  这会把偏离异常吞成一句"已回退规则"。所以偏离被**锁存**，运行结束时检查并**故障关闭**，
+  退出码 3——一个把退出码当作"重放确认了原决策"的脚本不能在偏离时被告知"是"。
+* **耗尽 ≠ 偏离。** 同序号不同调用是硬失败；日志用完还有新调用只是告警
+  "本次结果不是纯离线重放"。
+
+详见 [docs/REPLAY.md](docs/REPLAY.md)。
 
 ## 可视化控制台
 
@@ -272,17 +305,22 @@ python -m yaobi_harness run --role physician --knowledge-store ./knowledge.db --
   深度上限 1；预算切分并回记父预算；合议取最高紧急度而非多数票。
 * **视觉不做诊断**：判读等级 `model_reasoning`（不可放行），影像类不允许声明
   `requires_formal_read=false`，图片不落盘，PHI 预检命中即丢弃全部结果。
+* **并发下台账仍可复现**：成员写各自的 `MemberScope`，按名单顺序合并分配证据 ID；
+  `Budget` 与 `ToolHealth` 都是读-改-写，已加锁——否则"硬上限"和"两次熔断"在并发下都名不副实。
+* **重放要么复现，要么明说**：调用按内容地址记录，同序号不同调用即判偏离并故障关闭；
+  偏离被锁存，不依赖异常穿透那些合法的 catch。
 
 ## 仍未完成
 
 LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化推荐抽取、
 大规模对抗性安全评测与红旗召回率基线仍未实现。模型**不能主动发起对话轮次**（它会答会问，
-但不会自己开口）；会诊成员串行执行而非并发；persona 的 I/O 契约是声明性的、未被强制校验；
-内容寻址的重放日志（能证明续跑发出了同样的调用）尚未实现。内置骨科规则包不能替代完整的相互作用数据库，
+但不会自己开口）；persona 的 I/O 契约是声明性的、未被强制校验；
+重放日志能证明"重放与记录一致"，不能证明"记录未被修改"（需存储层签名）；
+并发只覆盖会诊，图内任务执行仍是串行。内置骨科规则包不能替代完整的相互作用数据库，
 且须经本机构药师/医师复核后启用。**本项目不能对外宣称为临床可用系统。**
 
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 379 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 454 个用例，无需 pytest 与网络
 ```

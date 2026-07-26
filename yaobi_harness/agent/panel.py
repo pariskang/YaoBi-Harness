@@ -35,6 +35,7 @@ than as a filter on the output.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,6 +45,11 @@ from ..tools import CapabilityBroker, ToolRegistry
 
 #: Depth cap. A consult may not convene a consult.
 MAX_DEPTH = 1
+
+#: Default thread count for a panel. Members are I/O bound, so this is about
+#: overlapping network waits, not CPU. Capped low because each thread holds an
+#: LLM connection and a hospital deployment may be behind a modest proxy.
+DEFAULT_CONCURRENCY = 4
 
 #: Urgency ladder, least to most severe. The panel result takes the maximum.
 URGENCY_ORDER = ("routine", "expedited", "urgent", "emergency")
@@ -189,6 +195,11 @@ class PanelResult:
     agreement: str = ""
     convened: list[str] = field(default_factory=list)
     mode: str = "not_run"
+    #: Threads actually used. 1 means the sequential path ran.
+    concurrency: int = 1
+    #: Per-member merge record: how many evidence rows, warnings and traces each
+    #: member contributed, and how its scope-local ids were remapped.
+    merge: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -198,6 +209,7 @@ class PanelResult:
             "questions_for_patient": self.questions_for_patient,
             "dissents": self.dissents, "agreement": self.agreement,
             "convened": self.convened, "mode": self.mode,
+            "concurrency": self.concurrency, "merge": self.merge,
         }
 
 
@@ -256,8 +268,16 @@ class ConsultSubagent:
         *,
         health: Any = None,
         sub_budget: Any = None,
+        scope: Any = None,
     ) -> ConsultOpinion:
-        """Run this member as a bounded tool loop and return its opinion."""
+        """Run this member as a bounded tool loop and return its opinion.
+
+        ``scope`` is a :class:`~yaobi_harness.agent.scope.MemberScope` when the
+        panel runs concurrently: the loop then writes evidence into the scope
+        rather than into the shared state, and the caller merges it afterwards.
+        Passing ``None`` runs directly against ``state``, which is what the
+        sequential path does.
+        """
         from .toolloop import ToolLoop
 
         opinion = ConsultOpinion(self.persona, self.label)
@@ -271,30 +291,43 @@ class ConsultSubagent:
 
         mode = str(self.profile.get("consult_mode") or spec.consult_mode or "screening")
         granted = spec.effective_tools(mode)
-        broker = _member_broker(state, registry, self.skill_id, granted, health=health, budget=sub_budget)
+        target = scope if scope is not None else state
+        budget = sub_budget if sub_budget is not None else getattr(target, "budget", None)
+        broker = _member_broker(state, registry, self.skill_id, granted, health=health, budget=budget)
 
         loop = ToolLoop(
-            self.llm, tools, broker, state,
+            self.llm, tools, broker, target,
             agent_name=self.label, skill_id=self.skill_id, skill_spec=spec,
             max_steps=self.max_steps,
         )
         # The member sees only its own narrowed set, not the skill's full grant.
         loop.allowed_tool_specs = lambda: _specs_for(granted)  # type: ignore[method-assign]
+        # The persona is a *system-prompt* overlay, which is the whole mechanism.
+        # Previously it only reached the model as a JSON field in the user message
+        # while the system prompt stayed generic — so every member read the same
+        # instructions and the "independent perspectives" the panel exists to
+        # produce were much weaker than the design claimed.
+        loop.persona_prompt = self.system_prompt(schema_name="ConsultOpinion")  # type: ignore[attr-defined]
 
-        original_budget = state.budget
-        if sub_budget is not None:
+        # A scope already owns its budget, so nothing needs swapping. The
+        # sequential path still needs the swap, and it is safe there because only
+        # one member runs at a time.
+        swap = scope is None and sub_budget is not None
+        original_budget = state.budget if swap else None
+        if swap:
             state.budget = sub_budget
         try:
             result = loop.run(
                 objective=f"以{self.label}的专科视角给出会诊意见",
-                context=self._context(state),
+                context=self._context(target),
                 schema_name="ConsultOpinion",
             )
         except (LLMError, Exception) as exc:  # noqa: BLE001 - one member must not kill the panel
             opinion.ok, opinion.error = False, f"{type(exc).__name__}: {exc}"[:200]
             return opinion
         finally:
-            state.budget = original_budget
+            if swap:
+                state.budget = original_budget
 
         if not result.ok or not isinstance(result.output, dict):
             opinion.ok, opinion.error = False, result.error or result.mode
@@ -312,13 +345,20 @@ class ConsultSubagent:
         opinion.tool_calls = sum(1 for s in result.steps if s.kind == "tool_call")
         return opinion
 
-    def system_prompt(self) -> str:
+    def system_prompt(self, schema_name: str = "ConsultOpinion") -> str:
+        """This member's system prompt: persona overlay plus the output contract.
+
+        The overlay changes what the member attends to, never what it may call —
+        the tool set is narrowed separately, by ``consult_mode``.
+        """
+        from .toolloop import schema_hint
+
         return PERSONA_SYSTEM_PROMPT.format(
             persona_label=self.label,
             persona_instructions=str(self.profile.get("instructions") or ""),
-        )
+        ) + f"\n\n严格按下面的字段输出：\n{schema_hint(schema_name)}"
 
-    def _context(self, state: ClinicalRunState) -> dict[str, Any]:
+    def _context(self, state: Any) -> dict[str, Any]:
         """What this member is shown. Doses and signatures are never included."""
         outputs = state.outputs or {}
         return {
@@ -334,12 +374,29 @@ class ConsultSubagent:
 
 
 class ConsultPanel:
-    """Convenes members, runs them, and synthesises conservatively."""
+    """Convenes members, runs them concurrently, and synthesises conservatively.
 
-    def __init__(self, llm: Any, *, skill_id: str = "yaobi.consult_panel", max_members: int = 5) -> None:
+    Members are I/O bound — each spends its time waiting on an LLM endpoint — so
+    a thread pool turns five sequential round trips into roughly one. What makes
+    that safe is :mod:`yaobi_harness.agent.scope`: each member writes into its own
+    scope and the results are merged in *convened order*, so the evidence ledger
+    is identical whether the panel ran concurrently or one member at a time.
+    """
+
+    def __init__(
+        self,
+        llm: Any,
+        *,
+        skill_id: str = "yaobi.consult_panel",
+        max_members: int = 5,
+        concurrency: int | None = None,
+    ) -> None:
         self.llm = llm
         self.skill_id = skill_id
         self.max_members = max_members
+        #: Threads to use. 1 forces the sequential path, which is what a
+        #: debugging session or a deterministic-stub test wants.
+        self.concurrency = concurrency if concurrency is not None else _default_concurrency()
 
     def run(
         self,
@@ -359,15 +416,74 @@ class ConsultPanel:
             result.mode = "llm_unavailable"
             return result
 
+        workers = max(1, min(self.concurrency, len(chosen)))
+        result.concurrency = workers
+        if workers == 1:
+            self._run_sequential(state, tools, registry, chosen, health, result)
+        else:
+            self._run_concurrent(state, tools, registry, chosen, health, result)
+        return self.synthesise(result)
+
+    # ------------------------------------------------------------- execution
+    def _run_sequential(
+        self,
+        state: ClinicalRunState,
+        tools: ToolRegistry,
+        registry: Any,
+        chosen: list[str],
+        health: Any,
+        result: PanelResult,
+    ) -> None:
         for persona in chosen:
             member = ConsultSubagent(persona, self.llm, skill_id=self.skill_id)
-            opinion = member.run(
+            result.opinions.append(member.run(
                 state, tools, registry, health=health,
                 sub_budget=_carve_budget(state.budget, len(chosen)),
-            )
-            result.opinions.append(opinion)
+            ))
 
-        return self.synthesise(result)
+    def _run_concurrent(
+        self,
+        state: ClinicalRunState,
+        tools: ToolRegistry,
+        registry: Any,
+        chosen: list[str],
+        health: Any,
+        result: PanelResult,
+    ) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        from .scope import MemberScope, merge_scopes
+
+        members = [ConsultSubagent(p, self.llm, skill_id=self.skill_id) for p in chosen]
+        scopes = [
+            MemberScope(state, _carve_budget(state.budget, len(chosen)), label=member.label)
+            for member in members
+        ]
+
+        def work(index: int) -> ConsultOpinion:
+            member, scope = members[index], scopes[index]
+            try:
+                return member.run(state, tools, registry, health=health,
+                                  sub_budget=scope.budget, scope=scope)
+            except Exception as exc:  # noqa: BLE001 - a worker must never escape
+                return ConsultOpinion(member.persona, member.label, ok=False,
+                                      error=f"{type(exc).__name__}: {exc}"[:200])
+
+        with ThreadPoolExecutor(max_workers=min(self.concurrency, len(members)),
+                                thread_name_prefix="yaobi-consult") as pool:
+            # `map` preserves input order, so opinions come back in convened
+            # order regardless of which member finished first.
+            opinions = list(pool.map(work, range(len(members))))
+
+        # Merge after every member has finished, in roster order: this is where
+        # evidence ids are allocated, and it is why the ledger is reproducible.
+        reports = merge_scopes(state, scopes)
+        remaps = {report.member: report.evidence_remap for report in reports}
+        for opinion in opinions:
+            remap = remaps.get(opinion.label, {})
+            opinion.evidence_ids = [remap.get(eid, eid) for eid in opinion.evidence_ids]
+        result.opinions = opinions
+        result.merge = [report.to_dict() for report in reports]
 
     @staticmethod
     def synthesise(result: PanelResult) -> PanelResult:
@@ -401,6 +517,17 @@ class ConsultPanel:
 
 
 # ------------------------------------------------------------------- helpers
+def _default_concurrency() -> int:
+    """Threads to use, overridable for debugging or a rate-limited endpoint."""
+    raw = os.environ.get("YAOBI_PANEL_CONCURRENCY")
+    if not raw:
+        return DEFAULT_CONCURRENCY
+    try:
+        return max(1, min(8, int(raw)))
+    except ValueError:
+        return DEFAULT_CONCURRENCY
+
+
 def _member_broker(
     state: ClinicalRunState,
     registry: Any,
@@ -485,6 +612,11 @@ class _ChargebackBudget:
         if not self._slice.reserve_llm():
             return False
         if not self._parent.reserve_llm():
+            # The slice was charged for a call the parent then refused. Handing
+            # it back matters under concurrency: several members hitting the
+            # parent ceiling at once would otherwise each burn a slice call they
+            # never spent, and their remaining slices would silently shrink.
+            self._slice.refund_llm()
             return False
         return True
 

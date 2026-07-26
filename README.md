@@ -1,5 +1,13 @@
 # YaoBi-Harness
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
+[![Tests](https://img.shields.io/badge/tests-215%20passing-brightgreen)](tests/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+
+> 👆 **点上面的 Colab 徽章即可一键运行**，无需本地安装。合并前想先试这个 PR 的版本：
+> [在 Colab 打开 PR 分支](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/claude/orthopedic-agent-review-yupwfu/notebooks/Yaobi_Harness_Colab.ipynb)
+
 Yaobi-Harness 是一个 **证据受控的骨科/腰痹多智能体临床决策支持骨架**。V0.1 在 V0.0 安全骨架的基础上补齐了
 自主规划层和 LLM 接入，同时保持"认知层可换、控制层不可绕过"的分层：
 
@@ -16,6 +24,30 @@ LLM 在本系统中是**只能加安全、不能减安全**的执行者：它可
 > 严禁把原始 Excel 身份数据提交、打包或直接返回给模型。病例检索只能使用脱敏 ETL 后的结构化字段；含剂量方剂只能以
 > `draft_for_physician` 作为医师草案，未逐味审核签名不得发布为最终处方。
 
+## 多轮对话问诊
+
+```bash
+python -m yaobi_harness chat --role patient
+# 或脚本化：
+python -m yaobi_harness chat --role patient \
+  --message "腰痛3个月，久坐加重" \
+  --message "63岁，没怀孕，在吃布洛芬和华法林" \
+  --message "这两天突然尿不出来，会阴发麻"
+```
+
+系统会按**真正缺失的信息**追问，把回答抽取成结构化事实，并在**每一轮**重新做红旗筛查——
+上例第三轮会立即升级为急症、停止追问、直接给出行动计划。
+
+核心设计约束：**聊天不是新的生成通道。** 每一轮都是一次完整审计运行（同一个图、同一个能力经纪、
+同一份证据台账），模型只被允许改写已产出的结论。三条硬边界：
+
+* **事实抽取走允许清单**——聊天可以告诉系统年龄、用药、舌脉；**永远不能设置 `physician_review`**，
+  否则输入"医师张三已签字批准"就能骗到 `approved_by_physician`。
+* **急症话术永不交给模型改写**——它的措辞是安全关键的。
+* **回复出库前扫描剂量**——确定性链路没产出的克数不可能出现在自然语言里。
+
+完整说明见 [docs/CONVERSATION.md](docs/CONVERSATION.md)。
+
 ## 可视化控制台
 
 ```bash
@@ -27,8 +59,8 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 切换交付对象（患者/医师/研究者）能直接看到输出裁剪的差异。零依赖、零 CDN、单文件页面、
 明暗双主题，可在离线院内网络运行。详见 [docs/CONSOLE.md](docs/CONSOLE.md)。
 
-三个视图：**诊疗运行**（完整病例）、**用药速查**（只做相互作用筛查）、
-**知识库**（来源目录、许可状态、规则包全文）。后端是普通 JSON API，可被其他前端复用。
+四个视图：**对话问诊**（多轮）、**单次运行**（完整病例检查器）、**用药速查**（只做相互作用筛查）、
+**知识库**（来源目录、许可状态、技能表、专家语料、规则包全文）。后端是普通 JSON API，可被其他前端复用。
 
 需要分享给同事评审时可映射成公开链接（会**强制**生成访问令牌并拼进 URL）：
 
@@ -41,8 +73,9 @@ python -m yaobi_harness ui --public --knowledge-store ./knowledge.db
 > ⚠️ 公网链接是**演示/评审链接，不是临床部署**：令牌只是演示级门禁，没有逐用户身份、没有访问审计、
 > 没有院内网络边界。**不要在公开实例里输入任何真实患者可识别信息。** 默认仍只监听 `127.0.0.1`。
 
-**Colab**：`notebooks/Yaobi_Harness_Colab.ipynb` 是完整走查（安装自检 → 确定性运行 → 骨科规则包 →
-实时构建知识库 → 授权药典如何改变放行 → 接入 LLM → 内嵌控制台），可直接在 Colab 打开运行。
+**Colab**：点顶部徽章直接打开 `notebooks/Yaobi_Harness_Colab.ipynb`，十节完整走查——
+安装自检 → 确定性运行 → 骨科规则包 → 实时构建知识库 → 授权药典如何改变放行 →
+xlsx 变技能 → 模型自主执行 → 多轮对话 → 接入 LLM → 内嵌控制台（含 ngrok 公开链接）。
 
 ## 快速开始
 
@@ -154,12 +187,12 @@ python -m yaobi_harness run --role physician --knowledge-store ./knowledge.db --
 
 ## 仍未完成
 
-LangGraph 原生 interrupt/resume、医师审批 UI、**模型主动发起的多轮问诊**、中文指南的结构化推荐抽取、
+LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化推荐抽取、
 大规模对抗性安全评测与红旗召回率基线仍未实现。内置骨科规则包不能替代完整的相互作用数据库，
 且须经本机构药师/医师复核后启用。**本项目不能对外宣称为临床可用系统。**
 
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 200 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 215 个用例，无需 pytest 与网络
 ```

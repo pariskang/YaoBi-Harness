@@ -45,10 +45,40 @@ def signal_text(signals: list[str]) -> str:
     return "、".join(dict.fromkeys(names))
 
 
-MINIMUM_INFO = [
-    "起病时间", "疼痛部位/放射", "神经症状", "大小便/会阴感觉", "发热外伤肿瘤史",
-    "妊娠/年龄/肝肾功能", "当前用药/过敏", "舌脉", "疼痛评分(VAS)", "功能受限(ODI)",
-]
+#: Information gap -> the fact keys that satisfy it.
+#:
+#: Gap labels are human-readable and were previously compared directly against
+#: ``state.facts`` keys, which never matched — so every gap stayed "missing"
+#: no matter what the patient had already told us, and the dialogue re-asked
+#: questions it had just had answered.
+INFORMATION_GAPS: dict[str, tuple[str, ...]] = {
+    "起病时间": ("onset",),
+    "疼痛部位/放射": ("pain_location",),
+    "神经症状": ("neuro_symptoms",),
+    "大小便/会阴感觉": ("bowel_bladder",),
+    "发热外伤肿瘤史": ("fever_trauma_tumor",),
+    "妊娠/年龄/肝肾功能": ("pregnancy", "age", "renal", "liver"),
+    "当前用药/过敏": ("medications_confirmed", "allergies_confirmed"),
+    "舌脉": ("four_diagnoses",),
+    "疼痛评分(VAS)": ("vas",),
+    "功能受限(ODI)": ("odi",),
+}
+
+MINIMUM_INFO = list(INFORMATION_GAPS)
+
+
+def missing_information(facts: dict[str, Any]) -> list[str]:
+    """Gaps still open, given what we already know.
+
+    Special-population answers live in a nested dict for the dose pipeline, so
+    they are flattened here before checking.
+    """
+    known = dict(facts)
+    known.update(facts.get("special_population") or {})
+    return [
+        gap for gap, keys in INFORMATION_GAPS.items()
+        if not all(known.get(key) is not None for key in keys)
+    ]
 
 DEFAULT_QUESTIONS = [
     "疼痛什么时候开始的？是突然发生还是逐渐加重？",
@@ -216,7 +246,7 @@ class IntakeAgent(BaseAgent):
         elif screening.get("soft_hits"):
             state.warn("存在待证实的弱风险信号，建议线下评估以排除结构性病因")
 
-        state.missing_information = [x for x in MINIMUM_INFO if x not in state.facts]
+        state.missing_information = missing_information(state.facts)
         allowed = state.budget.reserve_questions(3 if state.risk_mode == "urgent" else 5)
         state.open_questions = cognition.followup_questions(state, self.llm, DEFAULT_QUESTIONS, allowed)
 

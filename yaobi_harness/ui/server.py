@@ -72,6 +72,9 @@ class ConsoleService:
 
         self.knowledge = self._open_knowledge()
         self.tools = ToolRegistry(self.xlsx_path or None, knowledge=self.knowledge)
+        #: Live conversations, keyed by session id. In-memory only: transcripts
+        #: are clinical content and must not be persisted by a demo console.
+        self.sessions: dict[str, Any] = {}
 
     def _open_knowledge(self):
         if not self.knowledge_store_path:
@@ -151,6 +154,47 @@ class ConsoleService:
         with self._lock:
             out = runner.run(state, allow_prescription=bool(payload.get("allow_prescription")))
         return console_payload(out, role)
+
+    def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """One conversation turn. Creates the session on the first message."""
+        from ..conversation import ConversationSession
+
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            raise ValueError("消息不能为空")
+        role = str(payload.get("role") or "patient")
+        if role not in ("patient", "physician", "researcher"):
+            raise ValueError(f"未知角色: {role}")
+
+        session_id = str(payload.get("session_id") or "")
+        session = self.sessions.get(session_id)
+        if session is None:
+            runner = YaobiGraphRunner(
+                self.tools, checkpoint_dir=self.checkpoint_dir,
+                skill_manifest=self.skill_manifest,
+                llm=self.llm if payload.get("use_llm", True) else NullLLMClient(),
+            )
+            session = ConversationSession(
+                role=role, runner=runner,
+                allow_prescription=bool(payload.get("allow_prescription")),
+            )
+            self.sessions[session.session_id] = session
+            if len(self.sessions) > 50:  # bound memory on a long-lived console
+                self.sessions.pop(next(iter(self.sessions)))
+
+        with self._lock:
+            reply = session.send(message)
+        return {
+            "session_id": session.session_id,
+            "reply": reply.to_dict(),
+            "audit": console_payload(session.state, session.role)["audit"] if session.state else {},
+            "meta": console_payload(session.state, session.role)["meta"] if session.state else {},
+            "turn_count": len(session.turns),
+        }
+
+    def reset_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.sessions.pop(str(payload.get("session_id") or ""), None)
+        return {"ok": True}
 
     def check_interactions(self, payload: dict[str, Any]) -> dict[str, Any]:
         medications = [str(m) for m in (payload.get("medications") or []) if str(m).strip()]
@@ -323,6 +367,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return self._safely(lambda: self.service.run_case(payload))
         if path == "/api/interactions":
             return self._safely(lambda: self.service.check_interactions(payload))
+        if path == "/api/chat":
+            return self._safely(lambda: self.service.chat(payload))
+        if path == "/api/chat/reset":
+            return self._safely(lambda: self.service.reset_chat(payload))
         return self._error(404, f"未知路径 {path}")
 
     def _safely(self, action) -> None:

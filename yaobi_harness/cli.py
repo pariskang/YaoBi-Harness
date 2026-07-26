@@ -43,6 +43,18 @@ def _build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--checkpoint-dir")
     resume.add_argument("--debug-state", action="store_true")
 
+    chat = sub.add_parser("chat", help="multi-turn clinical dialogue in the terminal")
+    chat.add_argument("--role", choices=["patient", "physician", "researcher"], default="patient")
+    chat.add_argument("--xlsx")
+    chat.add_argument("--knowledge-store")
+    chat.add_argument("--skill-manifest")
+    chat.add_argument("--allow-prescription", action="store_true")
+    chat.add_argument("--llm-provider", choices=["azure", "poe", "minimax", "litellm", "none"])
+    chat.add_argument("--llm-model")
+    chat.add_argument("--transcript", help="write the full transcript and state here on exit")
+    chat.add_argument("--message", action="append",
+                      help="send this message and exit; repeat for a scripted conversation")
+
     inspect = sub.add_parser("inspect-xlsx", help="summarise a local authorized Excel without returning raw rows")
     inspect.add_argument("path")
 
@@ -133,6 +145,65 @@ def _make_llm(provider: str | None, model: str | None):
 
 def _emit(payload) -> int:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _chat_command(args) -> int:
+    """Interactive dialogue, or a scripted one via repeated --message."""
+    from .conversation import ConversationSession
+
+    try:
+        llm = _make_llm(args.llm_provider, args.llm_model)
+        knowledge = _open_knowledge(args.knowledge_store)
+        tools = ToolRegistry(args.xlsx or None, knowledge=knowledge)
+    except (LLMError, DeidentificationKeyError) as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
+
+    runner = YaobiGraphRunner(tools, skill_manifest=args.skill_manifest, llm=llm)
+    session = ConversationSession(role=args.role, runner=runner,
+                                  allow_prescription=args.allow_prescription)
+
+    def show(reply) -> None:
+        flag = " ⚠已升级为急症" if reply.escalated else ""
+        print(f"\n🤖 [{reply.release_status}/{reply.risk_mode}{flag}]")
+        print("   " + reply.message.replace("\n", "\n   "))
+        if reply.extracted:
+            print(f"   ↳ 本轮获得: {json.dumps(reply.extracted, ensure_ascii=False)}")
+
+    if args.message:
+        for message in args.message:
+            print(f"\n👤 {message}")
+            show(session.send(message))
+    else:
+        print(f"腰痹智能体对话（角色={args.role}，模型={describe_client(llm)['provider']}）")
+        print("直接输入症状开始；输入 /quit 结束，/facts 查看已知信息。\n")
+        while True:
+            try:
+                message = input("👤 ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if message in ("/quit", "/exit", "q"):
+                break
+            if message == "/facts":
+                print(json.dumps(session.facts, ensure_ascii=False, indent=2))
+                continue
+            if not message:
+                continue
+            try:
+                reply = session.send(message)
+            except ValueError as exc:
+                print(f"   {exc}")
+                continue
+            show(reply)
+            if not reply.awaiting_answer:
+                print("\n（本次对话已达终态；继续输入可开启新的追问）")
+
+    if args.transcript:
+        with open(args.transcript, "w", encoding="utf-8") as handle:
+            json.dump(session.to_dict(), handle, ensure_ascii=False, indent=2)
+        print(f"\n对话记录已写入 {args.transcript}")
     return 0
 
 
@@ -269,6 +340,9 @@ def _open_knowledge(path: str | None):
 
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
+
+    if args.cmd == "chat":
+        return _chat_command(args)
 
     if args.cmd == "skill":
         return _skill_command(args)

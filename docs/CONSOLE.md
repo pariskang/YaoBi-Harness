@@ -28,9 +28,13 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 | `--xlsx` | 本地授权专家病例 Excel |
 | `--llm-provider` / `--llm-model` | 覆盖 `YAOBI_LLM_PROVIDER`；密钥仍只从环境变量读取 |
 | `--checkpoint-dir` | 每个节点落盘，可用 `resume` 子命令续跑 |
+| `--skill-manifest` | 指定技能清单（例如合并了生成的专家技能的那份） |
 | `--open` | 启动后打开浏览器 |
+| `--public` | 经 ngrok 映射为公开链接，**强制启用访问令牌**（仅演示/评审） |
+| `--access-token` | 固定访问令牌；`--public` 时会自动生成一个 |
+| `--ngrok-authtoken` / `--ngrok-region` | 覆盖 `NGROK_AUTHTOKEN` / 选择区域 |
 
-## 三个视图
+## 四个视图
 
 **诊疗运行** — 左侧填写病例，右侧看结果。
 左侧支持：交付对象（患者/医师/研究者）、主诉、五个示例病例、当前用药（中英逗号分隔）、
@@ -61,6 +65,8 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 | GET | `/api/rules` | 完整规则包与药物类别表 |
 | POST | `/api/run` | `{complaint, role, facts, allow_prescription, use_llm}` → `{delivered, audit, meta}` |
 | POST | `/api/interactions` | `{medications, conditions}` → 相互作用筛查结果 |
+| POST | `/api/chat` | `{message, role, session_id?}` → `{session_id, reply, audit, meta}` |
+| POST | `/api/chat/reset` | `{session_id}` → 清空该会话 |
 
 `/api/run` 的返回结构固定为三段：`delivered`（角色化答复）、`audit`（推理记录，仅操作者）、
 `meta`（放行状态、规划来源、预算、知识库与许可模式）。
@@ -75,13 +81,15 @@ curl -sS -X POST http://127.0.0.1:8000/api/run \
 ## 限制
 
 * **无身份认证、无多用户隔离。** 这是本地操作者工具。
+* 对话会话只存在内存中，进程退出即丢失；持久化涉及临床记录留存，须另行设计。
 * 一次只跑一个病例：共享的 `ToolRegistry` 与熔断器不为并发运行设计，服务端用锁串行化。
 * 浏览器端不持久化任何病例数据；刷新即清空。
 
 ## Colab
 
-`notebooks/Yaobi_Harness_Colab.ipynb` 是完整走查，七个部分：安装自检 → 确定性运行 →
-骨科规则包 → 实时构建知识库 → 授权药典如何改变放行 → 接入 LLM → 内嵌控制台。
+README 顶部有 Colab 徽章，点开即可运行。`notebooks/Yaobi_Harness_Colab.ipynb` 是十节完整走查：
+安装自检 → 确定性运行 → 骨科规则包 → 实时构建知识库 → 授权药典如何改变放行 →
+xlsx 变技能 → 模型自主执行 → 多轮对话 → 接入 LLM → 内嵌控制台（含 ngrok 公开链接）。
 
 内嵌方式：
 
@@ -95,7 +103,16 @@ threading.Thread(target=httpd.serve_forever, daemon=True).start()
 time.sleep(1)
 
 from google.colab import output
-output.serve_kernel_port_as_iframe(8000, height=1100)
+output.serve_kernel_port_as_iframe(8000, path=f"/?t={service.access_token}", height=1100)
+```
+
+公开链接（会强制要求访问令牌）：
+
+```python
+from yaobi_harness.ui.tunnel import banner, new_token, open_ngrok
+
+tunnel = open_ngrok(8000, token=service.access_token, authtoken="<NGROK_AUTHTOKEN>")
+print(banner(tunnel, local_url="http://127.0.0.1:8000/"))
 ```
 
 本地 Jupyter 用 `IPython.display.IFrame` 指向 `http://127.0.0.1:8000/` 即可。

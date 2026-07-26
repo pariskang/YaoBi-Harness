@@ -4,7 +4,8 @@
 
 ```
    ┌────────────────────────────────────────────────────────┐
-   │ operator console (yaobi_harness.ui) — delivered | audit │
+   │ operator console (ui) · dialogue (conversation)         │
+   │  delivered | audit — chat only *renders* a governed run │
    └───────────────────────────┬────────────────────────────┘
                 cognition (replaceable, advisory)
    ┌────────────────────────────────────────────────────────┐
@@ -54,7 +55,12 @@
    produced by `render()` for the selected role, and the reasoning record is
    returned in a separate `audit` object labelled operator-only in the UI. See
    [CONSOLE.md](CONSOLE.md).
-8. **Licences are enforced at write time.** `KnowledgeStore` rejects a
+8. **Chat is not a generation path.** Each dialogue turn is a fresh, fully
+   audited run over the accumulated narrative and facts; the model may extract
+   facts (through an allowlist that excludes `physician_review`) and rephrase
+   the released answer, nothing more. The urgent script is never rephrased and
+   replies are dose-scanned before they leave. See [CONVERSATION.md](CONVERSATION.md).
+9. **Licences are enforced at write time.** `KnowledgeStore` rejects a
    non-commercial dataset in a commercial deployment, strips body text from
    read-only sources, and keeps credentialed sources closed without an
    attestation. The repository therefore ships connectors, never content. See
@@ -70,6 +76,7 @@
 | Critique | add issues (`block`/`warn`) | clear an existing safety issue or change release status directly |
 | Tool use | choose tools and arguments from its skill's set, self-correct | see or reach a tool outside the skill; skip the broker |
 | Outputs | any shape the skill's schema allows | violate the schema; emit a gram value |
+| Dialogue | extract allowlisted facts, rephrase a released answer | set `physician_review`, add clinical content, rephrase the urgent script, emit a dose |
 | Doses | nothing | anything |
 
 Execution autonomy is documented in [AUTONOMY.md](AUTONOMY.md); a skill's
@@ -106,6 +113,8 @@ approval through `physician_review_submit`.
 
 ## Not implemented
 
-Licensed guideline/pharmacopoeia/interaction datasets, LangGraph-native
-interrupt/resume, physician review UI, multi-turn intake dialogue, and
-large-scale adversarial evaluation with red-flag recall/specificity baselines.
+LangGraph-native interrupt/resume, a physician review UI, model-initiated
+conversation turns (the agent answers and asks, but never opens a turn itself),
+persistent sessions, structured recommendation extraction from Chinese
+guidelines, and large-scale adversarial evaluation with red-flag
+recall/specificity baselines.

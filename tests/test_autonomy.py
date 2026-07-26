@@ -580,5 +580,130 @@ class SkillCatalogTests(unittest.TestCase):
                 )
 
 
+class InformalModelDrivesTheWholeRunTests(unittest.TestCase):
+    """One test for the claim the whole design rests on.
+
+    Every other test here checks a component. This one asks the end-to-end
+    question a user asks: with a model that is competent but writes informally,
+    does the model actually plan the graph, pick its own tools, and have its own
+    conclusions delivered — or does the run quietly degrade to rules?
+
+    It degraded. A Colab run reported ``planner_mode: rule`` beside a note saying
+    the model had answered, and the differentials in the output were the
+    deterministic list, not the model's. The stub below writes the way a real
+    model writes: a ``steps`` list instead of ``tasks``, ``name``/``id`` instead
+    of ``agent``/``task_id``, ``dependencies``/``after`` instead of
+    ``depends_on``, wrapped in prose and a code fence, with a trailing comma on
+    every answer. All of that used to be discarded.
+    """
+
+    TOOL_ARGS = {
+        "clinical_guideline_search": {"topic": "low back pain"},
+        "tcm_pattern_knowledge_search": {"pattern_hint": "气滞血瘀证"},
+        "similar_case_search": {"complaint": "腰痛", "pattern": "气滞血瘀证"},
+        "red_flag_evidence_search": {"text": "腰痛3月"},
+        "drug_interaction_check": {"medications": ["布洛芬", "华法林"]},
+    }
+    # Keyed by a required field, because the prompt shows the field list rather
+    # than the schema's name — which is what a real model has to go on too.
+    ANSWERS = (
+        ("differentials", {"differentials": ["腰椎间盘突出伴神经根病"], "exam_advice": ["腰椎MRI"]}),
+        ("primary_pattern", {"primary_pattern": "气滞血瘀证", "candidate_patterns": ["寒湿痹阻证"]}),
+        ("counterexamples", {"similar": [], "counterexamples": [], "limitation": "样本有限"}),
+        ("findings", {"findings": [], "overall": "无重大相互作用"}),
+    )
+    PLAN = {
+        "reasoning": "先筛红旗，再做西医鉴别与辨证",
+        "steps": [
+            {"id": "S1", "name": "IntakeAgent", "objective": "红旗与信息缺口"},
+            {"id": "S2", "name": "BiomedicalAgent", "objective": "西医鉴别",
+             "dependencies": ["S1"], "tools": ["clinical_guideline_search"]},
+            {"id": "S3", "name": "TCMPatternAgent", "objective": "辨证", "after": ["S1"]},
+            {"id": "S4", "name": "ExpertCaseAgent", "objective": "相似病例", "after": ["S3"]},
+            {"id": "S5", "name": "MedicationSafetyAgent", "objective": "用药筛查", "after": ["S1"]},
+        ],
+    }
+
+    class InformalModel:
+        name, model, available = "informal", "informal-v1", True
+
+        def __init__(self, outer):
+            self.outer = outer
+            self.planner_turns = self.tool_turns = self.answer_turns = 0
+
+        def chat(self, messages, tools=None, **kwargs):
+            system = messages[0]["content"]
+            if "规划器" in system:
+                self.planner_turns += 1
+                return LLMResponse(
+                    text="计划如下：\n```json\n"
+                         + json.dumps(self.outer.PLAN, ensure_ascii=False) + "\n```\n以上。",
+                    completion_tokens=40)
+            names = [t.name for t in (tools or [])]
+            if names and not any(m.get("role") == "tool" for m in messages):
+                self.tool_turns += 1
+                return LLMResponse(
+                    tool_calls=[ToolCall(names[0], self.outer.TOOL_ARGS.get(names[0], {}), "c1")],
+                    completion_tokens=8)
+            self.answer_turns += 1
+            body = next((dict(v) for key, v in self.outer.ANSWERS if key in system), None)
+            if body is None:
+                return LLMResponse(text="{}", completion_tokens=2)
+            body["citations"] = [
+                eid for m in messages if m.get("role") == "tool"
+                for eid in [json.loads(m["content"]).get("evidence_id")] if eid
+            ]
+            # Trailing comma: a syntax slip, not an ambiguity.
+            return LLMResponse(text=json.dumps(body, ensure_ascii=False)[:-1] + ",}",
+                               completion_tokens=20)
+
+    def setUp(self):
+        self.model = self.InformalModel(self)
+        state = ClinicalRunState("腰痛3月，久坐加重，右下肢麻木，无大小便异常", role="physician")
+        state.facts.update({"medications": ["布洛芬 0.3g bid", "华法林 3mg qd"]})
+        state.budget = Budget(max_llm_calls=80, max_tool_calls=80)
+        self.out = YaobiGraphRunner(llm=self.model).run(state)
+
+    def test_the_model_planned_the_graph(self):
+        self.assertEqual(self.out.planner_mode, "llm", self.out.outputs["plan"]["note"])
+        self.assertEqual(self.out.outputs["plan"]["note"], "llm_plan_accepted")
+        self.assertEqual([t.task_id for t in self.out.tasks],
+                         ["S1", "S2", "S3", "S4", "S5", "SAFETY"])
+
+    def test_the_dependency_structure_survived_the_aliases(self):
+        """`dependencies` and `after` must become `depends_on`, not be dropped —
+        losing them flattens the graph while still looking like a success."""
+        depends = {t.task_id: t.depends_on for t in self.out.tasks}
+        self.assertEqual(depends["S2"], ["S1"])
+        self.assertEqual(depends["S3"], ["S1"])
+        self.assertEqual(depends["S4"], ["S3"])
+
+    def test_every_autonomous_agent_ran_the_tool_loop(self):
+        autonomy = self.out.outputs.get("autonomy", {})
+        self.assertTrue(autonomy, "no agent ran autonomously")
+        for agent, info in autonomy.items():
+            with self.subTest(agent=agent):
+                self.assertEqual(info["mode"], "llm_tool_loop", info.get("error"))
+                self.assertEqual(info["repairs"], 0, "a trailing comma must not cost a repair turn")
+                self.assertTrue([s for s in info["steps"] if s.get("tool")],
+                                "the model chose no tool")
+
+    def test_the_delivered_conclusion_is_the_models_own(self):
+        """The point of the whole exercise: the answer came from the model, not
+        from the deterministic fallback list."""
+        self.assertEqual(self.out.outputs["biomedical"]["differentials"],
+                         ["腰椎间盘突出伴神经根病"])
+        self.assertEqual(self.out.outputs["tcm_pattern"]["primary_pattern"], "气滞血瘀证")
+
+    def test_the_control_plane_still_ran(self):
+        """Model-driven is not model-governed: the safety node and the release
+        state machine are unchanged by any of this."""
+        self.assertIn("SAFETY", [t.task_id for t in self.out.tasks])
+        self.assertEqual([t.status for t in self.out.tasks if t.task_id == "SAFETY"], ["ok"])
+        self.assertIn(self.out.release_status,
+                      ("needs_examination", "needs_more_information", "treatment_advice_only"))
+        self.assertNotIn("prescription_draft", self.out.outputs)
+
+
 if __name__ == "__main__":
     unittest.main()

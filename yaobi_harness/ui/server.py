@@ -37,6 +37,12 @@ from ..tools import DeidentificationKeyError, ToolRegistry
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 256 * 1024
+#: Live conversations kept in memory before the oldest is evicted.
+MAX_SESSIONS = 50
+#: Recorded journals kept for replay before the oldest is evicted. Journals hold
+#: tool payloads and model text — clinical content — so the console keeps a short
+#: window in memory and never writes one to disk.
+MAX_RECORDINGS = 20
 
 logger = logging.getLogger("yaobi.ui")
 
@@ -56,8 +62,10 @@ class ConsoleService:
         access_token: str | None = None,
         skill_dirs: list[str] | None = None,
         vision: bool = True,
+        panel_concurrency: int | None = None,
     ) -> None:
         self.knowledge_store_path = str(knowledge_store_path) if knowledge_store_path else None
+        self.panel_concurrency = panel_concurrency
         self.xlsx_path = str(xlsx_path) if xlsx_path else None
         self.checkpoint_dir = str(checkpoint_dir) if checkpoint_dir else None
         self.skill_manifest = str(skill_manifest) if skill_manifest else None
@@ -66,6 +74,10 @@ class ConsoleService:
         self.access_token = access_token or None
         self.llm_error: str | None = None
         self._lock = threading.Lock()
+        #: Separate from ``_lock``: session bookkeeping must not wait behind a
+        #: whole clinical run, and a run must not hold the session lock while it
+        #: fans out to a consult panel.
+        self._sessions_lock = threading.Lock()
 
         try:
             self.llm = build_client(llm_provider, **({"model": llm_model} if llm_model else {}))
@@ -79,6 +91,9 @@ class ConsoleService:
         #: Live conversations, keyed by session id. In-memory only: transcripts
         #: are clinical content and must not be persisted by a demo console.
         self.sessions: dict[str, Any] = {}
+        #: Recorded runs available for offline re-derivation, keyed by run id.
+        #: Also in-memory only, and for the same reason.
+        self.recordings: dict[str, dict[str, Any]] = {}
 
     def _open_knowledge(self):
         if not self.knowledge_store_path:
@@ -100,7 +115,13 @@ class ConsoleService:
             logger.warning("vision client unavailable: %s", exc)
             return None
 
-    def _runner(self, use_llm: bool = True, interview_loop: Any | None = None) -> YaobiGraphRunner:
+    def _runner(
+        self,
+        use_llm: bool = True,
+        interview_loop: Any | None = None,
+        journal: Any | None = None,
+        panel_concurrency: int | None = None,
+    ) -> YaobiGraphRunner:
         return YaobiGraphRunner(
             self.tools,
             checkpoint_dir=self.checkpoint_dir,
@@ -108,6 +129,8 @@ class ConsoleService:
             llm=self.llm if use_llm else NullLLMClient(),
             skill_dirs=self.skill_dirs or None,
             interview_loop=interview_loop,
+            journal=journal,
+            panel_concurrency=panel_concurrency or self.panel_concurrency,
         )
 
     # ------------------------------------------------------------------ routes
@@ -150,6 +173,10 @@ class ConsoleService:
                 ],
             },
             "personas": _persona_catalog(),
+            "panel": {
+                "concurrency_default": self.panel_concurrency or _env_concurrency(),
+                "concurrency_max": 8,
+            },
             "expert": self.expert_summary(),
             "auth_required": bool(self.access_token),
             "knowledge": {
@@ -165,14 +192,123 @@ class ConsoleService:
         }
 
     def run_case(self, payload: dict[str, Any]) -> dict[str, Any]:
+        role = self._role_of(payload, default="physician")
+        state = self._state_from(payload, role)
+        journal = None
+        if payload.get("record_journal"):
+            from ..journal import Journal
+
+            # No path: the console records for replay in this process only.
+            journal = Journal(mode="record")
+
+        runner = self._runner(
+            bool(payload.get("use_llm", True)),
+            journal=journal,
+            panel_concurrency=_coerce_concurrency(payload.get("panel_concurrency")),
+        )
+        # One run at a time: the shared ToolRegistry and circuit breaker are not
+        # designed for concurrent mutation from several browser tabs.
+        with self._lock:
+            out = runner.run(state, allow_prescription=bool(payload.get("allow_prescription")))
+        result = console_payload(out, role)
+        result["meta"]["panel_concurrency"] = runner.panel_concurrency
+        if journal is not None:
+            self._keep_recording(out, payload, journal)
+            result["journal"] = {
+                "run_id": out.run_id,
+                **journal.summary(),
+                "replay_hint": journal.replay_hint(),
+            }
+        return result
+
+    def replay_case(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Re-derive a recorded run from its journal and report whether it matched.
+
+        The point of the exercise is the *comparison*, not the second answer: a
+        replay that quietly produces a different release status is worse than no
+        replay at all, so the fidelity block is returned first and a divergence is
+        reported as a failure rather than folded into the new payload.
+
+        ``complaint``/``facts`` may be supplied to replay the journal against a
+        *changed* case. That is the interesting audit question — "would this
+        recording still justify the decision if the history had read differently?"
+        — and the honest answer is a loud failure, because the journal's entries
+        are addressed by request content and no longer match.
+        """
+        from ..journal import Journal, JournalError
+
+        run_id = str(payload.get("run_id") or "")
+        with self._sessions_lock:
+            recording = self.recordings.get(run_id)
+        if recording is None:
+            raise ValueError("没有这次运行的录制日志；请勾选「录制可复核日志」后重新运行")
+
+        source = recording["journal"]
+        # A fresh Journal over a copy of the entries: replaying advances a cursor,
+        # so reusing the recording's own object would consume it and make the
+        # second replay of the same run fail for the wrong reason.
+        replay = Journal(mode="replay", entries=list(source.entries), meta=dict(source.meta))
+        role = recording["role"]
+        case = dict(recording["payload"])
+        against = "recording"
+        if str(payload.get("complaint") or "").strip():
+            case["complaint"] = str(payload["complaint"]).strip()
+            against = "modified"
+        if isinstance(payload.get("facts"), dict):
+            case["facts"] = payload["facts"]
+            against = "modified"
+
+        state = self._state_from(case, role)
+        runner = self._runner(
+            bool(case.get("use_llm", True)),
+            journal=replay,
+            panel_concurrency=replay.meta.get("panel_concurrency"),
+        )
+        try:
+            with self._lock:
+                out = runner.run(state, allow_prescription=bool(case.get("allow_prescription")))
+        except JournalError as exc:
+            return {
+                "fidelity": {"reproduced": False, "against": against, "error": str(exc),
+                             "divergences": replay.divergences},
+                "journal": replay.summary(),
+            }
+
+        after = _fingerprint(out)
+        before = recording["fingerprint"]
+        differences = [k for k in before if before[k] != after.get(k)]
+        return {
+            "fidelity": {
+                # A journal that ran dry mid-run did not re-derive the decision
+                # either: the tail was executed live, so this is not a replay of
+                # the recording but a hybrid, and it must not report success.
+                "reproduced": (not differences and not replay.diverged
+                               and not replay.live_after_exhaustion and against == "recording"),
+                "against": against,
+                "differences": differences,
+                "before": before,
+                "after": after,
+                "divergences": replay.divergences,
+                "live_after_exhaustion": replay.live_after_exhaustion,
+            },
+            "journal": {**replay.summary(), "replay_hint": replay.replay_hint()},
+            **console_payload(out, role),
+        }
+
+    # --------------------------------------------------------------- internals
+    @staticmethod
+    def _role_of(payload: dict[str, Any], *, default: str) -> str:
+        role = str(payload.get("role") or default)
+        if role not in ("patient", "physician", "researcher"):
+            raise ValueError(f"未知角色: {role}")
+        return role
+
+    def _state_from(self, payload: dict[str, Any], role: str) -> ClinicalRunState:
+        """Build the run state. Shared by a live run and by its replay, so a
+        replay cannot accidentally be given different inputs than the recording."""
         complaint = str(payload.get("complaint") or "").strip()
         if not complaint:
             raise ValueError("请填写主诉")
-
-        role = str(payload.get("role") or "physician")
-        if role not in ("patient", "physician", "researcher"):
-            raise ValueError(f"未知角色: {role}")
-
         state = ClinicalRunState(complaint=complaint, role=role)
         facts = payload.get("facts")
         if isinstance(facts, dict):
@@ -182,15 +318,20 @@ class ConsoleService:
             max_tool_calls=int(payload.get("max_tool_calls", 24)),
             max_llm_calls=int(payload.get("max_llm_calls", 40)),
         )
-
         state.enable_panel = bool(payload.get("enable_panel"))
         state.images = _coerce_images(payload.get("images"))
-        runner = self._runner(bool(payload.get("use_llm", True)))
-        # One run at a time: the shared ToolRegistry and circuit breaker are not
-        # designed for concurrent mutation from several browser tabs.
-        with self._lock:
-            out = runner.run(state, allow_prescription=bool(payload.get("allow_prescription")))
-        return console_payload(out, role)
+        return state
+
+    def _keep_recording(self, state: ClinicalRunState, payload: dict[str, Any], journal: Any) -> None:
+        with self._sessions_lock:
+            self.recordings[state.run_id] = {
+                "payload": dict(payload),
+                "role": state.role,
+                "journal": journal,
+                "fingerprint": _fingerprint(state),
+            }
+            while len(self.recordings) > MAX_RECORDINGS:
+                self.recordings.pop(next(iter(self.recordings)))
 
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """One conversation turn. Creates the session on the first message."""
@@ -199,20 +340,26 @@ class ConsoleService:
         message = str(payload.get("message") or "").strip()
         if not message:
             raise ValueError("消息不能为空")
-        role = str(payload.get("role") or "patient")
-        if role not in ("patient", "physician", "researcher"):
-            raise ValueError(f"未知角色: {role}")
+        role = self._role_of(payload, default="patient")
 
         session_id = str(payload.get("session_id") or "")
-        session = self.sessions.get(session_id)
-        if session is None:
-            session = ConversationSession(
-                role=role, runner=self._runner(bool(payload.get("use_llm", True))),
-                allow_prescription=bool(payload.get("allow_prescription")),
-            )
-            self.sessions[session.session_id] = session
-            if len(self.sessions) > 50:  # bound memory on a long-lived console
-                self.sessions.pop(next(iter(self.sessions)))
+        # Session creation and eviction under one lock: the console is a threading
+        # server, and ``pop(next(iter(...)))`` is a read-modify-write that raises
+        # RuntimeError if another request inserts during the iteration.
+        with self._sessions_lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                session = ConversationSession(
+                    role=role,
+                    runner=self._runner(
+                        bool(payload.get("use_llm", True)),
+                        panel_concurrency=_coerce_concurrency(payload.get("panel_concurrency")),
+                    ),
+                    allow_prescription=bool(payload.get("allow_prescription")),
+                )
+                self.sessions[session.session_id] = session
+                while len(self.sessions) > MAX_SESSIONS:  # bound memory on a long-lived console
+                    self.sessions.pop(next(iter(self.sessions)))
 
         for image in _coerce_images(payload.get("images")):
             session.attach_image(image["ref"], kind=image["kind"], deidentified=image["deidentified"])
@@ -229,7 +376,8 @@ class ConsoleService:
         }
 
     def reset_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        self.sessions.pop(str(payload.get("session_id") or ""), None)
+        with self._sessions_lock:
+            self.sessions.pop(str(payload.get("session_id") or ""), None)
         return {"ok": True}
 
     def check_interactions(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -269,6 +417,44 @@ class ConsoleService:
             ],
             "classes": {name: list(members) for name, members in ortho_interactions.DRUG_CLASSES.items()},
         }
+
+
+def _env_concurrency() -> int:
+    from ..agent.panel import _default_concurrency
+
+    return _default_concurrency()
+
+
+def _coerce_concurrency(raw: Any) -> int | None:
+    """Panel threads requested by the browser, or ``None`` to keep the default.
+
+    Clamped rather than rejected: a slider that sends 99 means "as parallel as
+    you can", not "fail the run". The upper bound matches the panel's own.
+    """
+    if raw in (None, "", 0):
+        return None
+    try:
+        return max(1, min(8, int(raw)))
+    except (TypeError, ValueError):
+        raise ValueError(f"并发数必须是整数: {raw!r}") from None
+
+
+def _fingerprint(state: ClinicalRunState) -> dict[str, Any]:
+    """The parts of a run a replay has to reproduce exactly.
+
+    Deliberately not the whole payload: timestamps and run ids differ by
+    construction, and comparing them would report every replay as a divergence.
+    What must match is the decision — release status, risk mode, which planner
+    produced the graph — and the evidence it rests on, in ledger order.
+    """
+    return {
+        "release_status": state.release_status,
+        "risk_mode": state.risk_mode,
+        "planner_mode": state.planner_mode,
+        "tasks": [f"{t.agent}:{t.status}" for t in state.tasks],
+        "evidence": [f"{eid}|{e.source}|{e.level}" for eid, e in state.evidence.items()],
+        "safety_issues": list(state.safety_issues),
+    }
 
 
 def _persona_catalog() -> list[dict[str, Any]]:
@@ -448,6 +634,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return self._error(400, str(exc))
         if path == "/api/run":
             return self._safely(lambda: self.service.run_case(payload))
+        if path == "/api/replay":
+            return self._safely(lambda: self.service.replay_case(payload))
         if path == "/api/interactions":
             return self._safely(lambda: self.service.check_interactions(payload))
         if path == "/api/chat":
@@ -468,9 +656,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._error(500, f"{type(exc).__name__}: {exc}")
 
 
+class _ConsoleServer(ThreadingHTTPServer):
+    """The console's HTTP server, with a queue deep enough for a real burst.
+
+    ``socketserver`` defaults to a listen backlog of 5. Clinical runs are slow
+    relative to HTTP, and the service serialises them, so a handful of browser
+    tabs — or one page firing several requests on load — overflows the accept
+    queue and the client sees a connection reset rather than a queued request.
+    A reset looks like the console crashed, which is a much worse diagnosis than
+    "your request waited".
+    """
+
+    request_queue_size = 128
+    #: Threads must not keep the process alive after Ctrl+C, and a Colab kernel
+    #: cell that starts the console should be interruptible.
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def create_server(service: ConsoleService, host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
     handler = type("BoundConsoleHandler", (ConsoleHandler,), {"service": service})
-    return ThreadingHTTPServer((host, port), handler)
+    return _ConsoleServer((host, port), handler)
 
 
 def serve(
@@ -490,6 +696,7 @@ def serve(
     ngrok_region: str | None = None,
     skill_dirs: list[str] | None = None,
     vision: bool = True,
+    panel_concurrency: int | None = None,
 ) -> None:
     """Run the console until interrupted, optionally behind a public tunnel."""
     from .tunnel import TunnelError, banner, new_token, open_ngrok
@@ -505,24 +712,30 @@ def serve(
         access_token=token,
         skill_dirs=skill_dirs,
         vision=vision,
+        panel_concurrency=panel_concurrency,
     )
     httpd = create_server(service, host, port)
     url = f"http://{host}:{port}/"
-    print(f"Yaobi 控制台已启动: {url}")
+    # Print the URL that actually works. Printing the bare address when a token is
+    # configured hands the operator a link that 401s on every request, which reads
+    # as a broken console rather than a missing parameter.
+    entry = f"{url}?t={token}" if token else url
+    print(f"Yaobi 控制台已启动: {entry}")
+    if token:
+        print(f"  访问令牌 : {token}   （链接已包含；也可用 X-Yaobi-Token 头调用 API）")
     print(f"  LLM      : {describe_client(service.llm)}")
     print(f"  知识库   : {service.knowledge_store_path or '未配置（指南/药典证据为占位数据）'}")
     print(f"  视觉模型 : {service.vision.model if service.vision else '未配置（影像/舌象工具不可用）'}")
+    print(f"  会诊并发 : {service.panel_concurrency or _env_concurrency()} 线程（页面可逐次调整；1 为顺序执行）")
     print("  按 Ctrl+C 停止")
     tunnel = None
     if public:  # pragma: no cover - network path
         try:
             tunnel = open_ngrok(port, token=token, authtoken=ngrok_authtoken, region=ngrok_region)
-            print(banner(tunnel, local_url=url))
+            print(banner(tunnel, local_url=entry))
         except TunnelError as exc:
             print(f"公网隧道未开启: {exc}")
             print("控制台仍在本地可用。")
-    elif token:
-        print(f"  访问令牌 : {token}\n  带令牌链接: {url}?t={token}")
 
     if open_browser:  # pragma: no cover - convenience path
         import webbrowser

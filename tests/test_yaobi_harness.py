@@ -618,9 +618,13 @@ class LLMLayerTests(unittest.TestCase):
         self.assertEqual(poe.endpoint(), "https://api.poe.com/v1/chat/completions")
         self.assertTrue(poe.headers()["Authorization"].startswith("Bearer "))
 
-        minimax = build_client("minimax", api_key="k", model="MiniMax-Text-01", group_id="g1")
-        self.assertIn("/text/chatcompletion_v2", minimax.endpoint())
+        minimax = build_client("minimax", api_key="k", group_id="g1")
+        self.assertIn("/chat/completions", minimax.endpoint())
         self.assertIn("GroupId=g1", minimax.endpoint())
+        # China is the default host; the two regions are not interchangeable.
+        self.assertIn("api.minimaxi.com", minimax.endpoint())
+        self.assertEqual(minimax.model, "MiniMax-M3")
+        self.assertIn("api.minimax.io", build_client("minimax", api_key="k", region="global").endpoint())
 
         litellm = build_client("litellm", api_key="k", model="gpt-4o", base_url="http://gateway:4000")
         self.assertEqual(litellm.endpoint(), "http://gateway:4000/v1/chat/completions")

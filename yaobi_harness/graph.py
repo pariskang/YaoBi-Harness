@@ -33,6 +33,12 @@ from .tools import CapabilityBroker, ToolHealth, ToolRegistry
 PRESCRIPTIVE_AGENTS = {"FormulaAgent", "DoseAgent", "PhysicianReviewAgent"}
 
 
+def _panel_concurrency() -> int:
+    from .agent.panel import _default_concurrency
+
+    return _default_concurrency()
+
+
 class YaobiGraphRunner:
     """Task-driven state graph runner with bounded self-repair loops."""
 
@@ -44,14 +50,46 @@ class YaobiGraphRunner:
         llm: Any | None = None,
         skill_dirs: list[str | Path] | None = None,
         interview_loop: Any | None = None,
+        journal: Any | None = None,
+        panel_concurrency: int | None = None,
     ) -> None:
         self.tools = tools or ToolRegistry()
+        # Resolved here rather than inside the panel, because the journal's meta
+        # line records the effective value and a replay is only faithful against
+        # a matching one: an unresolved ``None`` in the meta would tell a future
+        # replayer nothing.
+        self.panel_concurrency = panel_concurrency if panel_concurrency else _panel_concurrency()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         manifest = Path(skill_manifest) if skill_manifest else Path(__file__).parent / "skills" / "manifest.yaml"
         # ``discover`` layers every ``SKILL.md`` over the manifest, so the rich
         # procedure files are policy too, not just prose the model happens to read.
         self.skill_registry = SkillRegistry.discover(manifest, extra_roots=skill_dirs)
-        self.llm = llm or NullLLMClient()
+        #: Optional call journal. Recording captures every tool and model call;
+        #: replaying feeds them back so a past decision can be re-derived offline.
+        self.journal = journal
+        base_llm = llm or NullLLMClient()
+        if self.journal is not None:
+            from .journal import JournaledLLM
+
+            self.llm = JournaledLLM(
+                base_llm, self.journal,
+                # A replay with no configured model must be served entirely from
+                # the journal; running out is an error, not a silent degradation
+                # to the deterministic path, which would hide the shortfall.
+                offline=self.journal.mode == "replay" and not getattr(base_llm, "available", False),
+            )
+        else:
+            self.llm = base_llm
+        if self.journal is not None and self.journal.mode == "record":
+            # Written before the first entry so a replay can adopt the recorded
+            # model name; the name is part of every request's content address, so
+            # without it an offline replay diverges on the name alone.
+            self.journal.write_meta({
+                "llm_model": getattr(base_llm, "model", "none"),
+                "llm_provider": getattr(base_llm, "name", "none"),
+                "llm_available": bool(getattr(base_llm, "available", False)),
+                "panel_concurrency": self.panel_concurrency,
+            })
         self.health = ToolHealth()
         self.agents = {
             "TimelineAgent": TimelineAgent(self.llm),
@@ -61,7 +99,7 @@ class YaobiGraphRunner:
             # continuous rather than reset on each call.
             "InterviewAgent": InterviewAgent(self.llm, loop=interview_loop),
             "VisionAgent": VisionAgent(self.llm),
-            "ConsultPanelAgent": ConsultPanelAgent(self.llm),
+            "ConsultPanelAgent": ConsultPanelAgent(self.llm, concurrency=self.panel_concurrency),
             "OsteoporosisAgent": OsteoporosisAgent(self.llm),
             "UrgentPlannerAgent": UrgentPlannerAgent(self.llm),
             "UrgentCareAgent": UrgentCareAgent(self.llm),
@@ -88,6 +126,7 @@ class YaobiGraphRunner:
             skill_registry=self.skill_registry,
             active_skill=getattr(agent, "skill_id", "") or None,
             health=self.health,
+            journal=self.journal,
         )
 
     def _checkpoint(self, state: ClinicalRunState, node: str) -> None:
@@ -224,6 +263,7 @@ class YaobiGraphRunner:
             },
             "tool_health": self.health.snapshot(),
             "knowledge": self._knowledge_meta(),
+            "journal": self.journal.summary() if self.journal is not None else {"mode": "off"},
         }
 
     @staticmethod
@@ -320,8 +360,39 @@ class YaobiGraphRunner:
             # including ones that failed closed or skipped every clinical task.
             if "safety_audit" not in state.outputs:
                 self._critic(state)
+            self._check_replay_fidelity(state)
             self._finalize(state)
         return state
+
+    def _check_replay_fidelity(self, state: ClinicalRunState) -> None:
+        """A replay that did not reproduce must not look like one that did.
+
+        Agents wrap model calls in broad ``except Exception`` so they can fall
+        back to a deterministic path, which silently converts a replay divergence
+        into an ordinary "fell back to rules" warning. The journal latches
+        divergences precisely so this check can see them, and the run fails closed:
+        an audit replay whose calls did not match the recording has answered a
+        different question than the one asked of it.
+        """
+        journal = self.journal
+        if journal is None or journal.mode != "replay":
+            return
+        if journal.diverged:
+            first = journal.divergences[0]
+            where = (
+                f"同一调用 {first['issued']} 但参数不同"
+                if first.get("differs_by") == "arguments"
+                else f"记录的是 {first['recorded']}，本次发出的是 {first['issued']}"
+            )
+            state.fail_closed(
+                f"重放偏离：日志第 {first['seq']} 条 —— {where}。"
+                f"病例、代码或模型已变化，本次重放不能作为对原决策的复核。"
+            )
+        elif journal.live_after_exhaustion:
+            state.warn(
+                f"重放日志已耗尽，其后 {journal.live_after_exhaustion} 次调用走了实时链路；"
+                f"本次结果不是纯离线重放"
+            )
 
     def _run_loops(self, state: ClinicalRunState, allow_prescription: bool) -> None:
         while True:

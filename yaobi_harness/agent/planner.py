@@ -244,24 +244,97 @@ def build_planner_prompt(state: ClinicalRunState, skill_registry: Any | None = N
     ]
 
 
-def parse_plan(payload: Any) -> list[Task]:
-    """Turn a model JSON payload into Tasks; malformed entries are dropped."""
+#: Keys a model may put the task list under. All mean the same thing; insisting
+#: on ``tasks`` alone silently discarded most real plans.
+_PLAN_LIST_KEYS = ("tasks", "plan", "task_plan", "steps", "graph", "task_graph", "nodes")
+
+#: Per-task field aliases. Shape only — never a guess about meaning.
+_AGENT_KEYS = ("agent", "agent_name", "name", "agent_id")
+_TASK_ID_KEYS = ("task_id", "id", "step_id", "node_id")
+_TOOL_KEYS = ("required_tools", "tools", "tool_names")
+_DEPENDS_KEYS = ("depends_on", "dependencies", "depends", "after", "requires")
+
+
+def _first(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value:
+            return value
+    return None
+
+
+def _plan_entries(payload: Any) -> list[Any]:
+    """Find the task list in whatever container the model chose.
+
+    Accepts a bare list, a list under any recognised key, or one level of nesting
+    (``{"plan": {"tasks": [...]}}``). Shape tolerance only: every entry still has
+    to name an agent that exists, and :func:`validate_plan` still checks roles,
+    risk modes, tool subsets and cycles afterwards.
+    """
+    if isinstance(payload, list):
+        return payload
     if not isinstance(payload, dict):
         return []
-    raw_tasks = payload.get("tasks")
-    if not isinstance(raw_tasks, list):
+    for key in _PLAN_LIST_KEYS:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for inner in _PLAN_LIST_KEYS:
+                nested = value.get(inner)
+                if isinstance(nested, list):
+                    return nested
+    return []
+
+
+def parse_plan(payload: Any, diagnostics: list[str] | None = None) -> list[Task]:
+    """Turn a model JSON payload into Tasks.
+
+    Deliberately liberal about *shape* and unchanged about *content*: an entry is
+    kept only when it names an agent, and nothing here decides whether that agent
+    is allowed to run. Being strict about shape bought no safety at all — it just
+    meant a competent plan under a ``"plan"`` key became a silent fallback to the
+    rule-based graph, with the run reporting ``planner_mode: rule``.
+
+    ``diagnostics`` collects why entries were dropped, so the planner can say what
+    happened instead of leaving the operator to guess.
+    """
+    notes = diagnostics if diagnostics is not None else []
+    raw_tasks = _plan_entries(payload)
+    if not raw_tasks:
+        notes.append(
+            "找不到任务列表；已接受的键: " + "/".join(_PLAN_LIST_KEYS)
+            + f"，实际收到: {sorted(payload)[:6] if isinstance(payload, dict) else type(payload).__name__}"
+        )
         return []
+
     tasks: list[Task] = []
     for index, item in enumerate(raw_tasks):
-        if not isinstance(item, dict) or not item.get("agent"):
+        # A bare string is accepted only as an *exact* catalogue name. Fuzzy
+        # matching would be the parser guessing at intent, which is the one thing
+        # it must not do.
+        if isinstance(item, str):
+            if item in AGENT_CATALOG:
+                tasks.append(Task(f"L{index + 1}", item, AGENT_CATALOG[item].description, [], [], origin="llm"))
+            else:
+                notes.append(f"条目 #{index + 1} 是字符串但不是已登记的 Agent 名: {item[:40]!r}")
             continue
+        if not isinstance(item, dict):
+            notes.append(f"条目 #{index + 1} 既不是对象也不是字符串: {type(item).__name__}")
+            continue
+        agent = _first(item, _AGENT_KEYS)
+        if not agent:
+            notes.append(f"条目 #{index + 1} 未指明 Agent（可用键: {'/'.join(_AGENT_KEYS)}）")
+            continue
+        agent = str(agent)
         tasks.append(
             Task(
-                task_id=str(item.get("task_id") or f"L{index + 1}"),
-                agent=str(item["agent"]),
-                objective=str(item.get("objective") or AGENT_CATALOG.get(str(item["agent"]), AgentSpec("", "", "")).description),
-                required_tools=[str(t) for t in (item.get("required_tools") or []) if isinstance(t, str)],
-                depends_on=[str(d) for d in (item.get("depends_on") or []) if isinstance(d, str)],
+                task_id=str(_first(item, _TASK_ID_KEYS) or f"L{index + 1}"),
+                agent=agent,
+                objective=str(item.get("objective") or item.get("goal")
+                              or AGENT_CATALOG.get(agent, AgentSpec("", "", "")).description),
+                required_tools=[str(t) for t in (_first(item, _TOOL_KEYS) or []) if isinstance(t, str)],
+                depends_on=[str(d) for d in (_first(item, _DEPENDS_KEYS) or []) if isinstance(d, str)],
                 origin="llm",
             )
         )
@@ -283,7 +356,7 @@ class PlannerAgent:
         tasks, mode, note = fallback, "rule", "llm_not_configured"
 
         if self.llm is not None and getattr(self.llm, "available", False):
-            proposal, note = self._propose(state)
+            proposal, note, diagnostics = self._propose(state)
             if proposal:
                 ok, problems = validate_plan(proposal, state)
                 if ok:
@@ -292,6 +365,13 @@ class PlannerAgent:
                 else:
                     note = "llm_plan_rejected:" + "; ".join(problems[:3])
                     state.warn(f"LLM 规划被规则层驳回，已回退默认计划: {problems[:3]}")
+            elif note == "llm_responded":
+                # The model answered and nothing usable came out. This used to
+                # leave the note at "llm_responded" with no warning at all, so the
+                # run reported `planner_mode: rule` next to a note saying the model
+                # replied, and the operator had no way to tell which it was.
+                note = "llm_plan_unparseable:" + ("; ".join(diagnostics[:3]) or "empty task list")
+                state.warn(f"LLM 规划无法解析为任务，已回退默认计划: {diagnostics[:3] or ['空任务列表']}")
 
         tasks = self._append_critic(tasks)
         state.tasks = tasks
@@ -308,19 +388,24 @@ class PlannerAgent:
         state.trace("PlannerAgent", "plan", state.complaint, f"{mode}: 生成{len(tasks)}个任务 ({note})")
         return state
 
-    def _propose(self, state: ClinicalRunState) -> tuple[list[Task], str]:
+    def _propose(self, state: ClinicalRunState) -> tuple[list[Task], str, list[str]]:
         from ..llm.base import LLMError
 
         if not state.budget.reserve_llm():
-            return [], "llm_budget_exhausted"
+            return [], "llm_budget_exhausted", []
         try:
             response = self.llm.chat(build_planner_prompt(state, self.skill_registry),
                                      temperature=0.0, max_tokens=1200, response_format_json=True)
         except (LLMError, Exception) as exc:  # noqa: BLE001 - a failed planner must never fail the run
             state.warn(f"LLM 规划调用失败，已回退默认计划: {exc!r}")
-            return [], f"llm_error:{type(exc).__name__}"
+            return [], f"llm_error:{type(exc).__name__}", []
         state.budget.charge_llm_tokens(response.total_tokens)
-        return parse_plan(response.json({})), "llm_responded"
+        diagnostics: list[str] = []
+        payload = response.json({})
+        tasks = parse_plan(payload, diagnostics)
+        if not tasks and not diagnostics:
+            diagnostics.append(f"响应不含可解析内容（前 120 字）: {(response.text or '')[:120]!r}")
+        return tasks, "llm_responded", diagnostics
 
     @staticmethod
     def _append_critic(tasks: list[Task]) -> list[Task]:

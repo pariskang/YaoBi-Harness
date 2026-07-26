@@ -99,13 +99,33 @@ class LLMTransportTests(unittest.TestCase):
         self.assertEqual(RECORDED[0]["headers"]["authorization"], "Bearer poe-key")
         self.assertEqual(RECORDED[0]["body"]["model"], "Claude-Sonnet-4.5")
 
-    def test_minimax_round_trip_uses_its_own_path(self):
-        client = build_client("minimax", api_key="mm-key", model="MiniMax-Text-01",
+    def test_minimax_round_trip_uses_the_openai_compatible_path(self):
+        """MiniMax's documented surface is OpenAI-compatible now.
+
+        The old ``/text/chatcompletion_v2`` path on ``api.minimax.chat`` is gone;
+        pinning it here meant the harness shipped an endpoint that 404s.
+        """
+        client = build_client("minimax", api_key="mm-key", model="MiniMax-M3",
                               base_url=f"{self.base}/v1", group_id="g42")
         response = client.chat([{"role": "user", "content": "hi"}])
-        self.assertIn("/v1/text/chatcompletion_v2", RECORDED[0]["path"])
+        self.assertIn("/v1/chat/completions", RECORDED[0]["path"])
         self.assertIn("GroupId=g42", RECORDED[0]["path"])
+        self.assertEqual(RECORDED[0]["body"]["model"], "MiniMax-M3")
         self.assertTrue(response.json())
+
+    def test_minimax_without_a_group_id_sends_a_clean_path(self):
+        client = build_client("minimax", api_key="mm-key", base_url=f"{self.base}/v1")
+        client.chat([{"role": "user", "content": "hi"}])
+        self.assertEqual(RECORDED[0]["path"], "/v1/chat/completions")
+
+    def test_minimax_surfaces_a_base_resp_error_instead_of_an_empty_answer(self):
+        """The API still returns this envelope; reading it as success is worse."""
+        from yaobi_harness.llm.providers import MiniMaxClient
+
+        client = MiniMaxClient(api_key="k", base_url=f"{self.base}/v1")
+        with self.assertRaises(LLMError) as ctx:
+            client.parse_response({"base_resp": {"status_code": 1004, "status_msg": "invalid api key"}})
+        self.assertIn("1004", str(ctx.exception))
 
     def test_azure_round_trip_uses_api_key_header_and_deployment_path(self):
         client = build_client("azure", api_key="az-key", model="my-deploy", base_url=self.base,

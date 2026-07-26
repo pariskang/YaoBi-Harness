@@ -367,6 +367,12 @@ class ConsultPanelAgent(BaseAgent):
     output_schema = "ConsultOpinion"
     output_key = "consult_panel"
 
+    def __init__(self, llm=None, *, concurrency: int | None = None) -> None:
+        super().__init__(llm)
+        #: Threads the panel may use. ``None`` defers to the environment default,
+        #: so a caller that says nothing keeps the previous behaviour.
+        self.concurrency = concurrency
+
     def run(self, state, tools, broker):
         from .panel import ConsultPanel
 
@@ -375,7 +381,7 @@ class ConsultPanelAgent(BaseAgent):
             state.warn("未登记会诊技能，跳过多学科会诊")
             return state
 
-        panel = ConsultPanel(self.llm, skill_id=self.skill_id)
+        panel = ConsultPanel(self.llm, skill_id=self.skill_id, concurrency=self.concurrency)
         result = panel.run(state, tools, registry, health=broker.health)
         state.outputs[self.output_key] = result.to_dict()
 

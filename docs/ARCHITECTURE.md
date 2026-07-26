@@ -81,7 +81,20 @@
     radiology, and are discarded wholesale when the PHI pre-check finds
     identifiers. Images are never persisted — only a SHA-256 survives. See
     [VISION.md](VISION.md).
-12. **Licences are enforced at write time.** `KnowledgeStore` rejects a
+12. **A concurrent panel produces a reproducible ledger.** Members run in a
+    thread pool but each writes into its own ``MemberScope``; results merge in
+    *convened order*, so evidence ids depend on the roster rather than on which
+    response arrived first. ``Budget`` and ``ToolHealth`` are lock-guarded — both
+    are read-modify-write, so a "hard" ceiling and a two-strike breaker were not
+    actually either under concurrency. A member cannot write ``risk_mode`` or
+    ``release_status`` at all. See [PANEL.md](PANEL.md).
+13. **A replay reproduces or it says so.** Every tool call and model completion is
+    content-addressed into a journal; a differing call at a given sequence
+    position is a hard divergence, latched so that an agent's broad
+    ``except Exception`` cannot turn a failed replay into a "fell back to rules"
+    warning. Authorisation is re-derived live, so a journal supplies data and
+    never permission. See [REPLAY.md](REPLAY.md).
+14. **Licences are enforced at write time.** `KnowledgeStore` rejects a
    non-commercial dataset in a commercial deployment, strips body text from
    read-only sources, and keeps credentialed sources closed without an
    attestation. The repository therefore ships connectors, never content. See
@@ -146,9 +159,8 @@ persistent sessions, structured recommendation extraction from Chinese
 guidelines, and large-scale adversarial evaluation with red-flag
 recall/specificity baselines.
 
-Also deliberately absent: a content-addressed replay journal. Checkpoints record
-state after each node, which is enough to resume, but not enough to *prove* a
-resumed run reissued the same calls. Grok Build's workflow journal hashes each
-host request and detects replay divergence; that is the right shape for this
-problem and remains unbuilt. Consult members run sequentially rather than
-concurrently, and persona I/O contracts are declared but not enforced.
+Persona I/O contracts are declared but not enforced. The journal proves a replay
+matches its recording but does not prove the recording was not edited — that needs
+a signature at the storage layer. Concurrency covers the consult panel only; the
+graph's own task execution is still sequential, so two independent branches of a
+plan do not overlap.

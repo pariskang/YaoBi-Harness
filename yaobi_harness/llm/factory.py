@@ -8,8 +8,11 @@ rest are provider-specific:
 * azure    — ``AZURE_OPENAI_API_KEY``, ``AZURE_OPENAI_ENDPOINT``,
              ``AZURE_OPENAI_DEPLOYMENT``, optional ``AZURE_OPENAI_API_VERSION``
 * poe      — ``POE_API_KEY``, optional ``POE_MODEL``, ``POE_BASE_URL``
-* minimax  — ``MINIMAX_API_KEY``, optional ``MINIMAX_MODEL``,
-             ``MINIMAX_BASE_URL``, ``MINIMAX_GROUP_ID``
+* minimax  — ``MINIMAX_API_KEY``, optional ``MINIMAX_MODEL`` (default
+             ``MiniMax-M3``), ``MINIMAX_REGION`` (``china`` | ``global``),
+             ``MINIMAX_BASE_URL``, ``MINIMAX_GROUP_ID``. The two regional hosts
+             are not interchangeable: ``https://api.minimaxi.com/v1`` for China,
+             ``https://api.minimax.io/v1`` for everywhere else.
 * litellm  — ``LITELLM_API_KEY``, ``LITELLM_MODEL``, optional ``LITELLM_BASE_URL``
 
 If nothing is configured, a :class:`NullLLMClient` is returned and the harness
@@ -66,8 +69,12 @@ def build_client(provider: str | None = None, **overrides: Any) -> LLMClient:
     if name == "minimax":
         return MiniMaxClient(
             api_key=overrides.get("api_key") or _env("MINIMAX_API_KEY"),
-            model=overrides.get("model") or _env("MINIMAX_MODEL", default="MiniMax-Text-01"),
-            base_url=overrides.get("base_url") or _env("MINIMAX_BASE_URL", default="https://api.minimax.chat/v1"),
+            model=overrides.get("model") or _env("MINIMAX_MODEL", default="MiniMax-M3"),
+            # No default here: the client resolves the region, so an unset
+            # MINIMAX_BASE_URL falls through to MINIMAX_REGION rather than being
+            # pinned to one host by the factory.
+            base_url=overrides.get("base_url") or _env("MINIMAX_BASE_URL") or None,
+            region=overrides.get("region") or _env("MINIMAX_REGION") or None,
             group_id=overrides.get("group_id") or _env("MINIMAX_GROUP_ID") or None,
             **common,
         )

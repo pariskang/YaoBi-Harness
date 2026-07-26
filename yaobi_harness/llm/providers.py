@@ -184,11 +184,32 @@ class PoeClient(OpenAICompatibleClient):
         super().__init__(api_key=api_key, model=model, base_url=base_url, **kwargs)
 
 
-class MiniMaxClient(OpenAICompatibleClient):
-    """MiniMax text chat completion v2.
+#: MiniMax's two regional hosts. Picking the wrong one fails to resolve or
+#: rejects the key, so both are named rather than left to the caller to guess.
+MINIMAX_HOSTS = {
+    "china": "https://api.minimaxi.com/v1",
+    "global": "https://api.minimax.io/v1",
+}
+MINIMAX_DEFAULT_BASE_URL = MINIMAX_HOSTS["china"]
 
-    The path is ``/text/chatcompletion_v2`` instead of ``/chat/completions``;
-    the request and response bodies are otherwise OpenAI-shaped.
+#: Legacy hosts and paths, kept only to give a clear error rather than a timeout.
+_MINIMAX_LEGACY_HOSTS = ("api.minimax.chat",)
+
+
+class MiniMaxClient(OpenAICompatibleClient):
+    """MiniMax, via its OpenAI-compatible ``/chat/completions`` endpoint.
+
+    Two regions, and they are not interchangeable:
+
+    * China   — ``https://api.minimaxi.com/v1``
+    * Global  — ``https://api.minimax.io/v1``
+
+    Set ``MINIMAX_BASE_URL`` explicitly, or ``MINIMAX_REGION=china|global``.
+    The old ``api.minimax.chat`` host with its ``/text/chatcompletion_v2`` path is
+    no longer the documented surface; the standard OpenAI path is used now, so the
+    only MiniMax-specific behaviour left is the ``base_resp`` error envelope, which
+    the API still returns on some failures and which would otherwise be read as a
+    successful empty completion.
     """
 
     name = "minimax"
@@ -197,16 +218,27 @@ class MiniMaxClient(OpenAICompatibleClient):
         self,
         *,
         api_key: str,
-        model: str = "MiniMax-Text-01",
-        base_url: str = "https://api.minimax.chat/v1",
+        model: str = "MiniMax-M3",
+        base_url: str | None = None,
         group_id: str | None = None,
+        region: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.group_id = group_id
-        super().__init__(api_key=api_key, model=model, base_url=base_url, **kwargs)
+        resolved = base_url or MINIMAX_HOSTS.get((region or "").strip().lower()) or MINIMAX_DEFAULT_BASE_URL
+        if any(host in resolved for host in _MINIMAX_LEGACY_HOSTS):
+            raise LLMError(
+                f"minimax: {resolved} 是已废弃的地址。请改用 "
+                f"{MINIMAX_HOSTS['china']}（中国）或 {MINIMAX_HOSTS['global']}（海外），"
+                "通过 MINIMAX_BASE_URL 或 MINIMAX_REGION=china|global 设置。"
+            )
+        super().__init__(api_key=api_key, model=model, base_url=resolved, **kwargs)
 
     def endpoint(self) -> str:
-        url = f"{self.base_url}/text/chatcompletion_v2"
+        # The documented surface is OpenAI-compatible, so the shared endpoint is
+        # correct. GroupId is still accepted as a query parameter by accounts that
+        # require it.
+        url = super().endpoint()
         return f"{url}?GroupId={self.group_id}" if self.group_id else url
 
     def parse_response(self, data: dict[str, Any]) -> LLMResponse:

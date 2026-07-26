@@ -341,6 +341,7 @@ textarea:focus, input:focus, select:focus {
 .note.n-danger { background:var(--danger-soft); border-color:var(--danger-line); color:var(--danger); }
 .note.n-info   { background:var(--info-soft);   border-color:var(--info-line);   color:var(--info); }
 .note.n-mute   { background:var(--mute-soft);   border-color:var(--mute-line);   color:var(--text-2); }
+.note.n-ok     { background:var(--ok-soft);     border-color:var(--ok-line);     color:var(--ok); }
 .note b { font-weight:600; }
 
 .finding { border:1px solid var(--line); border-radius:var(--r-md); overflow:hidden; margin-bottom:10px; }
@@ -633,6 +634,18 @@ pre.json {
             <div>召集多学科会诊
               <small>骨科/疼痛/康复/中医骨伤/药师子体各自独立运行；最保守意见优先。token 开销显著增加</small></div>
           </label>
+          <label class="check">
+            <input type="checkbox" id="recordJournal">
+            <div>录制可复核日志
+              <small>记录每一次工具与模型调用，运行后可离线重放复核这次决策。仅存于本进程内存，不落盘</small></div>
+          </label>
+        </div>
+
+        <div class="field" id="panelConcField" hidden>
+          <label for="panelConc">会诊并发线程</label>
+          <input type="number" id="panelConc" min="1" max="8" step="1">
+          <small class="hint">并发只改变调用时序，不改变证据台账：合议后按会诊名单顺序合并。
+            设为 1 可得到顺序确定的日志，便于重放。</small>
         </div>
 
         <button class="btn" id="runBtn">运行智能体</button>
@@ -731,6 +744,9 @@ const labelOf = (map, key) => (map[key]?.label) || key;
 
 /* ─── state ────────────────────────────────────────────────── */
 let BOOT = null, LAST = null, ACTIVE_TAB = "answer";
+/* Result of the most recent offline replay of LAST, or null. Kept separate from
+   LAST so a replay can never overwrite the run it is meant to be checked against. */
+let REPLAY = null;
 const picked = { conditions:new Set(), dConditions:new Set() };
 
 /* ─── theme ────────────────────────────────────────────────── */
@@ -754,13 +770,44 @@ $$(".nav button").forEach(btn => btn.addEventListener("click", () => {
   if (btn.dataset.view === "know") renderKnowledge();
 }));
 
+/* ─── 访问令牌 ─────────────────────────────────────────────────
+   服务端接受 bearer / X-Yaobi-Token / ?t= / cookie 四种通道，但页面此前
+   一个都不发：只有最初那次带 ?t= 的 HTML 请求能过，随后每个 XHR 都 401。
+   在 Colab 内嵌（用 ?t= 打开 iframe）和 ngrok 公开链接下，控制台因此完全不可用。
+
+   令牌来源按优先级：URL → sessionStorage → cookie。三条都留着是因为
+   第三方 iframe 里 storage 与 cookie 都可能被浏览器拦掉，而 URL 一定在。
+   也正因如此**不从地址栏抹掉 ?t=**：storage 被拦时，刷新只能靠它。          */
+let TOKEN = "";
+(function readToken() {
+  const fromUrl = new URLSearchParams(location.search).get("t");
+  const fromStore = (() => { try { return sessionStorage.getItem("yaobi_token"); } catch { return null; } })();
+  const fromCookie = (document.cookie.match(/(?:^|;\s*)yaobi_token=([^;]*)/) || [])[1];
+  TOKEN = fromUrl || fromStore || (fromCookie ? decodeURIComponent(fromCookie) : "") || "";
+  if (!TOKEN) return;
+  // Best-effort persistence so a reload without ?t= still works. Either channel
+  // may be blocked in an embedded frame; failing silently is correct because the
+  // in-memory copy already covers this page's lifetime.
+  try { sessionStorage.setItem("yaobi_token", TOKEN); } catch {}
+  try { document.cookie = `yaobi_token=${encodeURIComponent(TOKEN)}; Path=/; SameSite=None; Secure`; } catch {}
+})();
+
 /* ─── API ──────────────────────────────────────────────────── */
 async function api(path, body) {
-  const res = await fetch(path, body === undefined ? {} : {
-    method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify(body),
-  });
+  const headers = {};
+  if (TOKEN) headers["X-Yaobi-Token"] = TOKEN;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const res = await fetch(path, body === undefined
+    ? { headers }
+    : { method:"POST", headers, body:JSON.stringify(body) });
   const data = await res.json().catch(() => ({ error:`HTTP ${res.status}` }));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    // 401 with no token in hand is a setup problem, not a backend fault; say which.
+    if (res.status === 401 && !TOKEN) {
+      throw new Error("需要访问令牌：请使用启动时打印的带 ?t=… 的完整链接打开本页");
+    }
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
   return data;
 }
 
@@ -811,6 +858,14 @@ async function boot() {
   }));
 
   renderConditionChips();
+  // The concurrency control only means anything when a panel is convened, so it
+  // follows the checkbox rather than sitting there inert.
+  $("#panelConc").value = BOOT.panel?.concurrency_default ?? 4;
+  $("#panelConc").max = BOOT.panel?.concurrency_max ?? 8;
+  const syncPanelField = () => { $("#panelConcField").hidden = !$("#enablePanel").checked; };
+  $("#enablePanel").addEventListener("change", syncPanelField);
+  syncPanelField();
+
   if (!llm.available) $("#runHint").textContent = "未配置 LLM，将以确定性规则路径运行。";
   if (llm.error) $("#runHint").textContent = "LLM 配置错误: " + llm.error;
 }
@@ -869,7 +924,10 @@ async function runCase() {
       allow_prescription: $("#allowRx").checked,
       use_llm: $("#useLlm").checked,
       enable_panel: $("#enablePanel").checked,
+      record_journal: $("#recordJournal").checked,
+      panel_concurrency: $("#enablePanel").checked ? Number($("#panelConc").value) || null : null,
     });
+    REPLAY = null;
     ACTIVE_TAB = "answer";
     renderRun();
   } catch (e) {
@@ -896,6 +954,7 @@ function renderRun() {
     ["safety", "安全审查", blockers],
     ["raw",    "原始 JSON", null],
   ];
+  if (LAST.journal) tabs.splice(5, 0, ["replay", "离线复核", LAST.journal.entries || null]);
 
   $("#result").replaceChildren(el(`
     <div class="hero t-${info.tone}">
@@ -911,6 +970,9 @@ function renderRun() {
         ${badge("规划 " + (meta.planner_mode === "llm" ? "LLM" : "规则"), meta.planner_mode === "llm" ? "accent" : "mute")}
         ${badge("轮次 " + (meta.loops_used ?? 1), "mute")}
         ${badge("工具 " + (meta.budget?.tool_calls ?? "-"), "mute")}
+        ${(audit.consult_panel?.concurrency || 0) > 1
+          ? badge("会诊并发 " + audit.consult_panel.concurrency, "accent") : ""}
+        ${LAST.journal ? badge("已录制 " + LAST.journal.entries + " 次调用", "ok") : ""}
         ${meta.llm?.available ? badge("模型 " + meta.llm.provider, "accent") : ""}
         ${badge(meta.knowledge?.configured ? "知识库 " + (meta.knowledge.enabled_sources || []).length + " 源" : "知识库未配置",
                 meta.knowledge?.configured ? "ok" : "warn")}
@@ -946,8 +1008,9 @@ function renderTab() {
   const body = $("#tabBody");
   const { delivered, audit, meta } = LAST;
   const fns = { answer:tabAnswer, plan:tabPlan, intake:tabIntake, meds:tabMeds,
-                evidence:tabEvidence, safety:tabSafety, raw:tabRaw };
-  body.replaceChildren(el(fns[ACTIVE_TAB](delivered, audit, meta)));
+                evidence:tabEvidence, safety:tabSafety, replay:tabReplay, raw:tabRaw };
+  body.replaceChildren(el((fns[ACTIVE_TAB] || tabAnswer)(delivered, audit, meta)));
+  if (ACTIVE_TAB === "replay") bindReplay();
 }
 
 /* ── tab: delivered answer ─────────────────────────────────── */
@@ -1065,6 +1128,7 @@ function tabPlan(d, audit, meta) {
                     info.mode === "llm_tool_loop" ? "ok" : "warn")}
             <strong>${esc(agent)}</strong>
             <span class="badge mono">${esc(info.mode)}</span>
+            ${info.repairs ? badge("格式重提 " + info.repairs + " 次", "mute") : ""}
           </div>
           <div class="finding-body">
             ${(info.steps || []).map(st => `<div style="display:flex;gap:8px;align-items:flex-start">
@@ -1081,17 +1145,41 @@ function tabPlan(d, audit, meta) {
         </div>`).join("")}
     </div>` : "";
 
+  const note = audit.plan?.note || "";
   return `${autonomyBlock}<div class="sec">
       <h3>规划来源</h3>
-      <div class="note ${meta.planner_mode === "llm" ? "n-info" : "n-mute"}"><span class="ico">◎</span><div>
+      <div class="note ${meta.planner_mode === "llm" ? "n-info" : (planNote(note).tone || "n-mute")}">
+        <span class="ico">◎</span><div>
         ${meta.planner_mode === "llm"
           ? "<b>LLM 生成的任务图已通过规则层校验。</b>校验覆盖 Agent 白名单、技能工具表、角色、风险模式与依赖环；任一不通过即整体驳回。"
-          : "<b>使用确定性规则计划。</b>未配置模型、模型调用失败或 LLM 提案被驳回时均回退到此路径。"}
+          : planNote(note).text}
+        ${note ? `<br><span class="badge mono">${esc(note)}</span>` : ""}
       </div></div></div>
     <div class="sec"><h3>任务图</h3><div class="graph">${nodes || "<p class='hint'>无任务</p>"}</div></div>
     ${audit.missing_information?.length ? listSec("信息缺口", audit.missing_information) : ""}
     ${audit.open_questions?.length ? listSec("待追问", audit.open_questions) : ""}`;
 }
+/* Why the deterministic plan was used. "规则" on its own is the failure mode the
+   operator complained about: it cannot distinguish an unconfigured model from a
+   proposal the rule layer threw out from output that never parsed. */
+function planNote(note) {
+  if (note.startsWith("llm_plan_rejected"))
+    return { tone:"n-warn", text:"<b>模型提案被规则层驳回，已整体回退默认计划。</b>"
+      + "驳回原因见下方标签；越权提案不会被部分采纳。" };
+  if (note.startsWith("llm_plan_unparseable"))
+    return { tone:"n-warn", text:"<b>模型有回复，但没有解析出可执行任务。</b>"
+      + "解析器接受多种写法（tasks/plan/steps、agent/name、id/task_id、裸列表、代码块、尾随逗号），"
+      + "仍失败说明回复里没有可识别的 Agent 名或任务结构。" };
+  if (note === "llm_budget_exhausted")
+    return { tone:"n-warn", text:"<b>模型调用预算已用尽，规划阶段没有发起请求。</b>" };
+  if (note.startsWith("llm_error"))
+    return { tone:"n-warn", text:"<b>模型调用失败，已回退默认计划。</b>失败不会让整次运行失败。" };
+  if (note === "llm_not_configured")
+    return { tone:"n-mute", text:"<b>未配置模型，使用确定性规则计划。</b>"
+      + "这是完整可用的路径：规则层本身就能给出放行判断。" };
+  return { tone:"n-mute", text:"<b>使用确定性规则计划。</b>" };
+}
+
 const statusLabel = (s) => ({
   ok:"完成", failed:"失败", pending:"待执行", repair_requested:"待修复",
   skipped_dependency:"依赖未满足", skipped_not_authorized:"未授权跳过",
@@ -1333,6 +1421,100 @@ function tabSafety(d, audit) {
         `<span class="badge mono">${esc(c)}</span>`).join("") || "<span class='hint'>无</span>"}</div></div>
     ${audit.dose_safety?.blockers?.length ? `<div class="sec"><h3>剂量安全门槛</h3>
       <ul class="list">${audit.dose_safety.blockers.map(b => `<li>${esc(b)}</li>`).join("")}</ul></div>` : ""}`;
+}
+
+/* ── tab: offline replay ───────────────────────────────────────
+   Checkpoints record what the state *was*. An audit asks a different question:
+   was this decision derivable from what the system actually saw? The journal
+   answers it — every tool and model call, content-addressed — and this tab is
+   where an operator makes it answer. A replay that produces a different decision
+   must read as a failure, so the verdict is the first thing on the page. */
+function tabReplay(d, audit, meta) {
+  const j = LAST.journal || {};
+  const kinds = j.replay_hint?.kinds || {};
+  const head = `<div class="sec">
+    <h3>录制内容</h3>
+    <div class="hero-meta" style="margin-bottom:12px">
+      ${badge("调用 " + (j.entries || 0), "accent")}
+      ${badge("工具 " + (kinds.tool || 0), "mute")}
+      ${badge("模型 " + (kinds.llm || 0), "mute")}
+      ${badge("会诊并发 " + (j.replay_hint?.panel_concurrency ?? "-"), "mute")}
+      <span class="badge mono">${esc(j.run_id || "")}</span>
+    </div>
+    <div class="note n-mute"><span class="ico">◎</span><div>
+      日志<b>只提供数据，不提供权限</b>：重放时角色、技能与能力经纪照常裁剪，
+      以患者身份重放同一份日志拿不到方剂结果。日志仅存于本进程内存，不落盘。
+      ${j.replay_hint?.note ? "<br>" + esc(j.replay_hint.note) : ""}
+    </div></div></div>`;
+
+  const form = `<div class="sec">
+    <h3>复核</h3>
+    <p class="hint" style="margin-bottom:10px">直接复核 = 用同一份病历重放，应当逐条相同。
+      改写主诉再复核 = 问「这份日志还能支撑那个结论吗」，答案必须是响亮的失败。</p>
+    <div class="field">
+      <label for="replayComplaint">改写主诉（留空表示按原病历复核）</label>
+      <textarea id="replayComplaint" style="min-height:56px"
+        placeholder="例：突然不能排尿、会阴麻木，双腿越来越无力"></textarea>
+    </div>
+    <button class="btn" id="replayBtn">离线重放</button>
+    <p class="hint" style="margin-top:10px" id="replayHint"></p></div>`;
+
+  return head + form + replayVerdict();
+}
+
+function replayVerdict() {
+  if (!REPLAY) return "";
+  const f = REPLAY.fidelity || {};
+  const modified = f.against === "modified";
+  const tone = f.reproduced ? "n-ok" : (modified ? "n-info" : "n-danger");
+  const title = f.reproduced
+    ? "已复现：同一份日志重新推导出同一个决策"
+    : (modified ? "按预期偏离：病历已改，日志不再匹配，运行故障关闭"
+                : "未复现：这次重放没有得到原来的决策");
+  // kv() escapes its values, so these are plain strings, not markup.
+  const rows = [
+    ["放行状态", `${f.before?.release_status} → ${f.after?.release_status ?? "—"}`],
+    ["风险模式", `${f.before?.risk_mode} → ${f.after?.risk_mode ?? "—"}`],
+    ["规划来源", `${f.before?.planner_mode} → ${f.after?.planner_mode ?? "—"}`],
+    ["证据条数", `${(f.before?.evidence || []).length} → ${(f.after?.evidence || []).length}`],
+    ["日志供给", `${REPLAY.journal?.replayed ?? 0} 次由日志回放，${f.live_after_exhaustion ?? 0} 次日志耗尽后实跑`],
+  ];
+  return `<div class="sec">
+    <div class="note ${tone}"><span class="ico">${f.reproduced ? "✓" : "▲"}</span><div>
+      <b>${esc(title)}</b>
+      ${f.error ? "<br>" + esc(f.error) : ""}
+      ${f.differences?.length ? "<br>不一致项：" + esc(f.differences.join("、")) : ""}
+    </div></div>
+    ${kv(rows)}
+    ${(f.divergences || []).length ? `<h3 style="margin-top:16px">偏离明细</h3>
+      <ul class="list">${f.divergences.map(x => `<li><span class="mono">#${x.seq}</span>
+        录制 <span class="mono">${esc(x.recorded)}</span> ·
+        实发 <span class="mono">${esc(x.issued)}</span> ·
+        差异在${x.differs_by === "arguments" ? "参数" : "调用"}
+        <span class="mono">(${esc(x.recorded_hash)} ≠ ${esc(x.issued_hash)})</span></li>`).join("")}</ul>` : ""}
+    </div>`;
+}
+
+function bindReplay() {
+  const btn = $("#replayBtn");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>重放中…';
+    $("#replayHint").textContent = "";
+    try {
+      REPLAY = await api("/api/replay", {
+        run_id: LAST.journal.run_id,
+        complaint: $("#replayComplaint").value.trim() || undefined,
+      });
+      renderTab();
+    } catch (e) {
+      $("#replayHint").textContent = "重放失败: " + e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "离线重放";
+    }
+  });
 }
 
 function tabRaw(d, audit, meta) {

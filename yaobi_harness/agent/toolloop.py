@@ -32,6 +32,10 @@ from ..state import ClinicalRunState
 
 MAX_STEPS = 6
 MAX_OBSERVATION_CHARS = 4000
+#: Reformatting turns allowed when the final message is not the declared shape.
+#: One is enough: a model that cannot produce the schema after being shown it and
+#: told plainly will not produce it on a third try either.
+MAX_REPAIRS = 1
 
 SYSTEM_TEMPLATE = """你是骨科临床决策支持系统中的 **{agent}**。
 
@@ -89,12 +93,16 @@ class ToolLoopResult:
     citations: list[str] = field(default_factory=list)
     mode: str = "not_run"
     error: str = ""
+    #: Reformatting turns spent. Reported so a run can show that the model needed
+    #: a nudge, rather than that looking like a clean first-try answer.
+    repairs: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok, "mode": self.mode, "error": self.error,
             "steps": [s.to_dict() for s in self.steps],
             "evidence_ids": self.evidence_ids, "citations": self.citations,
+            "repairs": self.repairs,
         }
 
 
@@ -172,6 +180,7 @@ class ToolLoop:
         skill_id: str,
         skill_spec: Any | None = None,
         max_steps: int = MAX_STEPS,
+        max_repairs: int = MAX_REPAIRS,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -181,6 +190,7 @@ class ToolLoop:
         self.skill_id = skill_id
         self.skill_spec = skill_spec
         self.max_steps = max_steps
+        self.max_repairs = max_repairs
 
     # ------------------------------------------------------------- availability
     @property
@@ -226,7 +236,17 @@ class ToolLoop:
             self.state.budget.charge_llm_tokens(response.total_tokens)
 
             if not response.tool_calls:
-                return self._finalize(result, response.text, schema_name, step)
+                finalized = self._finalize(result, response.text, schema_name, step)
+                if finalized.ok or not self._may_repair(finalized, step):
+                    return finalized
+                # One bounded repair turn. A model that answered in prose, or
+                # missed a required field, is a formatting miss — discarding the
+                # whole run's evidence gathering over it is why so many runs
+                # reported "已回退确定性逻辑" despite the model having done the work.
+                messages.append({"role": "assistant", "content": response.text or ""})
+                messages.append({"role": "user", "content": self._repair_prompt(finalized, schema_name)})
+                result.repairs += 1
+                continue
 
             messages.append(self._assistant_message(response))
             for call in response.tool_calls:
@@ -244,8 +264,41 @@ class ToolLoop:
         result.mode, result.error = "max_steps_exceeded", f"未在 {self.max_steps} 步内给出结论"
         return self._finish(result)
 
+    # ------------------------------------------------------------------ repair
+    #: Failure modes worth one more turn. ``dose_in_output`` is deliberately
+    #: absent: a model that emitted a gram value gets no second chance, because
+    #: re-prompting a dose leak invites a reworded dose leak.
+    REPAIRABLE = ("invalid_output", "schema_violation")
+
+    def _may_repair(self, result: ToolLoopResult, step: int) -> bool:
+        return (
+            result.mode in self.REPAIRABLE
+            and result.repairs < self.max_repairs
+            and step < self.max_steps
+        )
+
+    def _repair_prompt(self, result: ToolLoopResult, schema_name: str) -> str:
+        problem = (
+            "上一条回复不是 JSON 对象。" if result.mode == "invalid_output"
+            else f"上一条回复不符合输出契约：{result.error}"
+        )
+        return (
+            f"{problem}\n\n"
+            "请**只输出一个 JSON 对象**，不要代码块围栏、不要任何说明文字、不要在 JSON 前后加句子。"
+            "已经取到的证据不需要重新检索，直接按下面的字段整理成 JSON：\n"
+            f"{schema_hint(schema_name)}"
+        )
+
     # ----------------------------------------------------------------- helpers
     def _system_prompt(self, schema_name: str) -> str:
+        # A caller may install a replacement — the consult panel does, so each
+        # member gets its speciality's instructions rather than the shared skill
+        # body every member would otherwise read. The safety clauses it must still
+        # obey are in the persona template itself, not bolted on here, so a
+        # replacement cannot accidentally drop them.
+        override = getattr(self, "persona_prompt", "")
+        if override:
+            return str(override)
         spec = self.skill_spec
         return SYSTEM_TEMPLATE.format(
             agent=self.agent_name,

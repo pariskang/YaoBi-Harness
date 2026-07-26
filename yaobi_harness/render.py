@@ -208,6 +208,11 @@ def console_payload(state: ClinicalRunState, role: str | None = None) -> dict[st
                  "evidence_ids": c.evidence_ids, "confidence": c.confidence, "origin": c.origin}
                 for c in state.claims
             ],
+            # How the task graph came to be, including the note that says *why*
+            # a model-driven plan was not used. Without it the console can only
+            # show "规则" and the operator cannot tell an unconfigured model from
+            # a rejected proposal from output that failed to parse.
+            "plan": state.outputs.get("plan", {}),
             # Per-agent record of the model-driven tool loop: which tools it
             # chose, with what arguments, and whether it fell back.
             "autonomy": state.outputs.get("autonomy", {}),

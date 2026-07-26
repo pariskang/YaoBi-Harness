@@ -19,6 +19,7 @@ import hmac
 import os
 import re
 import statistics
+import threading
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
@@ -105,29 +106,77 @@ class ToolResult:
         return self.evidence_level
 
 
+def _tool_result_to_dict(result: ToolResult) -> dict[str, Any]:
+    """Serialise a tool result for the journal."""
+    return {
+        "tool": result.tool, "ok": result.ok, "summary": result.summary, "data": result.data,
+        "evidence_level": result.evidence_level, "error": result.error,
+        "source_version": result.source_version, "is_stub": result.is_stub,
+        "retryable": result.retryable, "recoverable": result.recoverable,
+    }
+
+
+def _tool_result_from_dict(name: str, payload: Any) -> ToolResult:
+    """Rebuild a tool result from the journal, defensively.
+
+    A journal is an input like any other, so a malformed record produces a failed
+    result rather than an exception — the run then treats it as a tool failure and
+    fails closed, which is the correct response to unusable evidence.
+    """
+    if not isinstance(payload, dict):
+        return ToolResult(name, False, "journal_replay_malformed",
+                          error="journal entry was not an object", retryable=False)
+    return ToolResult(
+        tool=str(payload.get("tool") or name),
+        ok=bool(payload.get("ok")),
+        summary=str(payload.get("summary") or ""),
+        data=payload.get("data") if isinstance(payload.get("data"), dict) else {},
+        evidence_level=str(payload.get("evidence_level") or EvidenceLevel.TOOL.value),
+        error=payload.get("error"),
+        source_version=payload.get("source_version"),
+        is_stub=bool(payload.get("is_stub")),
+        retryable=bool(payload.get("retryable")),
+        recoverable=bool(payload.get("recoverable")),
+    )
+
+
 class ToolHealth:
-    """Circuit breaker shared by every broker within one run."""
+    """Circuit breaker shared by every broker within one run.
+
+    ``record_failure`` is a read-modify-write on a per-tool counter, and consult
+    panel members run concurrently against one breaker, so every method holds a
+    lock. Without it two members failing the same tool at once can each read 0
+    and each write 1, leaving the circuit closed after two failures.
+    """
 
     def __init__(self, failure_threshold: int = 2) -> None:
         self.failure_threshold = failure_threshold
         self.consecutive_failures: dict[str, int] = {}
         self.open_circuits: set[str] = set()
+        self._lock = threading.RLock()
 
     def is_healthy(self, tool: str) -> bool:
-        return tool not in self.open_circuits
+        with self._lock:
+            return tool not in self.open_circuits
 
     def record_success(self, tool: str) -> None:
-        self.consecutive_failures.pop(tool, None)
-        self.open_circuits.discard(tool)
+        with self._lock:
+            self.consecutive_failures.pop(tool, None)
+            self.open_circuits.discard(tool)
 
     def record_failure(self, tool: str) -> None:
-        count = self.consecutive_failures.get(tool, 0) + 1
-        self.consecutive_failures[tool] = count
-        if count >= self.failure_threshold:
-            self.open_circuits.add(tool)
+        with self._lock:
+            count = self.consecutive_failures.get(tool, 0) + 1
+            self.consecutive_failures[tool] = count
+            if count >= self.failure_threshold:
+                self.open_circuits.add(tool)
 
     def snapshot(self) -> dict[str, Any]:
-        return {"open_circuits": sorted(self.open_circuits), "consecutive_failures": dict(self.consecutive_failures)}
+        with self._lock:
+            return {
+                "open_circuits": sorted(self.open_circuits),
+                "consecutive_failures": dict(self.consecutive_failures),
+            }
 
 
 class CapabilityBroker:
@@ -150,6 +199,7 @@ class CapabilityBroker:
         health: ToolHealth | None = None,
         *,
         require_skill: bool = True,
+        journal: Any | None = None,
     ) -> None:
         self.role = role
         self.risk_mode = risk_mode
@@ -158,6 +208,10 @@ class CapabilityBroker:
         self.active_skill = active_skill
         self.health = health or ToolHealth()
         self.require_skill = require_skill
+        #: Optional call journal. It rides on the broker because the broker is
+        #: already the single door every tool call passes through, and it is
+        #: constructed once per run — the tool registry is shared across runs.
+        self.journal = journal
 
     def allow(self, tool: str) -> tuple[bool, str]:
         """Return ``(allowed, reason)`` without consuming any budget."""
@@ -239,10 +293,18 @@ class ToolRegistry:
             "medical_image_read": self.medical_image_read,
         }
         self._profile = None
+        self._profile_lock = threading.RLock()
 
     # ------------------------------------------------------------- dispatching
     def call(self, broker: CapabilityBroker, name: str, **kwargs: Any) -> ToolResult:
-        """Authorise, execute (with bounded retry) and account for one tool call."""
+        """Authorise, execute (with bounded retry) and account for one tool call.
+
+        Authorisation runs *before* the journal is consulted. A replay therefore
+        re-derives every policy decision live: a journal recorded as a physician
+        cannot hand a patient-role replay a formula result, because the broker
+        denies the call before the recorded result is ever reached. The journal
+        supplies data, never permission.
+        """
         allowed, reason = broker.allow(name)
         if not allowed:
             # Policy denials and budget exhaustion are *not* tool failures: they
@@ -251,6 +313,28 @@ class ToolRegistry:
         if name not in self.tools:
             return ToolResult(name, False, "unknown_tool", error="unknown_tool", recoverable=True)
 
+        journal = getattr(broker, "journal", None)
+        if journal is not None:
+            hit, recorded = journal.next_result("tool", name, kwargs)
+            if hit:
+                broker.charge()  # a replayed call still consumes the run's budget
+                replayed = _tool_result_from_dict(name, recorded)
+                if replayed.ok:
+                    broker.health.record_success(name)
+                elif not replayed.recoverable:
+                    broker.health.record_failure(name)
+                return replayed
+
+        final = self._execute_with_retry(broker, name, kwargs)
+        if journal is not None:
+            # Recorded once, on every exit path, and only the *final* result: a
+            # replay reproduces the outcome the run acted on, not the transient
+            # failures on the way to it.
+            journal.record("tool", name, kwargs, _tool_result_to_dict(final))
+        return final
+
+    def _execute_with_retry(self, broker: CapabilityBroker, name: str, kwargs: dict[str, Any]) -> ToolResult:
+        """Run one tool, retrying transport-style failures within the budget."""
         result: ToolResult | None = None
         for attempt in range(self.max_attempts):
             broker.charge()
@@ -397,12 +481,18 @@ class ToolRegistry:
         )
 
     def expert_profile(self):
-        """Lazily mine the expert practice profile from the loaded corpus."""
-        if self._profile is None:
-            from .expert.profile import build_profile
+        """Lazily mine the expert practice profile from the loaded corpus.
 
-            self._profile = build_profile(self.case_store.records)
-        return self._profile
+        Guarded because consult members call this concurrently: without the lock
+        five members racing a cold cache each mine the whole corpus, which is the
+        most expensive computation in the registry.
+        """
+        with self._profile_lock:
+            if self._profile is None:
+                from .expert.profile import build_profile
+
+                self._profile = build_profile(self.case_store.records)
+            return self._profile
 
     def expert_practice_profile(self, pattern: str | None = None) -> ToolResult:
         """Aggregate expert habits — core herbs, treatments, investigations.

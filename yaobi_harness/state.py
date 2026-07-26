@@ -7,6 +7,7 @@ resumed later (see :mod:`yaobi_harness.graph`).
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -110,6 +111,13 @@ class Budget:
     Every counter here is enforced; nothing in this dataclass is decorative.
     Tool calls are charged only when a call is actually executed, so a denied
     or policy-blocked call can never drain the budget.
+
+    Every mutator is serialised by a lock, because the consult panel runs its
+    members concurrently and ``reserve_llm`` is a read-check-increment: without
+    the lock two members can both pass the ceiling check and both spend, so a
+    "hard" ceiling silently is not one. The lock is deliberately *not* a
+    dataclass field, so ``asdict`` and ``Budget(**payload)`` keep working for
+    checkpoints.
     """
 
     max_loops: int = 3
@@ -126,33 +134,62 @@ class Budget:
     used_questions: int = 0
     loop_counts: dict[str, int] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self._lock = threading.RLock()
+
+    @property
+    def lock(self) -> "threading.RLock":
+        """The budget's lock, recreated if this instance came from a pickle."""
+        existing = self.__dict__.get("_lock")
+        if existing is None:
+            existing = threading.RLock()
+            self._lock = existing
+        return existing
+
     def can_afford_tool(self) -> bool:
-        return self.used_tool_calls < self.max_tool_calls
+        with self.lock:
+            return self.used_tool_calls < self.max_tool_calls
 
     def charge_tool(self) -> None:
         """Charge one executed tool call. Call only after the call ran."""
-        self.used_tool_calls += 1
+        with self.lock:
+            self.used_tool_calls += 1
 
     def reserve_llm(self) -> bool:
-        if self.used_llm_calls >= self.max_llm_calls or self.used_llm_tokens >= self.max_llm_tokens:
-            return False
-        self.used_llm_calls += 1
-        return True
+        with self.lock:
+            if self.used_llm_calls >= self.max_llm_calls or self.used_llm_tokens >= self.max_llm_tokens:
+                return False
+            self.used_llm_calls += 1
+            return True
+
+    def refund_llm(self) -> None:
+        """Hand back a reservation that was taken but not used.
+
+        The panel reserves from a member slice *and* the parent; if the second
+        reservation fails the first must be returned, or a partial acquisition
+        would slowly drain a ceiling nobody ever actually spent.
+        """
+        with self.lock:
+            self.used_llm_calls = max(0, self.used_llm_calls - 1)
 
     def charge_llm_tokens(self, tokens: int) -> None:
-        self.used_llm_tokens += max(0, int(tokens))
+        with self.lock:
+            self.used_llm_tokens += max(0, int(tokens))
 
     def can_loop(self, node: str) -> bool:
-        return self.loop_counts.get(node, 0) < self.max_loops
+        with self.lock:
+            return self.loop_counts.get(node, 0) < self.max_loops
 
     def count_loop(self, node: str) -> int:
-        self.loop_counts[node] = self.loop_counts.get(node, 0) + 1
-        return self.loop_counts[node]
+        with self.lock:
+            self.loop_counts[node] = self.loop_counts.get(node, 0) + 1
+            return self.loop_counts[node]
 
     def reserve_questions(self, n: int) -> int:
-        allowed = max(0, min(n, self.max_questions - self.used_questions))
-        self.used_questions += allowed
-        return allowed
+        with self.lock:
+            allowed = max(0, min(n, self.max_questions - self.used_questions))
+            self.used_questions += allowed
+            return allowed
 
 
 @dataclass

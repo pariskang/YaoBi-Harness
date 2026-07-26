@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-379%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-495%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -19,6 +19,16 @@ Yaobi-Harness 是一个 **证据受控的骨科/腰痹多智能体临床决策�
 LLM 在本系统中是**只能加安全、不能减安全**的执行者：它可以规划、选工具、下结论，但看不到技能未授权的工具、
 不能发明 Agent、不能清除规则层命中的风险信号、**永远不能生成剂量**。任何一步越界（越权/输出不合 schema/
 出现克数/预算或步数耗尽）都会**整体回退**到确定性逻辑，而不是带病放行。未配置模型时，全流程确定性运行。
+
+**宽进严出**：模型输出的*形状*被宽容对待，*内容*被严格校验。计划可以写成 `tasks` /
+`plan` / `task_plan` / `steps` / 裸列表，Agent 可以写在 `agent` / `agent_name` / `name`，
+依赖可以写成 `depends_on` / `dependencies` / `after`；作答可以带代码块、前后散文、
+尾随逗号、单引号字典。理由是内容在后面每一层都会被校验（schema 查字段与类型，
+计划校验器查 Agent 白名单与技能工具表，能力经纪查权限），所以为一个尾随逗号拒收
+一份提案买不到任何安全，只会把整条模型驱动路径静默降级成规则路径。
+含义则绝不猜测：裸字符串只在**精确命中 Agent 目录**时才接受。
+回退时 `note` 会说清是哪一种——未配置 / 提案被驳回 / 回复无法解析 / 预算用尽，
+而不是只显示 `rule`。
 
 自主性的确切边界见 [docs/AUTONOMY.md](docs/AUTONOMY.md)；
 问诊追问见 [docs/INTERVIEW.md](docs/INTERVIEW.md)，
@@ -101,12 +111,45 @@ python -m yaobi_harness run --complaint "左小腿肿胀2天" --image limb_surfa
 两个方向的代价不对称。任何子体都拿不到方剂、剂量、签名三类工具（`consult_mode` 只能收窄授权，
 用交集而非并集实现），深度上限 1，每位成员用切分预算并回记到父预算。
 
+成员**并发执行**（默认 4 线程，实测 5 个成员 1.56s → 0.32s），但**审计轨迹仍然可复现**：
+每个成员写进自己的 `MemberScope`，全部完成后按会诊名单顺序合并，
+**证据 ID 在合并时才分配**——所以台账取决于名单，不取决于哪个响应先到。
+四种不同抖动下的台账逐条相同，且与顺序执行一致。
+
 视觉判读**永远不是影像报告**：证据等级为 `model_reasoning`（不可放行），
 `requires_formal_read` 是必填且影像类不允许写 false，图片不落盘（只留 sha256），
 调用前必须声明已去标识化，且系统会先做一次身份信息预检——**检出即丢弃全部判读结果**。
 它只能**升级**风险（患肢发紫/张力高 → 血管或骨筋膜室信号），不能撤销规则已判定的红旗。
 
 详见 [docs/PANEL.md](docs/PANEL.md) 与 [docs/VISION.md](docs/VISION.md)。
+
+## 重放日志：过去的决策可以被离线复核
+
+检查点记录的是**状态曾是什么**，但审计要问的是"在恰好这些证据之下，为什么放行了那条建议"。
+回答它必须用当时的工具返回和当时的模型输出重跑，而不是用今天的端点重跑。
+
+```bash
+# 录制：每一次工具执行与模型补全都按内容地址追加到 JSONL
+python -m yaobi_harness run --complaint "…" --journal ./audit/case-001.jsonl
+
+python -m yaobi_harness journal ./audit/case-001.jsonl --entries   # 看里面有什么
+
+# 离线重放：不需要网络，不需要配置模型
+python -m yaobi_harness run --complaint "…" --replay ./audit/case-001.jsonl
+```
+
+三条设计要点：
+
+* **日志不是授权。** 授权在重放时重新推导——以医师身份录的日志，
+  在以患者身份重放时拿不到方剂结果，因为经纪在触及记录之前就拒绝了。
+  被篡改的日志最多让重放**偏离**，不可能把草案提升为已签名处方。
+* **偏离必须响亮。** Agent 用宽泛 `except Exception` 包住模型调用以便回退，
+  这会把偏离异常吞成一句"已回退规则"。所以偏离被**锁存**，运行结束时检查并**故障关闭**，
+  退出码 3——一个把退出码当作"重放确认了原决策"的脚本不能在偏离时被告知"是"。
+* **耗尽 ≠ 偏离。** 同序号不同调用是硬失败；日志用完还有新调用只是告警
+  "本次结果不是纯离线重放"。
+
+详见 [docs/REPLAY.md](docs/REPLAY.md)。
 
 ## 可视化控制台
 
@@ -122,6 +165,14 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 四个视图：**对话问诊**（多轮）、**单次运行**（完整病例检查器）、**用药速查**（只做相互作用筛查）、
 **知识库**（来源目录、许可状态、技能表、专家语料、规则包全文）。后端是普通 JSON API，可被其他前端复用。
 
+单次运行页把本文档里的每一项能力都做成了控件：**召集多学科会诊**勾选后出现
+**会诊并发线程**（1–8，并发只改调用时序不改证据台账）；**录制可复核日志**勾选后
+多出一个**离线复核**标签页——用录制的日志重新推导这次决策，先给结论
+（放行状态、风险模式、规划来源、证据条数逐项对照），并且可以**改写主诉再复核**，
+此时日志按请求内容寻址、病历一变就对不上，运行故障关闭并列出偏离的请求哈希。
+「规划与执行」页现在还会说明**为什么**用了确定性计划，而不只是显示「规则」。
+控制台的日志只存在内存里、不落盘——它和聊天记录一样是临床内容。
+
 需要分享给同事评审时可映射成公开链接（会**强制**生成访问令牌并拼进 URL）：
 
 ```bash
@@ -133,9 +184,11 @@ python -m yaobi_harness ui --public --knowledge-store ./knowledge.db
 > ⚠️ 公网链接是**演示/评审链接，不是临床部署**：令牌只是演示级门禁，没有逐用户身份、没有访问审计、
 > 没有院内网络边界。**不要在公开实例里输入任何真实患者可识别信息。** 默认仍只监听 `127.0.0.1`。
 
-**Colab**：点顶部徽章直接打开 `notebooks/Yaobi_Harness_Colab.ipynb`，十节完整走查——
+**Colab**：点顶部徽章直接打开 `notebooks/Yaobi_Harness_Colab.ipynb`，十六节完整走查——
 安装自检 → 确定性运行 → 骨科规则包 → 实时构建知识库 → 授权药典如何改变放行 →
-xlsx 变技能 → 模型自主执行 → 多轮对话 → 接入 LLM → 内嵌控制台（含 ngrok 公开链接）。
+xlsx 变技能 → 模型自主执行 → 多轮对话 → **自主追问（十问歌 × 专科）** →
+**会诊子体** → **视觉判读** → **技能库** → **并发会诊** → **重放日志** →
+接入 LLM（含模型输出形状容忍度的逐项验证）→ 内嵌控制台（含离线复核与 ngrok 公开链接）。
 
 ## 快速开始
 
@@ -170,8 +223,12 @@ python -m yaobi_harness run --role physician --allow-prescription \
 | --- | --- | --- |
 | `azure` | `AZURE_OPENAI_API_KEY`、`AZURE_OPENAI_ENDPOINT`、`AZURE_OPENAI_DEPLOYMENT` | `AZURE_OPENAI_API_VERSION`（默认 `2024-10-21`） |
 | `poe` | `POE_API_KEY` | `POE_MODEL`（默认 `Claude-Sonnet-4.5`）、`POE_BASE_URL` |
-| `minimax` | `MINIMAX_API_KEY` | `MINIMAX_MODEL`、`MINIMAX_BASE_URL`、`MINIMAX_GROUP_ID` |
+| `minimax` | `MINIMAX_API_KEY` | `MINIMAX_MODEL`（默认 `MiniMax-M3`）、`MINIMAX_REGION`（`china`/`global`）、`MINIMAX_BASE_URL`、`MINIMAX_GROUP_ID` |
 | `litellm` | `LITELLM_MODEL` | `LITELLM_API_KEY`、`LITELLM_BASE_URL`（默认 `http://localhost:4000/v1`） |
+
+> **MiniMax 的两个区域地址不能互换**：国内 `https://api.minimaxi.com/v1`，
+> 海外 `https://api.minimax.io/v1`。默认走国内，用 `MINIMAX_REGION=global` 切换。
+> 已废弃的 `api.minimax.chat` 会**直接报错并给出正确地址**，而不是超时。
 
 ```bash
 export YAOBI_LLM_PROVIDER=azure
@@ -272,17 +329,25 @@ python -m yaobi_harness run --role physician --knowledge-store ./knowledge.db --
   深度上限 1；预算切分并回记父预算；合议取最高紧急度而非多数票。
 * **视觉不做诊断**：判读等级 `model_reasoning`（不可放行），影像类不允许声明
   `requires_formal_read=false`，图片不落盘，PHI 预检命中即丢弃全部结果。
+* **并发下台账仍可复现**：成员写各自的 `MemberScope`，按名单顺序合并分配证据 ID；
+  `Budget` 与 `ToolHealth` 都是读-改-写，已加锁——否则"硬上限"和"两次熔断"在并发下都名不副实。
+* **重放要么复现，要么明说**：调用按内容地址记录，同序号不同调用即判偏离并故障关闭；
+  偏离被锁存，不依赖异常穿透那些合法的 catch。日志耗尽后实跑的尾部不计入"已复现"。
+* **格式失误给一次重提，安全失误不给**：作答不合 schema 时补发一轮"只输出 JSON"并附上
+  schema，因为不该为少一个代码块丢掉模型已经做完的取证；但**输出含克数不重提**——
+  重提只会换个说法再泄一次。重提次数记录在自主执行台账里。
 
 ## 仍未完成
 
 LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化推荐抽取、
 大规模对抗性安全评测与红旗召回率基线仍未实现。模型**不能主动发起对话轮次**（它会答会问，
-但不会自己开口）；会诊成员串行执行而非并发；persona 的 I/O 契约是声明性的、未被强制校验；
-内容寻址的重放日志（能证明续跑发出了同样的调用）尚未实现。内置骨科规则包不能替代完整的相互作用数据库，
+但不会自己开口）；persona 的 I/O 契约是声明性的、未被强制校验；
+重放日志能证明"重放与记录一致"，不能证明"记录未被修改"（需存储层签名）；
+并发只覆盖会诊，图内任务执行仍是串行。内置骨科规则包不能替代完整的相互作用数据库，
 且须经本机构药师/医师复核后启用。**本项目不能对外宣称为临床可用系统。**
 
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 379 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 495 个用例，无需 pytest 与网络
 ```

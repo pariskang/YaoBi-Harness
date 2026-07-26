@@ -153,6 +153,13 @@ class RedFlagScreeningTests(unittest.TestCase):
         untouched = red_flags.screen("突发胸痛")
         self.assertTrue(red_flags.merge_llm_hits(untouched, []).urgent)
 
+    def test_urgent_plan_text_has_no_python_repr_leaking_to_the_patient(self):
+        out = YaobiGraphRunner().run(ClinicalRunState("突发腰痛伴尿潴留和会阴麻木", role="patient"))
+        judgement = out.outputs["urgent_action_plan"]["risk_judgement"]
+        self.assertNotIn("[", judgement)
+        self.assertNotIn("cauda_equina", judgement)
+        self.assertIn("马尾", judgement)
+
     def test_urgent_run_withholds_prescription_and_returns_action_plan(self):
         out = YaobiGraphRunner().run(ClinicalRunState("突发腰痛伴尿潴留和会阴麻木", role="patient"), allow_prescription=True)
         self.assertEqual(out.risk_mode, "urgent")

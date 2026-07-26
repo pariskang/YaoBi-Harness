@@ -19,6 +19,31 @@ from ..state import NON_RELEASABLE_LEVELS, ClinicalRunState
 from ..tools import CapabilityBroker, ToolRegistry, ToolResult, herbs_in
 from . import cognition
 
+#: Patient-facing names for the internal red-flag signal keys. Without these a
+#: raw Python list repr leaks into the text a patient reads.
+SIGNAL_NAMES = {
+    "cauda_equina": "马尾神经受压",
+    "cardiopulmonary": "心肺急症",
+    "vascular_dvt_pe": "深静脉血栓/肺栓塞",
+    "infection_or_tumor": "感染或肿瘤",
+    "septic_joint_or_osteomyelitis": "化脓性关节炎/骨髓炎",
+    "fracture": "骨折或外伤",
+    "progressive_neuro": "进行性神经功能缺损",
+    "cervical_myelopathy": "脊髓型颈椎病",
+    "compartment_syndrome": "骨筋膜室综合征",
+    "night_pain": "夜间痛",
+    "chronic_bone_fragility": "骨质疏松/骨脆性",
+    "age_extremes": "高龄因素",
+    "unclassified_urgent_risk": "未分类急症风险",
+}
+
+
+def signal_text(signals: list[str]) -> str:
+    """Render internal signal keys as a readable Chinese phrase."""
+    names = [SIGNAL_NAMES.get(s, s) for s in signals] or ["急症"]
+    return "、".join(dict.fromkeys(names))
+
+
 MINIMUM_INFO = [
     "起病时间", "疼痛部位/放射", "神经症状", "大小便/会阴感觉", "发热外伤肿瘤史",
     "妊娠/年龄/肝肾功能", "当前用药/过敏", "舌脉", "疼痛评分(VAS)", "功能受限(ODI)",
@@ -198,7 +223,7 @@ class UrgentCareAgent(BaseAgent):
         call_advice = f"请立即拨打{phone}" if phone else "请立即拨打当地官方急救电话"
 
         state.outputs["urgent_action_plan"] = {
-            "risk_judgement": f"存在{hypotheses or ['急症']}风险信号，需要优先排除可致残或致命情况。",
+            "risk_judgement": f"存在「{signal_text(hypotheses)}」相关的风险信号，需要优先排除可致残或致命情况。",
             "why_urgent": "红旗信号不能通过线上问诊安全排除，延误可能导致神经功能损害或危及生命。",
             "immediate_action": f"现在不要等待完整线上问诊；{call_advice}，或由家属陪同立即去急诊。",
             "transport_advice": "尿潴留、会阴麻木、进行性无力、胸痛呼吸困难或晕厥时优先急救转运；不要自行驾车。",

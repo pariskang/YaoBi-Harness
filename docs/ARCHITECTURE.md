@@ -3,6 +3,9 @@
 ## Layering
 
 ```
+   ┌────────────────────────────────────────────────────────┐
+   │ operator console (yaobi_harness.ui) — delivered | audit │
+   └───────────────────────────┬────────────────────────────┘
                 cognition (replaceable, advisory)
    ┌────────────────────────────────────────────────────────┐
    │ PlannerAgent(LLM)  semantic red-flag screen            │
@@ -46,7 +49,12 @@
 6. **Screening escalates on ambiguity.** Suppression is clause-scoped and needs
    an explicit negation / third-party / hypothetical / history cue, with present
    -tense cues vetoing history cues.
-7. **Licences are enforced at write time.** `KnowledgeStore` rejects a
+7. **The console has no privileged path.** `/api/run` builds an ordinary
+   `ClinicalRunState` and drives the ordinary runner; the answer it shows is
+   produced by `render()` for the selected role, and the reasoning record is
+   returned in a separate `audit` object labelled operator-only in the UI. See
+   [CONSOLE.md](CONSOLE.md).
+8. **Licences are enforced at write time.** `KnowledgeStore` rejects a
    non-commercial dataset in a commercial deployment, strips body text from
    read-only sources, and keeps credentialed sources closed without an
    attestation. The repository therefore ships connectors, never content. See

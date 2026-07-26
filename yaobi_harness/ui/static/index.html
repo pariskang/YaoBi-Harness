@@ -1,0 +1,1098 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Yaobi 骨科智能体控制台</title>
+<style>
+/* ─────────────────────────────────────────────────────────────
+   Design tokens. One accent, a wide neutral ramp, and semantic
+   colours reserved exclusively for clinical release states — so
+   colour always means the same thing.
+   ───────────────────────────────────────────────────────────── */
+:root {
+  color-scheme: light dark;
+
+  --ink-0:#ffffff; --ink-1:#fafafa; --ink-2:#f4f4f5; --ink-3:#e8e8ea;
+  --ink-4:#d4d4d8; --ink-6:#8b8b94; --ink-8:#3f3f46; --ink-9:#18181b;
+
+  --bg:var(--ink-1); --surface:var(--ink-0); --surface-2:var(--ink-2);
+  --line:var(--ink-3); --line-strong:var(--ink-4);
+  --text:var(--ink-9); --text-2:#5b5b64; --text-3:var(--ink-6);
+
+  --accent:#3d5afe; --accent-soft:#eef1ff; --accent-line:#c5cffd;
+
+  --ok:#0f7b52;      --ok-soft:#e7f5ee;    --ok-line:#a8dcc4;
+  --warn:#a56100;    --warn-soft:#fdf3e3;  --warn-line:#f0cf94;
+  --danger:#c0342b;  --danger-soft:#fdeeed;--danger-line:#f2bcb7;
+  --info:#1f5f9e;    --info-soft:#eaf2fb;  --info-line:#b6d2ec;
+  --mute-soft:var(--ink-2); --mute-line:var(--line);
+
+  --r-sm:7px; --r-md:11px; --r-lg:15px;
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px; --sp-6:32px; --sp-7:48px;
+  --shadow:0 1px 2px rgba(24,24,27,.05), 0 8px 24px -12px rgba(24,24,27,.14);
+
+  --sans:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",ui-sans-serif,
+         -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:#0d0d0f; --surface:#151518; --surface-2:#1c1c21;
+    --line:#2a2a31; --line-strong:#3a3a44;
+    --text:#f0f0f2; --text-2:#a8a8b3; --text-3:#75757f;
+    --accent:#8ba0ff; --accent-soft:#1b2040; --accent-line:#334080;
+    --ok:#4ec08c;      --ok-soft:#0f2a1f;    --ok-line:#255f45;
+    --warn:#e0a44a;    --warn-soft:#2c2110;  --warn-line:#6a4d1c;
+    --danger:#f08079;  --danger-soft:#2e1614;--danger-line:#6e2f2a;
+    --info:#78b0e8;    --info-soft:#12222f;  --info-line:#2d4f70;
+    --mute-soft:var(--surface-2); --mute-line:var(--line);
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg:#fafafa; --surface:#fff; --surface-2:#f4f4f5; --line:#e8e8ea; --line-strong:#d4d4d8;
+  --text:#18181b; --text-2:#5b5b64; --text-3:#8b8b94;
+  --accent:#3d5afe; --accent-soft:#eef1ff; --accent-line:#c5cffd;
+  --ok:#0f7b52; --ok-soft:#e7f5ee; --ok-line:#a8dcc4;
+  --warn:#a56100; --warn-soft:#fdf3e3; --warn-line:#f0cf94;
+  --danger:#c0342b; --danger-soft:#fdeeed; --danger-line:#f2bcb7;
+  --info:#1f5f9e; --info-soft:#eaf2fb; --info-line:#b6d2ec;
+  --mute-soft:#f4f4f5; --mute-line:#e8e8ea;
+  --shadow:0 1px 2px rgba(24,24,27,.05), 0 8px 24px -12px rgba(24,24,27,.14);
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:#0d0d0f; --surface:#151518; --surface-2:#1c1c21; --line:#2a2a31; --line-strong:#3a3a44;
+  --text:#f0f0f2; --text-2:#a8a8b3; --text-3:#75757f;
+  --accent:#8ba0ff; --accent-soft:#1b2040; --accent-line:#334080;
+  --ok:#4ec08c; --ok-soft:#0f2a1f; --ok-line:#255f45;
+  --warn:#e0a44a; --warn-soft:#2c2110; --warn-line:#6a4d1c;
+  --danger:#f08079; --danger-soft:#2e1614; --danger-line:#6e2f2a;
+  --info:#78b0e8; --info-soft:#12222f; --info-line:#2d4f70;
+  --mute-soft:#1c1c21; --mute-line:#2a2a31;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+}
+
+*,*::before,*::after { box-sizing:border-box; }
+html,body { margin:0; padding:0; }
+/* `.split` sets display:grid, which would otherwise beat the UA rule for
+   [hidden] and leave inactive views stacked on the page. */
+[hidden] { display:none !important; }
+body {
+  background:var(--bg); color:var(--text);
+  font-family:var(--sans); font-size:14px; line-height:1.6;
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+}
+h1,h2,h3,h4 { margin:0; font-weight:600; letter-spacing:-0.011em; }
+p { margin:0; }
+button,input,select,textarea { font:inherit; color:inherit; }
+a { color:var(--accent); text-decoration:none; }
+a:hover { text-decoration:underline; }
+
+/* ── chrome ─────────────────────────────────────────────────── */
+.top {
+  position:sticky; top:0; z-index:20;
+  display:flex; align-items:center; gap:var(--sp-4);
+  padding:0 var(--sp-5); height:58px;
+  background:color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter:saturate(180%) blur(14px);
+  border-bottom:1px solid var(--line);
+}
+.brand { display:flex; align-items:center; gap:10px; margin-right:var(--sp-2); }
+.mark {
+  width:26px; height:26px; border-radius:8px; flex:none;
+  background:linear-gradient(140deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #12b3a6));
+  display:grid; place-items:center; color:#fff; font-size:13px; font-weight:700;
+}
+.brand b { font-size:14.5px; font-weight:650; letter-spacing:-0.015em; white-space:nowrap; }
+.brand span { display:block; font-size:11px; color:var(--text-3); line-height:1.2; letter-spacing:0; }
+
+.nav { display:flex; gap:2px; background:var(--surface-2); padding:3px; border-radius:var(--r-md); }
+.nav button {
+  border:0; background:transparent; color:var(--text-2);
+  padding:5px 13px; border-radius:8px; cursor:pointer; font-size:13px; font-weight:500;
+  transition:background .15s, color .15s;
+}
+.nav button:hover { color:var(--text); }
+.nav button[aria-selected="true"] { background:var(--surface); color:var(--text); box-shadow:0 1px 2px rgba(0,0,0,.07); }
+
+.top-right { margin-left:auto; display:flex; align-items:center; gap:var(--sp-2); }
+.icon-btn {
+  width:32px; height:32px; border-radius:9px; border:1px solid var(--line);
+  background:var(--surface); cursor:pointer; display:grid; place-items:center;
+  color:var(--text-2); font-size:14px; transition:border-color .15s, color .15s;
+}
+.icon-btn:hover { border-color:var(--line-strong); color:var(--text); }
+
+/* ── layout ─────────────────────────────────────────────────── */
+main { max-width:1440px; margin:0 auto; padding:var(--sp-5); }
+.split { display:grid; grid-template-columns:minmax(300px, 372px) minmax(0,1fr); gap:var(--sp-5); align-items:start; }
+/* Grid items default to min-width:auto, so a wide result table would widen the
+   whole column — and with it the composer — instead of scrolling inside its own
+   container. */
+.split > * { min-width:0; }
+@media (max-width:1080px) { .split { grid-template-columns:minmax(0,1fr); } }
+
+.card {
+  background:var(--surface); border:1px solid var(--line);
+  border-radius:var(--r-lg); box-shadow:var(--shadow);
+}
+.card-head {
+  display:flex; align-items:center; gap:var(--sp-2);
+  padding:var(--sp-4) var(--sp-5); border-bottom:1px solid var(--line);
+}
+.card-head h2 { font-size:13.5px; font-weight:600; }
+.card-head .sub { font-size:12px; color:var(--text-3); margin-left:auto; }
+.card-body { padding:var(--sp-5); }
+.composer { position:sticky; top:78px; }
+@media (max-width:1080px) { .composer { position:static; } }
+
+/* ── form ───────────────────────────────────────────────────── */
+.field { margin-bottom:var(--sp-4); }
+.field:last-child { margin-bottom:0; }
+label.lbl {
+  display:block; font-size:12px; font-weight:600; color:var(--text-2);
+  margin-bottom:6px; letter-spacing:.005em;
+}
+label.lbl em { font-style:normal; font-weight:400; color:var(--text-3); }
+textarea, input[type=text], select {
+  width:100%; background:var(--surface); border:1px solid var(--line-strong);
+  border-radius:var(--r-sm); padding:9px 11px; font-size:13.5px; outline:none;
+  transition:border-color .15s, box-shadow .15s;
+}
+textarea { resize:vertical; min-height:88px; line-height:1.65; }
+textarea:focus, input:focus, select:focus {
+  border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.seg { display:flex; background:var(--surface-2); padding:3px; border-radius:var(--r-sm); gap:2px; }
+.seg button {
+  flex:1; border:0; background:transparent; color:var(--text-2); cursor:pointer;
+  padding:6px 4px; border-radius:6px; font-size:12.5px; font-weight:500; transition:.15s;
+}
+.seg button[aria-pressed="true"] { background:var(--surface); color:var(--text); box-shadow:0 1px 2px rgba(0,0,0,.07); }
+
+.check { display:flex; align-items:flex-start; gap:9px; cursor:pointer; padding:7px 0; }
+.check input { margin:3px 0 0; accent-color:var(--accent); width:15px; height:15px; flex:none; }
+.check div { font-size:13px; }
+.check small { display:block; color:var(--text-3); font-size:11.5px; line-height:1.45; }
+
+.chips { display:flex; flex-wrap:wrap; gap:6px; }
+.chip {
+  border:1px solid var(--line-strong); background:var(--surface); color:var(--text-2);
+  padding:4px 10px; border-radius:99px; font-size:12px; cursor:pointer; transition:.15s;
+}
+.chip:hover { border-color:var(--accent-line); color:var(--text); }
+.chip[aria-pressed="true"] { background:var(--accent-soft); border-color:var(--accent-line); color:var(--accent); font-weight:500; }
+
+.btn {
+  width:100%; border:0; border-radius:var(--r-sm); padding:11px 16px; cursor:pointer;
+  background:var(--accent); color:#fff; font-size:14px; font-weight:600;
+  display:flex; align-items:center; justify-content:center; gap:8px;
+  transition:filter .15s, opacity .15s;
+}
+.btn:hover:not(:disabled) { filter:brightness(1.08); }
+.btn:disabled { opacity:.55; cursor:not-allowed; }
+.btn-ghost { background:var(--surface-2); color:var(--text); border:1px solid var(--line-strong); }
+
+.spinner {
+  width:14px; height:14px; border-radius:50%; flex:none;
+  border:2px solid rgba(255,255,255,.35); border-top-color:#fff; animation:spin .7s linear infinite;
+}
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* ── status hero: the single most important element on screen ── */
+.hero { border-radius:var(--r-lg); border:1px solid; padding:var(--sp-5); margin-bottom:var(--sp-5); }
+.hero-top { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.hero-dot { width:9px; height:9px; border-radius:50%; flex:none; }
+.hero h2 { font-size:17px; letter-spacing:-0.02em; }
+.hero .why { margin-top:8px; font-size:13.5px; color:var(--text-2); line-height:1.62; }
+.hero-meta { display:flex; flex-wrap:wrap; gap:6px; margin-top:var(--sp-4); }
+
+.t-ok     { background:var(--ok-soft);     border-color:var(--ok-line); }
+.t-ok     .hero-dot, .t-ok h2     { color:var(--ok); }
+.t-warn   { background:var(--warn-soft);   border-color:var(--warn-line); }
+.t-warn   .hero-dot, .t-warn h2   { color:var(--warn); }
+.t-danger { background:var(--danger-soft); border-color:var(--danger-line); }
+.t-danger .hero-dot, .t-danger h2 { color:var(--danger); }
+.t-info   { background:var(--info-soft);   border-color:var(--info-line); }
+.t-info   .hero-dot, .t-info h2   { color:var(--info); }
+.t-mute   { background:var(--mute-soft);   border-color:var(--mute-line); }
+.t-mute   .hero-dot, .t-mute h2   { color:var(--text-2); }
+.hero-dot { background:currentColor; }
+
+/* ── badges & pills ─────────────────────────────────────────── */
+.badge {
+  display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:500;
+  padding:3px 9px; border-radius:99px; border:1px solid var(--line);
+  background:var(--surface-2); color:var(--text-2); white-space:nowrap;
+}
+.badge.mono { font-family:var(--mono); font-size:11px; }
+.badge.b-ok     { background:var(--ok-soft);     border-color:var(--ok-line);     color:var(--ok); }
+.badge.b-warn   { background:var(--warn-soft);   border-color:var(--warn-line);   color:var(--warn); }
+.badge.b-danger { background:var(--danger-soft); border-color:var(--danger-line); color:var(--danger); }
+.badge.b-info   { background:var(--info-soft);   border-color:var(--info-line);   color:var(--info); }
+.badge.b-accent { background:var(--accent-soft); border-color:var(--accent-line); color:var(--accent); }
+
+/* ── tabs ───────────────────────────────────────────────────── */
+.tabs { display:flex; gap:var(--sp-5); border-bottom:1px solid var(--line); padding:0 var(--sp-5); overflow-x:auto; }
+.tabs button {
+  border:0; background:transparent; cursor:pointer; padding:12px 0 10px;
+  font-size:13px; font-weight:500; color:var(--text-3); white-space:nowrap;
+  border-bottom:2px solid transparent; margin-bottom:-1px; transition:color .15s;
+  display:flex; align-items:center; gap:6px;
+}
+.tabs button:hover { color:var(--text-2); }
+.tabs button[aria-selected="true"] { color:var(--text); border-bottom-color:var(--accent); }
+.tabs .count {
+  font-size:10.5px; font-family:var(--mono); background:var(--surface-2);
+  border-radius:99px; padding:1px 6px; color:var(--text-3);
+}
+
+/* ── content primitives ─────────────────────────────────────── */
+.sec { padding:var(--sp-5); border-bottom:1px solid var(--line); }
+.sec:last-child { border-bottom:0; }
+.sec > h3 {
+  font-size:11.5px; font-weight:600; text-transform:uppercase; letter-spacing:.07em;
+  color:var(--text-3); margin-bottom:var(--sp-3);
+}
+.list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:9px; }
+.list li { display:flex; gap:10px; font-size:13.5px; line-height:1.6; }
+.list li::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--line-strong); margin-top:9px; flex:none; }
+
+.row {
+  display:flex; align-items:flex-start; gap:var(--sp-3); padding:11px 0;
+  border-bottom:1px solid var(--line); font-size:13px;
+}
+.row:last-child { border-bottom:0; }
+.row .k { flex:none; width:150px; color:var(--text-3); font-size:12.5px; }
+.row .v { flex:1; min-width:0; }
+
+.note {
+  border:1px solid; border-radius:var(--r-md); padding:12px 14px; font-size:13px; line-height:1.6;
+  display:flex; gap:10px; align-items:flex-start;
+}
+.note .ico { flex:none; font-size:13px; line-height:1.5; }
+.note.n-warn   { background:var(--warn-soft);   border-color:var(--warn-line);   color:var(--warn); }
+.note.n-danger { background:var(--danger-soft); border-color:var(--danger-line); color:var(--danger); }
+.note.n-info   { background:var(--info-soft);   border-color:var(--info-line);   color:var(--info); }
+.note.n-mute   { background:var(--mute-soft);   border-color:var(--mute-line);   color:var(--text-2); }
+.note b { font-weight:600; }
+
+.finding { border:1px solid var(--line); border-radius:var(--r-md); overflow:hidden; margin-bottom:10px; }
+.finding:last-child { margin-bottom:0; }
+.finding-head { display:flex; align-items:center; gap:10px; padding:11px 14px; background:var(--surface-2); }
+.finding-head strong { font-size:13.5px; font-weight:600; flex:1; min-width:0; }
+.finding-body { padding:12px 14px; display:flex; flex-direction:column; gap:9px; font-size:13px; }
+.finding-body dt { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--text-3); margin-bottom:3px; }
+.finding-body dd { margin:0; line-height:1.62; color:var(--text-2); }
+
+/* ── task graph ─────────────────────────────────────────────── */
+.graph { display:flex; flex-direction:column; gap:0; }
+.node { display:flex; gap:var(--sp-3); position:relative; padding-bottom:14px; }
+.node:last-child { padding-bottom:0; }
+.node::before {
+  content:""; position:absolute; left:11px; top:22px; bottom:0; width:1.5px; background:var(--line);
+}
+.node:last-child::before { display:none; }
+.node .pip {
+  width:23px; height:23px; border-radius:50%; flex:none; z-index:1;
+  display:grid; place-items:center; font-size:11px; font-weight:700;
+  border:1.5px solid; background:var(--surface);
+}
+.node .meat { flex:1; min-width:0; padding-top:1px; }
+.node .meat .name { font-size:13.5px; font-weight:600; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.node .meat .obj { font-size:12.5px; color:var(--text-3); margin-top:2px; }
+.node .meat .tools { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
+.p-ok     { border-color:var(--ok-line);     color:var(--ok); }
+.p-skip   { border-color:var(--line-strong); color:var(--text-3); }
+.p-fail   { border-color:var(--danger-line); color:var(--danger); }
+.p-repair { border-color:var(--warn-line);   color:var(--warn); }
+
+/* ── tables ─────────────────────────────────────────────────── */
+.tbl-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:var(--r-md); }
+table { width:100%; border-collapse:collapse; font-size:12.5px; }
+th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { background:var(--surface-2); font-weight:600; font-size:11px; text-transform:uppercase;
+     letter-spacing:.06em; color:var(--text-3); white-space:nowrap; }
+tbody tr:last-child td { border-bottom:0; }
+td.mono, .mono { font-family:var(--mono); font-size:11.5px; }
+/* Hashes, evidence-id runs and URLs must break rather than widen the layout. */
+.mono, .row .v, .finding-body dd, .list li { overflow-wrap:anywhere; }
+
+/* ── misc ───────────────────────────────────────────────────── */
+.empty { text-align:center; padding:var(--sp-7) var(--sp-5); color:var(--text-3); }
+.empty .big { font-size:26px; margin-bottom:10px; opacity:.5; }
+.empty h3 { font-size:14px; color:var(--text-2); margin-bottom:6px; }
+.empty p { font-size:13px; max-width:400px; margin:0 auto; line-height:1.65; }
+
+details.raw { margin-top:var(--sp-4); }
+details.raw summary { cursor:pointer; font-size:12px; color:var(--text-3); user-select:none; }
+details.raw summary:hover { color:var(--text-2); }
+pre.json {
+  margin:10px 0 0; padding:14px; background:var(--surface-2); border:1px solid var(--line);
+  border-radius:var(--r-md); overflow-x:auto; font-family:var(--mono); font-size:11.5px;
+  line-height:1.6; color:var(--text-2); max-height:440px; overflow-y:auto;
+}
+.stat-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(128px,1fr)); gap:10px; }
+.stat { border:1px solid var(--line); border-radius:var(--r-md); padding:13px 14px; background:var(--surface-2); }
+.stat .n { font-size:21px; font-weight:650; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; }
+.stat .l { font-size:11.5px; color:var(--text-3); margin-top:1px; }
+.hint { font-size:12px; color:var(--text-3); line-height:1.6; }
+.sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+
+/* ── narrow screens ─────────────────────────────────────────
+   The header carries a brand block, three nav tabs and two status
+   badges; below ~720px they cannot share one row, so the brand
+   subtitle and the badge set step aside rather than pushing the
+   page into horizontal scroll. */
+@media (max-width:720px) {
+  main { padding:var(--sp-4); }
+  .top { padding:0 var(--sp-4); gap:var(--sp-2); height:54px; }
+  .brand span { display:none; }
+  .brand b { font-size:13.5px; }
+  .nav button { padding:5px 9px; font-size:12.5px; }
+  #badgeLlm, #badgeKnow { display:none; }
+  .card-head, .card-body, .sec, .tabs { padding-left:var(--sp-4); padding-right:var(--sp-4); }
+  .hero { padding:var(--sp-4); }
+  .tabs { gap:var(--sp-4); }
+  .row { flex-direction:column; gap:2px; }
+  .row .k { width:auto; }
+  .node .meat .tools { gap:4px; }
+}
+@media (max-width:460px) {
+  /* Below this the wordmark wraps and squeezes the nav; the mark alone still
+     identifies the app. */
+  .brand { margin-right:0; }
+  .brand b { display:none; }
+  .nav { flex:1; }
+  .nav button { flex:1; padding:5px 6px; font-size:12px; white-space:nowrap; }
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <div class="mark">腰</div>
+    <div>
+      <b>Yaobi 骨科智能体</b>
+      <span>证据受控 · 医师在环 · 故障关闭</span>
+    </div>
+  </div>
+  <nav class="nav" role="tablist" aria-label="主导航">
+    <button role="tab" data-view="run"   aria-selected="true">诊疗运行</button>
+    <button role="tab" data-view="drugs" aria-selected="false">用药速查</button>
+    <button role="tab" data-view="know"  aria-selected="false">知识库</button>
+  </nav>
+  <div class="top-right">
+    <span class="badge mono" id="badgeLlm">LLM …</span>
+    <span class="badge mono" id="badgeKnow">知识库 …</span>
+    <button class="icon-btn" id="themeBtn" title="切换主题" aria-label="切换主题">◐</button>
+  </div>
+</header>
+
+<main>
+  <!-- ═════════════ 诊疗运行 ═════════════ -->
+  <section id="view-run" class="split">
+    <div class="card composer">
+      <div class="card-head"><h2>病例</h2><span class="sub" id="caseStoreInfo"></span></div>
+      <div class="card-body">
+        <div class="field">
+          <label class="lbl" for="role">交付对象 <em>决定可用工具与输出裁剪</em></label>
+          <div class="seg" id="roleSeg">
+            <button data-role="patient">患者</button>
+            <button data-role="physician" aria-pressed="true">医师</button>
+            <button data-role="researcher">研究者</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="lbl" for="complaint">主诉与现病史</label>
+          <textarea id="complaint" placeholder="例：腰痛3月，久坐加重，右下肢麻木，无大小便异常"></textarea>
+        </div>
+
+        <div class="field">
+          <label class="lbl">示例病例</label>
+          <div class="chips" id="examples"></div>
+        </div>
+
+        <div class="field">
+          <label class="lbl" for="meds">当前用药 <em>逗号分隔，中英皆可</em></label>
+          <input type="text" id="meds" placeholder="布洛芬 0.3g bid, 华法林 3mg qd">
+        </div>
+
+        <div class="field">
+          <label class="lbl">患者状态 <em>决定条件门控规则是否触发</em></label>
+          <div class="chips" id="conditions"></div>
+        </div>
+
+        <div class="field">
+          <label class="lbl" for="facts">结构化事实 <em>JSON，可选</em></label>
+          <textarea id="facts" style="min-height:64px;font-family:var(--mono);font-size:12px"
+            placeholder='{"special_population":{"pregnancy":false,"age":63,"renal":"normal","liver":"normal"},"medications_confirmed":true,"allergies_confirmed":true}'></textarea>
+        </div>
+
+        <div class="field">
+          <label class="check">
+            <input type="checkbox" id="allowRx">
+            <div>允许生成含剂量草案
+              <small>仅医师角色生效；仍需逐味审核签名才能成为处方</small></div>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="useLlm" checked>
+            <div>启用 LLM 规划与审查
+              <small>提案经规则层校验，越权即整体驳回并回退默认计划</small></div>
+          </label>
+        </div>
+
+        <button class="btn" id="runBtn">运行智能体</button>
+        <p class="hint" style="margin-top:10px" id="runHint"></p>
+      </div>
+    </div>
+
+    <div id="result">
+      <div class="card"><div class="empty">
+        <div class="big">◇</div>
+        <h3>尚未运行</h3>
+        <p>填写主诉后运行。控制台会展示交付给该角色的内容，以及完整的规划、证据与安全审查记录。</p>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- ═════════════ 用药速查 ═════════════ -->
+  <section id="view-drugs" class="split" hidden>
+    <div class="card composer">
+      <div class="card-head"><h2>相互作用速查</h2></div>
+      <div class="card-body">
+        <div class="field">
+          <label class="lbl" for="dMeds">药物清单 <em>逗号分隔</em></label>
+          <textarea id="dMeds" placeholder="布洛芬, 华法林, 泼尼松"></textarea>
+        </div>
+        <div class="field">
+          <label class="lbl">患者状态</label>
+          <div class="chips" id="dConditions"></div>
+        </div>
+        <button class="btn" id="dRunBtn">筛查</button>
+        <p class="hint" style="margin-top:10px">
+          内置规则包只覆盖骨科高频高危组合，须经本机构药师复核后启用；未接入授权 DDI 数据库时不构成完整审查。
+        </p>
+      </div>
+    </div>
+    <div id="dResult">
+      <div class="card"><div class="empty">
+        <div class="big">◈</div><h3>输入药物清单开始筛查</h3>
+        <p>支持中英文药名与商品名片段，按类别匹配；条件门控规则需勾选对应患者状态才会触发。</p>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- ═════════════ 知识库 ═════════════ -->
+  <section id="view-know" hidden>
+    <div id="knowBody"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+/* ─── tiny DOM helpers ─────────────────────────────────────── */
+const $  = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c =>
+  ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+const el = (html) => { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content; };
+
+/* ─── clinical vocabulary ──────────────────────────────────── */
+const RELEASE = {
+  urgent_action_plan:    { tone:"danger", label:"急症行动计划",   why:"检出红旗信号，线上不能安全排除，需立即线下急诊评估。" },
+  blocked:               { tone:"danger", label:"已阻断",         why:"安全审查发现不可放行的问题，本次结果不得作为临床依据。" },
+  failed_closed:         { tone:"danger", label:"故障关闭",       why:"关键工具失败或策略拒绝，系统按故障关闭处理，不产出结论。" },
+  needs_examination:     { tone:"warn",   label:"需线下检查",     why:"存在待证实的风险信号或用药安全问题，需线下评估后再决策。" },
+  needs_more_information:{ tone:"warn",   label:"信息不足",       why:"关键问诊信息缺失，继续推理会超出证据支持范围。" },
+  insufficient_evidence: { tone:"warn",   label:"证据不足",       why:"可用证据不足以支撑结论。" },
+  treatment_advice_only: { tone:"info",   label:"仅治疗建议",     why:"未通过含剂量放行门槛，仅提供不含克数的治法建议。" },
+  draft_for_physician:   { tone:"info",   label:"医师草案",       why:"已通过全部剂量安全门槛，但仍须医师逐味审核签名后方可作为处方。" },
+  approved_by_physician: { tone:"ok",     label:"医师已签署",     why:"已完成逐味审核与签名放行。" },
+};
+const SEVERITY = {
+  contraindicated:{ tone:"danger", label:"禁忌" },
+  major:          { tone:"danger", label:"严重" },
+  moderate:       { tone:"warn",   label:"中等" },
+  minor:          { tone:"mute",   label:"轻微" },
+};
+const LEVEL = {
+  guideline_or_standard:      { tone:"ok",     label:"指南/标准" },
+  pharmacopeia_or_formal_norm:{ tone:"ok",     label:"药典/说明书" },
+  expert_case:                { tone:"info",   label:"专家病例" },
+  observed_fact:              { tone:"info",   label:"客观事实" },
+  tool_result:                { tone:"mute",   label:"工具结果" },
+  model_reasoning:            { tone:"warn",   label:"模型推理" },
+  stub_not_for_clinical_use:  { tone:"warn",   label:"占位·不可临床" },
+  failed_tool_event:          { tone:"danger", label:"工具失败" },
+};
+const STATUS_PIP = {
+  ok:{ cls:"p-ok", ch:"✓" }, failed:{ cls:"p-fail", ch:"!" },
+  repair_requested:{ cls:"p-repair", ch:"↻" }, pending:{ cls:"p-skip", ch:"·" },
+};
+const pip = (s) => STATUS_PIP[s] || { cls:"p-skip", ch:"–" };
+const badge = (text, tone) => `<span class="badge${tone && tone!=="mute" ? " b-"+tone : ""}">${esc(text)}</span>`;
+const toneOf = (map, key, fallback="mute") => (map[key]?.tone) || fallback;
+const labelOf = (map, key) => (map[key]?.label) || key;
+
+/* ─── state ────────────────────────────────────────────────── */
+let BOOT = null, LAST = null, ACTIVE_TAB = "answer";
+const picked = { conditions:new Set(), dConditions:new Set() };
+
+/* ─── theme ────────────────────────────────────────────────── */
+(function initTheme() {
+  const saved = localStorage.getItem("yaobi-theme");
+  if (saved) document.documentElement.dataset.theme = saved;
+  $("#themeBtn").addEventListener("click", () => {
+    const root = document.documentElement;
+    const now = root.dataset.theme ||
+      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const next = now === "dark" ? "light" : "dark";
+    root.dataset.theme = next;
+    localStorage.setItem("yaobi-theme", next);
+  });
+})();
+
+/* ─── navigation ───────────────────────────────────────────── */
+$$(".nav button").forEach(btn => btn.addEventListener("click", () => {
+  $$(".nav button").forEach(b => b.setAttribute("aria-selected", String(b === btn)));
+  ["run","drugs","know"].forEach(v => { $("#view-" + v).hidden = (v !== btn.dataset.view); });
+  if (btn.dataset.view === "know") renderKnowledge();
+}));
+
+/* ─── API ──────────────────────────────────────────────────── */
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({ error:`HTTP ${res.status}` }));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+/* ─── bootstrap ────────────────────────────────────────────── */
+async function boot() {
+  try { BOOT = await api("/api/bootstrap"); }
+  catch (e) { $("#runHint").textContent = "无法连接后端: " + e.message; return; }
+
+  const llm = BOOT.llm || {};
+  $("#badgeLlm").textContent = llm.available ? `LLM ${llm.provider}/${llm.model}` : "LLM 未配置";
+  $("#badgeLlm").className = "badge mono" + (llm.available ? " b-accent" : "");
+
+  const kn = BOOT.knowledge || {};
+  const nSrc = kn.stats?.enabled_sources?.length || 0;
+  $("#badgeKnow").textContent = kn.configured ? `知识库 ${nSrc} 源` : "知识库 未配置";
+  $("#badgeKnow").className = "badge mono" + (kn.configured ? " b-ok" : " b-warn");
+
+  $("#caseStoreInfo").textContent = BOOT.case_store_records
+    ? `专家病例 ${BOOT.case_store_records} 条` : "未加载专家病例库";
+
+  $("#examples").replaceChildren(...(BOOT.examples || []).map(ex => {
+    const b = document.createElement("button");
+    b.className = "chip"; b.type = "button"; b.textContent = ex.label;
+    b.addEventListener("click", () => {
+      $("#complaint").value = ex.complaint;
+      setRole(ex.role);
+      const f = { ...(ex.facts || {}) };
+      $("#meds").value = (f.medications || []).join(", ");
+      picked.conditions = new Set(f.conditions || []);
+      delete f.medications; delete f.conditions;
+      $("#facts").value = Object.keys(f).length ? JSON.stringify(f, null, 2) : "";
+      $("#allowRx").checked = ex.role === "physician";
+      renderConditionChips();
+    });
+    return b;
+  }));
+
+  renderConditionChips();
+  if (!llm.available) $("#runHint").textContent = "未配置 LLM，将以确定性规则路径运行。";
+  if (llm.error) $("#runHint").textContent = "LLM 配置错误: " + llm.error;
+}
+
+function setRole(role) {
+  $$("#roleSeg button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.role === role)));
+}
+const currentRole = () => $("#roleSeg button[aria-pressed=true]")?.dataset.role || "physician";
+$$("#roleSeg button").forEach(b => b.addEventListener("click", () => setRole(b.dataset.role)));
+
+function renderConditionChips() {
+  [["#conditions","conditions"], ["#dConditions","dConditions"]].forEach(([sel, key]) => {
+    $(sel).replaceChildren(...(BOOT?.conditions || []).map(c => {
+      const b = document.createElement("button");
+      b.className = "chip"; b.type = "button"; b.textContent = c;
+      b.setAttribute("aria-pressed", String(picked[key].has(c)));
+      b.addEventListener("click", () => {
+        picked[key].has(c) ? picked[key].delete(c) : picked[key].add(c);
+        b.setAttribute("aria-pressed", String(picked[key].has(c)));
+      });
+      return b;
+    }));
+  });
+}
+
+const splitList = (s) => String(s || "").split(/[,，;；\n]/).map(x => x.trim()).filter(Boolean);
+
+/* ═══════════════════ RUN ═══════════════════ */
+$("#runBtn").addEventListener("click", runCase);
+$("#complaint").addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") runCase();
+});
+
+async function runCase() {
+  const complaint = $("#complaint").value.trim();
+  if (!complaint) { $("#complaint").focus(); return; }
+
+  let facts = {};
+  const raw = $("#facts").value.trim();
+  if (raw) {
+    try { facts = JSON.parse(raw); }
+    catch (e) { $("#runHint").textContent = "结构化事实不是合法 JSON: " + e.message; return; }
+  }
+  const meds = splitList($("#meds").value);
+  if (meds.length) facts.medications = meds;
+  if (picked.conditions.size) facts.conditions = [...picked.conditions];
+
+  const btn = $("#runBtn");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>运行中…';
+  $("#runHint").textContent = "";
+
+  try {
+    LAST = await api("/api/run", {
+      complaint, role: currentRole(), facts,
+      allow_prescription: $("#allowRx").checked,
+      use_llm: $("#useLlm").checked,
+    });
+    ACTIVE_TAB = "answer";
+    renderRun();
+  } catch (e) {
+    $("#result").replaceChildren(el(
+      `<div class="card"><div class="card-body"><div class="note n-danger">
+        <span class="ico">▲</span><div><b>运行失败</b><br>${esc(e.message)}</div></div></div></div>`));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "运行智能体";
+  }
+}
+
+function renderRun() {
+  const { delivered, audit, meta } = LAST;
+  const info = RELEASE[meta.release_status] || { tone:"mute", label:meta.release_status, why:"" };
+  const blockers = (audit.safety_issues || []).length;
+
+  const tabs = [
+    ["answer", "交付内容", null],
+    ["plan",   "规划与执行", (audit.tasks || []).length],
+    ["meds",   "用药安全", (audit.medication_safety?.findings || []).length],
+    ["evidence","证据台账", (audit.evidence || []).length],
+    ["safety", "安全审查", blockers],
+    ["raw",    "原始 JSON", null],
+  ];
+
+  $("#result").replaceChildren(el(`
+    <div class="hero t-${info.tone}">
+      <div class="hero-top">
+        <span class="hero-dot"></span>
+        <h2>${esc(info.label)}</h2>
+        <span class="badge mono">${esc(meta.release_status)}</span>
+        ${meta.risk_mode === "urgent" ? badge("急症模式","danger") : ""}
+      </div>
+      ${info.why ? `<p class="why">${esc(info.why)}</p>` : ""}
+      <div class="hero-meta">
+        ${badge("交付对象 " + roleName(meta.role), "mute")}
+        ${badge("规划 " + (meta.planner_mode === "llm" ? "LLM" : "规则"), meta.planner_mode === "llm" ? "accent" : "mute")}
+        ${badge("轮次 " + (meta.loops_used ?? 1), "mute")}
+        ${badge("工具 " + (meta.budget?.tool_calls ?? "-"), "mute")}
+        ${meta.llm?.available ? badge("模型 " + meta.llm.provider, "accent") : ""}
+        ${badge(meta.knowledge?.configured ? "知识库 " + (meta.knowledge.enabled_sources || []).length + " 源" : "知识库未配置",
+                meta.knowledge?.configured ? "ok" : "warn")}
+      </div>
+    </div>
+    <div class="card">
+      <div class="tabs" id="tabs">${tabs.map(([id, label, n]) => `
+        <button data-tab="${id}" aria-selected="${id === ACTIVE_TAB}">${esc(label)}${
+          n ? `<span class="count">${n}</span>` : ""}</button>`).join("")}</div>
+      <div id="tabBody"></div>
+    </div>`));
+
+  $$("#tabs button").forEach(b => b.addEventListener("click", () => {
+    ACTIVE_TAB = b.dataset.tab;
+    $$("#tabs button").forEach(x => x.setAttribute("aria-selected", String(x === b)));
+    renderTab();
+  }));
+  renderTab();
+  revealResult("#result");
+}
+
+/* The composer is taller than most viewports, so clicking 运行 leaves the user
+   scrolled past the verdict. Bring it back into view — but only scroll up,
+   never yank the page downwards. */
+function revealResult(sel) {
+  const top = $(sel).getBoundingClientRect().top + window.scrollY - 74;
+  if (window.scrollY > top) window.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+}
+
+const roleName = (r) => ({ patient:"患者", physician:"医师", researcher:"研究者" }[r] || r);
+
+function renderTab() {
+  const body = $("#tabBody");
+  const { delivered, audit, meta } = LAST;
+  const fns = { answer:tabAnswer, plan:tabPlan, meds:tabMeds, evidence:tabEvidence, safety:tabSafety, raw:tabRaw };
+  body.replaceChildren(el(fns[ACTIVE_TAB](delivered, audit, meta)));
+}
+
+/* ── tab: delivered answer ─────────────────────────────────── */
+function tabAnswer(d, audit, meta) {
+  const out = [];
+
+  out.push(`<div class="sec"><div class="note n-mute"><span class="ico">◎</span><div>
+    <b>这是交付给「${esc(roleName(meta.role))}」的内容。</b>其余标签页是操作者审计视图，不对该角色展示。
+    ${d.disclaimer ? "<br>" + esc(d.disclaimer) : ""}</div></div></div>`);
+
+  if (d.urgent) {
+    out.push(`<div class="sec"><h3>立即行动</h3>
+      <div class="note n-danger" style="margin-bottom:14px"><span class="ico">▲</span>
+        <div><b>${esc(d.urgent.immediate_action || "")}</b><br>${esc(d.urgent.transport_advice || "")}</div></div>
+      ${kv([["风险判断", d.urgent.risk_judgement], ["为何紧急", d.urgent.why_urgent],
+            ["不确定性", d.urgent.uncertainty]])}</div>`);
+    out.push(listSec("途中要做", d.urgent.during_transport));
+    out.push(listSec("不要做", d.urgent.do_not));
+    out.push(listSec("告诉医生", d.urgent.tell_clinicians));
+    out.push(listSec("出现以下情况立即升级", d.urgent.escalate_if));
+  }
+
+  if (d.medication_warnings?.length) {
+    out.push(`<div class="sec"><h3>用药提醒</h3>${d.medication_warnings.map(w => `
+      <div class="note n-danger" style="margin-bottom:10px"><span class="ico">▲</span><div>
+        <b>${esc(w.combination)}</b> ${badge(labelOf(SEVERITY, w.severity), toneOf(SEVERITY, w.severity))}
+        <br>${esc(w.what_to_do)}</div></div>`).join("")}</div>`);
+  }
+
+  out.push(listSec("可能的原因", d.what_this_might_be || d.biomedical?.differentials));
+  out.push(listSec("下一步建议", d.what_to_do_next || d.biomedical?.exam_advice));
+  out.push(listSec("出现以下情况请就医", d.see_a_doctor_if));
+  out.push(listSec("需要你回答", d.questions_for_you || d.open_questions));
+
+  if (d.tcm_pattern) {
+    out.push(`<div class="sec"><h3>中医辨证</h3>${kv([
+      ["主要证型", d.tcm_pattern.primary_pattern],
+      ["候选证型", (d.tcm_pattern.candidate_patterns || []).join("、")],
+      ["尚需反证", (d.tcm_pattern.counter_evidence_needed || []).join("、")]])}</div>`);
+  }
+  if (d.formula) {
+    out.push(`<div class="sec"><h3>候选方</h3>${kv([
+      ["方名", d.formula.formula_name], ["治法", (d.formula.treatment_principle || []).join("、")],
+      ["组成", (d.formula.herbs || []).join("、")], ["配伍校验", d.formula.combination_check]])}</div>`);
+  }
+  if (d.prescription_draft) out.push(draftSection(d.prescription_draft));
+  const review = d.physician_review;
+  if (review && !(review.problems_checked || []).includes("no_draft_to_review")) {
+    out.push(`<div class="sec"><h3>医师审核</h3>${kv([
+      ["状态", review.approved ? "已签署放行" : "等待逐味审核与签名"],
+      ["医师", review.physician_id],
+      ["问题", (review.problems_checked || []).join("；")]])}</div>`);
+  }
+  if (d.counts) {
+    out.push(`<div class="sec"><h3>聚合统计</h3><div class="stat-grid">${
+      Object.entries(d.counts).map(([k, v]) => `<div class="stat"><div class="n">${v}</div><div class="l">${esc(k)}</div></div>`).join("")
+    }</div></div>`);
+  }
+  if (d.citations?.length) out.push(citationSection(d.citations));
+
+  return out.filter(Boolean).join("") || emptyBlock("该角色本次无可交付内容");
+}
+
+function draftSection(draft) {
+  return `<div class="sec"><h3>处方草案 · 需医师逐味审核</h3>
+    <div class="note n-info" style="margin-bottom:14px"><span class="ico">◎</span><div>
+      不确定性 <b>${esc(draft.overall_uncertainty)}</b> · 指纹
+      <span class="mono">${esc(draft.prescription_hash || "")}</span><br>
+      未经逐味审核与签名，不得作为最终处方使用。</div></div>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>药味</th><th>剂量</th><th>授权范围</th><th>样本量</th><th>炮制</th><th>状态</th></tr></thead>
+      <tbody>${(draft.herbs || []).map(h => `<tr>
+        <td><b>${esc(h.herb_name)}</b></td>
+        <td class="mono">${esc(h.dose_value)} ${esc(h.dose_unit || "g")}</td>
+        <td class="mono">${h.authorized_range_g ? esc(h.authorized_range_g.join("–")) + " g" : "—"}</td>
+        <td class="mono">${esc(h.sample_n ?? "—")}</td>
+        <td>${esc(h.processing || "")}</td>
+        <td>${badge(h.physician_status === "pending" ? "待审核" : h.physician_status, "warn")}</td>
+      </tr>`).join("")}</tbody>
+    </table></div></div>`;
+}
+
+/* ── tab: plan & execution ─────────────────────────────────── */
+function tabPlan(d, audit, meta) {
+  const traceByAgent = {};
+  (audit.traces || []).forEach(t => { (traceByAgent[t.agent] ||= []).push(t); });
+
+  const nodes = (audit.tasks || []).map(t => {
+    const p = pip(t.status);
+    const traces = traceByAgent[t.agent] || [];
+    return `<div class="node">
+      <div class="pip ${p.cls}">${p.ch}</div>
+      <div class="meat">
+        <div class="name">${esc(t.agent)}
+          ${badge(statusLabel(t.status), statusTone(t.status))}
+          ${t.origin === "llm" ? badge("LLM 提案","accent") : ""}
+          ${t.repair_reason ? badge("修复 " + t.repair_reason, "warn") : ""}</div>
+        <div class="obj">${esc(t.objective)}</div>
+        ${t.required_tools?.length ? `<div class="tools">${
+          t.required_tools.map(x => `<span class="badge mono">${esc(x)}</span>`).join("")}</div>` : ""}
+        ${traces.map(tr => tr.output_summary
+          ? `<div class="obj" style="margin-top:6px">↳ ${esc(tr.output_summary)}</div>` : "").join("")}
+      </div></div>`;
+  }).join("");
+
+  return `<div class="sec">
+      <h3>规划来源</h3>
+      <div class="note ${meta.planner_mode === "llm" ? "n-info" : "n-mute"}"><span class="ico">◎</span><div>
+        ${meta.planner_mode === "llm"
+          ? "<b>LLM 生成的任务图已通过规则层校验。</b>校验覆盖 Agent 白名单、技能工具表、角色、风险模式与依赖环；任一不通过即整体驳回。"
+          : "<b>使用确定性规则计划。</b>未配置模型、模型调用失败或 LLM 提案被驳回时均回退到此路径。"}
+      </div></div></div>
+    <div class="sec"><h3>任务图</h3><div class="graph">${nodes || "<p class='hint'>无任务</p>"}</div></div>
+    ${audit.missing_information?.length ? listSec("信息缺口", audit.missing_information) : ""}
+    ${audit.open_questions?.length ? listSec("待追问", audit.open_questions) : ""}`;
+}
+const statusLabel = (s) => ({
+  ok:"完成", failed:"失败", pending:"待执行", repair_requested:"待修复",
+  skipped_dependency:"依赖未满足", skipped_not_authorized:"未授权跳过",
+}[s] || s);
+const statusTone = (s) => ({ ok:"ok", failed:"danger", repair_requested:"warn" }[s] || "mute");
+
+/* ── tab: medication safety ────────────────────────────────── */
+function tabMeds(d, audit) {
+  const ms = audit.medication_safety || {};
+  if (!ms.reviewed) {
+    return `<div class="sec"><div class="note n-warn"><span class="ico">▲</span><div>
+      <b>未进行用药相互作用审查。</b>${esc(ms.note || "未提供当前用药清单")}
+      <br>在左侧「当前用药」填入药物后重新运行。</div></div></div>`;
+  }
+  const findings = ms.findings || [];
+  if (!findings.length) {
+    return `<div class="sec"><div class="note n-info"><span class="ico">◎</span><div>
+      已审查 <b>${(ms.medications_reviewed || []).length}</b> 种药物，未命中骨科高危组合。
+      <br>${esc(ms.coverage_note || "")}</div></div></div>`;
+  }
+  return `<div class="sec">
+      <h3>已审查</h3>
+      <div class="chips">${(ms.medications_reviewed || []).map(m => `<span class="badge">${esc(m)}</span>`).join("")}
+      ${(ms.conditions_considered || []).map(c => badge(c, "info")).join("")}</div>
+      <p class="hint" style="margin-top:10px">${esc(ms.coverage_note || "")}</p></div>
+    <div class="sec"><h3>发现 ${findings.length} 项</h3>${findings.map(f => `
+      <div class="finding">
+        <div class="finding-head">
+          ${badge(labelOf(SEVERITY, f.severity), toneOf(SEVERITY, f.severity))}
+          <strong>${esc(f.title || (f.subject + " + " + f.object))}</strong>
+          <span class="badge mono">${esc(f.rule_id || f.provenance?.source_id || "")}</span>
+        </div>
+        <dl class="finding-body">
+          ${f.mechanism ? `<div><dt>机制</dt><dd>${esc(f.mechanism)}</dd></div>` : ""}
+          ${f.management ? `<div><dt>处理</dt><dd>${esc(f.management)}</dd></div>` : ""}
+          ${f.matched_drugs ? `<div><dt>命中药物</dt><dd>${
+            Object.entries(f.matched_drugs).map(([cls, ds]) =>
+              `<span class="mono">${esc(cls)}</span> → ${esc(ds.join("、"))}`).join("<br>")}</dd></div>` : ""}
+          ${f.matched_conditions?.length ? `<div><dt>触发条件</dt><dd>${esc(f.matched_conditions.join("、"))}</dd></div>` : ""}
+        </dl></div>`).join("")}</div>`;
+}
+
+/* ── tab: evidence ledger ──────────────────────────────────── */
+function tabEvidence(d, audit) {
+  const rows = (audit.evidence || []).map(e => `<tr>
+    <td class="mono">${esc(e.id)}</td>
+    <td>${badge(labelOf(LEVEL, e.level), toneOf(LEVEL, e.level))}</td>
+    <td class="mono">${esc(e.source)}</td>
+    <td>${esc(e.summary)}</td>
+    <td>${e.releasable ? badge("可放行","ok") : badge("不可放行","warn")}</td></tr>`).join("");
+
+  const claims = (audit.claims || []).map(c => `<tr>
+    <td class="mono">${esc(c.id)}</td><td>${esc(c.kind)}</td><td>${esc(c.text)}</td>
+    <td class="mono">${esc((c.evidence_ids || []).join(" "))}</td>
+    <td class="mono">${esc(c.confidence)}</td></tr>`).join("");
+
+  return `<div class="sec"><h3>证据台账</h3>
+      <p class="hint" style="margin-bottom:12px">
+        等级由产出该证据的工具自行声明，消费方不能提升。占位数据源永远记为「占位·不可临床」。</p>
+      <div class="tbl-wrap"><table><thead><tr>
+        <th>ID</th><th>等级</th><th>来源</th><th>摘要</th><th>放行</th></tr></thead>
+        <tbody>${rows || "<tr><td colspan='5'>无</td></tr>"}</tbody></table></div></div>
+    <div class="sec"><h3>结论与引用绑定</h3>
+      <div class="tbl-wrap"><table><thead><tr>
+        <th>ID</th><th>类型</th><th>结论</th><th>证据</th><th>置信度</th></tr></thead>
+        <tbody>${claims || "<tr><td colspan='5'>无</td></tr>"}</tbody></table></div></div>
+    ${audit.citations?.length ? citationSection(audit.citations) : ""}`;
+}
+
+function citationSection(citations) {
+  return `<div class="sec"><h3>外部来源出处</h3><div class="tbl-wrap"><table>
+    <thead><tr><th>来源</th><th>许可</th><th>版本</th><th>发布</th><th>检索时间</th></tr></thead>
+    <tbody>${citations.map(c => `<tr>
+      <td>${c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.source || c.source_id)}</a>`
+                  : esc(c.source || c.source_id)}</td>
+      <td>${esc(c.license || "")}</td>
+      <td class="mono">${esc(c.version || "")}</td>
+      <td class="mono">${esc(c.published || "")}</td>
+      <td class="mono">${esc(c.retrieved_at || "")}</td></tr>`).join("")}
+    </tbody></table></div></div>`;
+}
+
+/* ── tab: safety audit ─────────────────────────────────────── */
+function tabSafety(d, audit) {
+  const sa = audit.safety_audit || {};
+  const issues = audit.safety_issues || [];
+  const warnings = audit.warnings || [];
+
+  return `<div class="sec">
+      <h3>裁决</h3>
+      ${issues.length
+        ? `<div class="note n-danger"><span class="ico">▲</span><div><b>${issues.length} 项阻断问题</b><br>
+            安全审查是终结节点，无条件执行——包括故障关闭和全部任务被跳过的运行。</div></div>
+           <ul class="list" style="margin-top:14px">${issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>`
+        : `<div class="note n-info"><span class="ico">◎</span><div>未发现阻断问题。</div></div>`}
+    </div>
+    ${warnings.length ? `<div class="sec"><h3>告警 ${warnings.length} 项</h3>
+      <ul class="list">${warnings.map(w => `<li>${esc(w)}</li>`).join("")}</ul></div>` : ""}
+    ${sa.repair_requests?.length ? `<div class="sec"><h3>修复请求</h3>
+      <ul class="list">${sa.repair_requests.map(r =>
+        `<li><b>${esc(r.agent)}</b> — ${esc(r.reason)}</li>`).join("")}</ul></div>` : ""}
+    ${sa.uncited_claims?.length ? `<div class="sec"><h3>缺少可放行证据的结论</h3>
+      <p class="hint" style="margin-bottom:12px">这些结论已降级为提示性内容；高风险类型（剂量、急症行动）缺证据会直接阻断放行。</p>
+      <ul class="list">${sa.uncited_claims.map(c =>
+        `<li>${esc(typeof c === "string" ? c : c.text)}</li>`).join("")}</ul></div>` : ""}
+    <div class="sec"><h3>已执行的检查</h3>
+      <div class="chips">${(sa.checks_run || []).map(c =>
+        `<span class="badge mono">${esc(c)}</span>`).join("") || "<span class='hint'>无</span>"}</div></div>
+    ${audit.dose_safety?.blockers?.length ? `<div class="sec"><h3>剂量安全门槛</h3>
+      <ul class="list">${audit.dose_safety.blockers.map(b => `<li>${esc(b)}</li>`).join("")}</ul></div>` : ""}`;
+}
+
+function tabRaw(d, audit, meta) {
+  return `<div class="sec"><h3>完整响应</h3>
+    <pre class="json">${esc(JSON.stringify(LAST, null, 2))}</pre></div>`;
+}
+
+/* ── shared blocks ─────────────────────────────────────────── */
+function listSec(title, items) {
+  if (!items?.length) return "";
+  return `<div class="sec"><h3>${esc(title)}</h3><ul class="list">${
+    items.map(i => `<li>${esc(typeof i === "string" ? i : JSON.stringify(i))}</li>`).join("")}</ul></div>`;
+}
+function kv(pairs) {
+  const rows = pairs.filter(([, v]) => v !== undefined && v !== null && v !== "");
+  if (!rows.length) return "";
+  return rows.map(([k, v]) => `<div class="row"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("");
+}
+const emptyBlock = (msg) => `<div class="empty"><h3>${esc(msg)}</h3></div>`;
+
+/* ═══════════════════ DRUG CHECK ═══════════════════ */
+$("#dRunBtn").addEventListener("click", async () => {
+  const meds = splitList($("#dMeds").value);
+  if (!meds.length) { $("#dMeds").focus(); return; }
+  const btn = $("#dRunBtn");
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>筛查中…';
+  try {
+    const data = await api("/api/interactions", { medications: meds, conditions: [...picked.dConditions] });
+    const findings = [...(data.rule_findings || []), ...(data.database_findings || [])];
+    $("#dResult").replaceChildren(el(`
+      <div class="hero t-${findings.length ? (data.blocking?.length ? "danger" : "warn") : "ok"}">
+        <div class="hero-top"><span class="hero-dot"></span>
+          <h2>${findings.length ? `命中 ${findings.length} 项` : "未命中已知高危组合"}</h2>
+          ${data.blocking?.length ? badge(`${data.blocking.length} 项需阻断`, "danger") : ""}</div>
+        <p class="why">${esc(data.coverage_note || "")}</p>
+        <div class="hero-meta">${(data.medications || []).map(m => badge(m, "mute")).join("")}
+          ${(data.conditions || []).map(c => badge(c, "info")).join("")}</div>
+      </div>
+      <div class="card">${findings.length
+        ? tabMeds(null, { medication_safety: {
+            reviewed:true, findings, medications_reviewed:data.medications,
+            conditions_considered:data.conditions, coverage_note:data.coverage_note } })
+        : `<div class="sec"><div class="note n-info"><span class="ico">◎</span><div>
+             内置规则包未命中。这不等于安全——规则包只覆盖骨科高频高危组合。</div></div></div>`}
+      </div>`));
+    revealResult("#dResult");
+  } catch (e) {
+    $("#dResult").replaceChildren(el(`<div class="card"><div class="card-body">
+      <div class="note n-danger"><span class="ico">▲</span><div>${esc(e.message)}</div></div></div></div>`));
+  } finally { btn.disabled = false; btn.textContent = "筛查"; }
+});
+
+/* ═══════════════════ KNOWLEDGE ═══════════════════ */
+async function renderKnowledge() {
+  if (!BOOT) return;
+  const lic = BOOT.license || {}, kn = BOOT.knowledge || {}, stats = kn.stats?.counts || {};
+  const REUSE = {
+    public_domain:   { tone:"ok",     label:"公有领域" },
+    open_attribution:{ tone:"ok",     label:"署名开放" },
+    noncommercial:   { tone:"warn",   label:"仅非商业" },
+    link_only:       { tone:"warn",   label:"仅引用" },
+    credentialed:    { tone:"danger", label:"须授权" },
+  };
+
+  let rules = { rules: [] };
+  try { rules = await api("/api/rules"); } catch { /* rules panel is optional */ }
+
+  $("#knowBody").replaceChildren(el(`
+    <div class="card" style="margin-bottom:24px">
+      <div class="card-head"><h2>知识库状态</h2>
+        <span class="sub">${esc(kn.path || "未配置")}</span></div>
+      <div class="card-body">
+        ${kn.configured ? `<div class="stat-grid" style="margin-bottom:16px">
+          ${["sources","guidelines","label_sections","dose_ranges","interactions"].map(k =>
+            `<div class="stat"><div class="n">${stats[k] ?? 0}</div><div class="l">${esc(k)}</div></div>`).join("")}
+          </div>` : `<div class="note n-warn" style="margin-bottom:16px"><span class="ico">▲</span><div>
+            <b>未配置授权知识库。</b>指南与药典证据将记为占位数据，不可作为临床依据。<br>
+            构建：<span class="mono">python -m yaobi_harness knowledge build --store ./knowledge.db</span><br>
+            启动控制台时加 <span class="mono">--knowledge-store ./knowledge.db</span>。</div></div>`}
+        <div class="chips">
+          ${badge("部署模式 " + (lic.policy?.mode || "-"), "accent")}
+          ${(lic.policy?.attested_sources || []).map(s => badge("已授权 " + s, "ok")).join("") ||
+            badge("无授权声明", "mute")}
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:24px">
+      <div class="card-head"><h2>来源目录与许可</h2>
+        <span class="sub">许可在写入时强制执行，不是文档提醒</span></div>
+      <div class="card-body"><div class="tbl-wrap"><table>
+        <thead><tr><th>来源</th><th>类型</th><th>复用等级</th><th>商用</th><th>当前可用</th></tr></thead>
+        <tbody>${(lic.sources || []).map(s => `<tr>
+          <td>${s.license_url ? `<a href="${esc(s.license_url)}" target="_blank" rel="noopener">${esc(s.name)}</a>`
+                              : esc(s.name)}<br><span class="mono" style="color:var(--text-3)">${esc(s.source_id)}</span></td>
+          <td>${esc(s.kind)}</td>
+          <td>${badge(REUSE[s.reuse]?.label || s.reuse, REUSE[s.reuse]?.tone)}</td>
+          <td>${s.commercial_ok ? badge("可","ok") : badge("否","warn")}</td>
+          <td>${s.enabled ? badge("启用","ok") : `${badge("禁用","mute")}<br><span class="hint mono">${esc(s.reason)}</span>`}</td>
+        </tr>`).join("")}</tbody></table></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>骨科相互作用规则包</h2>
+        <span class="sub">${rules.rules.length} 条规则 · ${BOOT.rules?.class_count || 0} 个药物类别</span></div>
+      <div class="card-body">
+        <div class="note n-warn" style="margin-bottom:16px"><span class="ico">▲</span><div>
+          ${esc(BOOT.rules?.review_required || "")}；不能替代完整的相互作用数据库。</div></div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>规则</th><th>组合</th><th>级别</th><th>触发条件</th><th>处理</th></tr></thead>
+          <tbody>${rules.rules.map(r => `<tr>
+            <td class="mono">${esc(r.rule_id)}</td>
+            <td><b>${esc(r.title)}</b><br><span class="mono" style="color:var(--text-3)">${
+              esc((r.requires_all || []).join("  +  "))}</span></td>
+            <td>${badge(labelOf(SEVERITY, r.severity), toneOf(SEVERITY, r.severity))}</td>
+            <td class="mono">${esc((r.any_conditions || []).join(", ") || "—")}</td>
+            <td>${esc(r.management)}</td></tr>`).join("")}</tbody></table></div>
+      </div>
+    </div>`));
+}
+
+boot();
+</script>
+</body>
+</html>

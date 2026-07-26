@@ -47,6 +47,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("llm-check", help="show which LLM provider is configured")
 
+    ui = sub.add_parser("ui", help="serve the local operator console")
+    ui.add_argument("--host", default="127.0.0.1", help="bind address; keep on localhost unless fronted by an authenticated proxy")
+    ui.add_argument("--port", type=int, default=8000)
+    ui.add_argument("--knowledge-store")
+    ui.add_argument("--xlsx")
+    ui.add_argument("--checkpoint-dir")
+    ui.add_argument("--llm-provider", choices=["azure", "poe", "minimax", "litellm", "none"])
+    ui.add_argument("--llm-model")
+    ui.add_argument("--open", action="store_true", help="open a browser window")
+
     knowledge = sub.add_parser("knowledge", help="build and inspect the licensed knowledge store")
     ksub = knowledge.add_subparsers(dest="kcmd", required=True)
 
@@ -167,6 +177,17 @@ def main(argv=None) -> int:
 
     if args.cmd == "knowledge":
         return _knowledge_command(args)
+
+    if args.cmd == "ui":
+        from .ui.server import serve
+
+        serve(
+            host=args.host, port=args.port,
+            knowledge_store=args.knowledge_store, xlsx=args.xlsx,
+            llm_provider=args.llm_provider, llm_model=args.llm_model,
+            checkpoint_dir=args.checkpoint_dir, open_browser=args.open,
+        )
+        return 0
 
     if args.cmd == "llm-check":
         try:

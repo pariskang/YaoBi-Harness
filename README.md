@@ -13,6 +13,25 @@ Agent、不能触及技能未授权的工具、不能清除规则层命中的风
 > 严禁把原始 Excel 身份数据提交、打包或直接返回给模型。病例检索只能使用脱敏 ETL 后的结构化字段；含剂量方剂只能以
 > `draft_for_physician` 作为医师草案，未逐味审核签名不得发布为最终处方。
 
+## 可视化控制台
+
+```bash
+python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
+```
+
+控制台是一个**智能体运行检查器**，不是聊天界面：放行状态是视觉主角，
+`计划 → 执行 → 证据 → 裁决` 全部可见，「交付内容」与「操作者审计」在页面上明确分离——
+切换交付对象（患者/医师/研究者）能直接看到输出裁剪的差异。零依赖、零 CDN、单文件页面、
+明暗双主题，可在离线院内网络运行。详见 [docs/CONSOLE.md](docs/CONSOLE.md)。
+
+三个视图：**诊疗运行**（完整病例）、**用药速查**（只做相互作用筛查）、
+**知识库**（来源目录、许可状态、规则包全文）。后端是普通 JSON API，可被其他前端复用。
+
+> ⚠️ 控制台**没有身份认证**，默认只监听 `127.0.0.1`；不要在没有自有认证代理的情况下暴露到共享网络。
+
+**Colab**：`notebooks/Yaobi_Harness_Colab.ipynb` 是完整走查（安装自检 → 确定性运行 → 骨科规则包 →
+实时构建知识库 → 授权药典如何改变放行 → 接入 LLM → 内嵌控制台），可直接在 Colab 打开运行。
+
 ## 快速开始
 
 ```bash
@@ -113,5 +132,5 @@ LangGraph 原生 interrupt/resume、医师审批 UI、多轮问诊状态机、�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 128 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 148 个用例，无需 pytest 与网络
 ```

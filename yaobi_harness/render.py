@@ -165,6 +165,67 @@ def _researcher_view(state: ClinicalRunState) -> dict[str, Any]:
     }
 
 
+def console_payload(state: ClinicalRunState, role: str | None = None) -> dict[str, Any]:
+    """Build the operator-console view: what would be delivered, plus the audit.
+
+    This is deliberately *not* what a patient receives. ``delivered`` is the
+    role-scoped answer that would actually go out; ``audit`` is the reasoning
+    record — plan, tool trace, evidence ledger, safety findings — shown only to
+    the operator running the console. Keeping the two separate on the wire is
+    what stops the console from quietly becoming a privacy leak.
+    """
+    role = role or state.role
+    return {
+        "delivered": render(state, role),
+        "audit": {
+            "tasks": [
+                {
+                    "task_id": t.task_id, "agent": t.agent, "objective": t.objective,
+                    "status": t.status, "depends_on": t.depends_on,
+                    "required_tools": t.required_tools, "origin": t.origin,
+                    "repair_reason": t.repair_reason,
+                }
+                for t in state.tasks
+            ],
+            "traces": [
+                {
+                    "agent": t.agent, "action": t.action, "output_summary": t.output_summary,
+                    "evidence_ids": t.evidence_ids, "timestamp": t.timestamp,
+                }
+                for t in state.traces
+            ],
+            "evidence": [
+                {
+                    "id": e.evidence_id, "level": e.level, "source": e.source, "summary": e.summary,
+                    "source_version": e.source_version,
+                    "releasable": e.level not in NON_RELEASABLE_LEVELS,
+                    "tool_ok": bool(e.payload.get("tool_ok", True)),
+                }
+                for e in state.evidence.values()
+            ],
+            "claims": [
+                {"id": c.claim_id, "kind": c.kind, "text": c.text,
+                 "evidence_ids": c.evidence_ids, "confidence": c.confidence, "origin": c.origin}
+                for c in state.claims
+            ],
+            "safety_audit": state.outputs.get("safety_audit", {}),
+            "safety_issues": state.safety_issues,
+            "warnings": state.warnings,
+            "citations": citation_bundle(state),
+            "medication_safety": state.outputs.get("medication_safety", {}),
+            "dose_safety": state.outputs.get("dose_safety", {}),
+            "prescription_draft": state.outputs.get("prescription_draft"),
+            "missing_information": state.missing_information,
+            "open_questions": state.open_questions,
+        },
+        "meta": {
+            **_header(state),
+            **(state.outputs.get("run_meta") or {}),
+            "intake": state.outputs.get("intake", {}).get("screening", {}),
+        },
+    }
+
+
 def _level_histogram(state: ClinicalRunState) -> dict[str, int]:
     histogram: dict[str, int] = {}
     for evidence in state.evidence.values():

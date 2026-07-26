@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,13 +143,31 @@ class KnowledgeStore:
         self.policy = policy or LicensePolicy()
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        # The store is shared by the threaded operator console, so the
+        # connection is opened for cross-thread use and every statement is
+        # serialised by ``_lock``. An in-memory store could not use
+        # thread-local connections at all (each thread would see an empty DB),
+        # and this component is read-mostly, so one lock is the simple correct
+        # answer rather than a connection pool.
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        with self._lock:
+            self.conn.executescript(SCHEMA)
+            self.conn.commit()
+
+    def _write(self, sql: str, params: Iterable[Any]) -> None:
+        with self._lock:
+            self.conn.execute(sql, tuple(params))
+            self.conn.commit()
+
+    def _query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(sql, tuple(params)).fetchall()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def __enter__(self) -> "KnowledgeStore":
         return self
@@ -164,13 +183,12 @@ class KnowledgeStore:
 
     def register_source(self, source_id: str, version: str = "", url: str = "") -> None:
         source = self._authorize(source_id)
-        self.conn.execute(
+        self._write(
             "INSERT OR REPLACE INTO sources(source_id, name, license, reuse, version, retrieved_at, url)"
             " VALUES (?,?,?,?,?,?,?)",
             (source_id, source.name, source.license.license_name, source.license.reuse.value,
              version, now(), url or source.license.url),
         )
-        self.conn.commit()
 
     def _text_or_empty(self, source: KnowledgeSource, text: str) -> str:
         """Strip body text for sources that grant no redistribution right."""
@@ -196,7 +214,7 @@ class KnowledgeStore:
         if source.license.reuse is Reuse.LINK_ONLY and not url:
             raise LicenseError(f"{source_id}: read-only source requires a citation URL")
         self.register_source(source_id, version=version, url=url)
-        self.conn.execute(
+        self._write(
             "INSERT OR REPLACE INTO guidelines(guideline_id, source_id, title, topic, url, published, version,"
             " evidence_grade, summary, body, recommendations, retrieved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
@@ -205,7 +223,6 @@ class KnowledgeStore:
                 json.dumps(list(recommendations), ensure_ascii=False), now(),
             ),
         )
-        self.conn.commit()
 
     def add_label_section(
         self,
@@ -224,13 +241,12 @@ class KnowledgeStore:
         source = self._authorize(source_id)
         self.register_source(source_id, version=label_version, url=url)
         key = f"{source_id}:{ingredient.lower()}:{set_id or brand}:{section}"
-        self.conn.execute(
+        self._write(
             "INSERT OR REPLACE INTO label_sections(label_key, source_id, ingredient, brand, rxcui, set_id,"
             " label_version, effective_time, section, text, url, retrieved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (key, source_id, ingredient.lower(), brand, rxcui, set_id, label_version, effective_time,
              section, self._text_or_empty(source, text), url, now()),
         )
-        self.conn.commit()
 
     def add_dose_range(
         self,
@@ -251,13 +267,12 @@ class KnowledgeStore:
             raise ValueError(f"invalid dose range for {substance}: {min_value}-{max_value}")
         self.register_source(source_id, version=version)
         key = f"{source_id}:{substance}:{population}:{route}:{unit}"
-        self.conn.execute(
+        self._write(
             "INSERT OR REPLACE INTO dose_ranges(dose_key, source_id, substance, substance_type, population, route,"
             " min_value, max_value, unit, basis, version, retrieved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (key, source_id, substance, substance_type, population, route,
              float(min_value), float(max_value), unit, basis, version, now()),
         )
-        self.conn.commit()
 
     def add_interaction(
         self,
@@ -275,12 +290,11 @@ class KnowledgeStore:
         self.register_source(source_id, version=version)
         left, right = sorted([subject.strip().lower(), object_.strip().lower()])
         key = f"{source_id}:{left}|{right}"
-        self.conn.execute(
+        self._write(
             "INSERT OR REPLACE INTO interactions(interaction_key, source_id, subject, object, severity,"
             " mechanism, management, evidence, version, retrieved_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (key, source_id, left, right, severity.lower(), mechanism, management, evidence, version, now()),
         )
-        self.conn.commit()
 
     # ------------------------------------------------------------------ reads
     def _provenance(self, row: sqlite3.Row) -> dict[str, str]:
@@ -297,7 +311,7 @@ class KnowledgeStore:
 
     def enabled_sources(self) -> list[str]:
         """Sources present in the store that this deployment may still use."""
-        rows = self.conn.execute("SELECT source_id FROM sources").fetchall()
+        rows = self._query("SELECT source_id FROM sources")
         out = []
         for row in rows:
             source = SOURCE_CATALOG.get(row["source_id"])
@@ -310,9 +324,7 @@ class KnowledgeStore:
         if not enabled:
             return []
         terms = [t for t in _terms(topic) if t]
-        rows = self.conn.execute(
-            f"SELECT * FROM guidelines WHERE source_id IN ({_marks(enabled)})", enabled
-        ).fetchall()
+        rows = self._query(f"SELECT * FROM guidelines WHERE source_id IN ({_marks(enabled)})", enabled)
         scored = []
         for row in rows:
             haystack = " ".join([row["title"], row["topic"], row["summary"], row["recommendations"]]).lower()
@@ -338,11 +350,11 @@ class KnowledgeStore:
         if not enabled:
             return []
         wanted = list(sections)
-        rows = self.conn.execute(
+        rows = self._query(
             f"SELECT * FROM label_sections WHERE ingredient = ? AND source_id IN ({_marks(enabled)})"
             f" AND section IN ({_marks(wanted)})",
             [ingredient.strip().lower(), *enabled, *wanted],
-        ).fetchall()
+        )
         return [
             {
                 "ingredient": row["ingredient"],
@@ -365,10 +377,10 @@ class KnowledgeStore:
         enabled = self.enabled_sources()
         if not enabled:
             return None
-        rows = self.conn.execute(
+        rows = self._query(
             f"SELECT * FROM dose_ranges WHERE substance = ? AND source_id IN ({_marks(enabled)})",
             [substance, *enabled],
-        ).fetchall()
+        )
         if not rows:
             return None
         preferred = sorted(rows, key=lambda r: (
@@ -391,11 +403,11 @@ class KnowledgeStore:
         lowered = sorted({n.strip().lower() for n in names if n and n.strip()})
         if not enabled or len(lowered) < 2:
             return []
-        rows = self.conn.execute(
+        rows = self._query(
             f"SELECT * FROM interactions WHERE source_id IN ({_marks(enabled)})"
             f" AND subject IN ({_marks(lowered)}) AND object IN ({_marks(lowered)})",
             [*enabled, *lowered, *lowered],
-        ).fetchall()
+        )
         return [
             {
                 "subject": row["subject"],
@@ -412,7 +424,7 @@ class KnowledgeStore:
     def stats(self) -> dict[str, Any]:
         counts = {}
         for table in ("sources", "guidelines", "label_sections", "dose_ranges", "interactions"):
-            counts[table] = self.conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            counts[table] = self._query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
         return {
             "path": str(self.path),
             "counts": counts,

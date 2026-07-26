@@ -26,3 +26,7 @@ yaobi-harness = "yaobi_harness.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["yaobi_harness*"]
+
+# The console page and the skill manifest are runtime assets, not just source.
+[tool.setuptools.package-data]
+yaobi_harness = ["ui/static/*.html", "skills/*.yaml"]

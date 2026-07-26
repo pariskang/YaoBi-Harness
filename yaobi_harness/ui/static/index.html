@@ -1688,7 +1688,7 @@ function replyMeta(reply) {
     ${badge(info.label, info.tone)}
     ${reply.risk_mode === "urgent" ? badge("急症模式","danger") : ""}
     ${reply.escalated ? badge("本轮升级","danger") : ""}
-    ${reply.composer === "llm_rephrase" ? badge("模型改写","accent") : badge("模板生成","mute")}
+    ${reply.composer === "llm" ? badge("模型撰写","accent") : badge("确定性模板","mute")}
     ${reply.awaiting_answer ? "" : badge("已达终态","mute")}
   </div>`;
 }

@@ -214,6 +214,53 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertTrue(all(r == ["openfda"] for r in results))
 
 
+class PageTokenPlumbingTests(unittest.TestCase):
+    """The page must carry the token, not just be *served* one.
+
+    The server accepted a token four ways — bearer, ``X-Yaobi-Token``, ``?t=`` and
+    a cookie — and the page sent none of them. Only the initial HTML load carried
+    ``?t=``; every XHR after it got a 401, so a token-protected console (Colab's
+    embedded iframe, any ``--public`` tunnel) rendered its chrome and then failed
+    on the first action with "缺少或错误的访问令牌".
+
+    Asserted statically because the check has to hold without a browser in the
+    test dependencies. It is deliberately about *mechanism*, not wording: what
+    broke was the absence of any token plumbing at all, and that is what this
+    detects if someone rewrites ``api()`` again.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = STATIC.read_text(encoding="utf-8")
+
+    def test_the_page_reads_the_token_from_the_url(self):
+        self.assertIn("URLSearchParams(location.search)", self.page)
+        self.assertIn('get("t")', self.page)
+
+    def test_the_page_sends_the_token_on_every_request(self):
+        self.assertIn("X-Yaobi-Token", self.page,
+                      "api() must attach the token; without it every XHR 401s")
+
+    def test_the_token_survives_a_reload_without_the_query_string(self):
+        """Storage and cookie are both attempted: an embedded frame may block either."""
+        self.assertIn("sessionStorage", self.page)
+        self.assertIn("yaobi_token", self.page)
+
+    def test_reading_the_token_tolerates_blocked_storage(self):
+        """A third-party iframe can make sessionStorage throw on access."""
+        marker = self.page[self.page.index("function readToken"):]
+        marker = marker[: marker.index("/* ─── API")]
+        self.assertIn("try", marker)
+        self.assertIn("catch", marker)
+
+    def test_the_query_parameter_is_not_stripped_from_the_url(self):
+        """It is the only channel that always works, so it stays as the fallback."""
+        self.assertNotIn("history.replaceState", self.page)
+
+    def test_a_missing_token_is_reported_as_a_setup_problem(self):
+        self.assertIn("需要访问令牌", self.page)
+
+
 class AccessTokenTests(unittest.TestCase):
     """A public tunnel is only acceptable with a token gate in front of it."""
 

@@ -203,8 +203,12 @@ python -m yaobi_harness run --role physician --allow-prescription \
 | --- | --- | --- |
 | `azure` | `AZURE_OPENAI_API_KEY`、`AZURE_OPENAI_ENDPOINT`、`AZURE_OPENAI_DEPLOYMENT` | `AZURE_OPENAI_API_VERSION`（默认 `2024-10-21`） |
 | `poe` | `POE_API_KEY` | `POE_MODEL`（默认 `Claude-Sonnet-4.5`）、`POE_BASE_URL` |
-| `minimax` | `MINIMAX_API_KEY` | `MINIMAX_MODEL`、`MINIMAX_BASE_URL`、`MINIMAX_GROUP_ID` |
+| `minimax` | `MINIMAX_API_KEY` | `MINIMAX_MODEL`（默认 `MiniMax-M3`）、`MINIMAX_REGION`（`china`/`global`）、`MINIMAX_BASE_URL`、`MINIMAX_GROUP_ID` |
 | `litellm` | `LITELLM_MODEL` | `LITELLM_API_KEY`、`LITELLM_BASE_URL`（默认 `http://localhost:4000/v1`） |
+
+> **MiniMax 的两个区域地址不能互换**：国内 `https://api.minimaxi.com/v1`，
+> 海外 `https://api.minimax.io/v1`。默认走国内，用 `MINIMAX_REGION=global` 切换。
+> 已废弃的 `api.minimax.chat` 会**直接报错并给出正确地址**，而不是超时。
 
 ```bash
 export YAOBI_LLM_PROVIDER=azure

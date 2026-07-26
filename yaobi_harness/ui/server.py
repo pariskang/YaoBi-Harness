@@ -537,7 +537,13 @@ def serve(
     )
     httpd = create_server(service, host, port)
     url = f"http://{host}:{port}/"
-    print(f"Yaobi 控制台已启动: {url}")
+    # Print the URL that actually works. Printing the bare address when a token is
+    # configured hands the operator a link that 401s on every request, which reads
+    # as a broken console rather than a missing parameter.
+    entry = f"{url}?t={token}" if token else url
+    print(f"Yaobi 控制台已启动: {entry}")
+    if token:
+        print(f"  访问令牌 : {token}   （链接已包含；也可用 X-Yaobi-Token 头调用 API）")
     print(f"  LLM      : {describe_client(service.llm)}")
     print(f"  知识库   : {service.knowledge_store_path or '未配置（指南/药典证据为占位数据）'}")
     print(f"  视觉模型 : {service.vision.model if service.vision else '未配置（影像/舌象工具不可用）'}")
@@ -546,12 +552,10 @@ def serve(
     if public:  # pragma: no cover - network path
         try:
             tunnel = open_ngrok(port, token=token, authtoken=ngrok_authtoken, region=ngrok_region)
-            print(banner(tunnel, local_url=url))
+            print(banner(tunnel, local_url=entry))
         except TunnelError as exc:
             print(f"公网隧道未开启: {exc}")
             print("控制台仍在本地可用。")
-    elif token:
-        print(f"  访问令牌 : {token}\n  带令牌链接: {url}?t={token}")
 
     if open_browser:  # pragma: no cover - convenience path
         import webbrowser

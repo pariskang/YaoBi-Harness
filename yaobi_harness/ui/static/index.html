@@ -754,13 +754,44 @@ $$(".nav button").forEach(btn => btn.addEventListener("click", () => {
   if (btn.dataset.view === "know") renderKnowledge();
 }));
 
+/* ─── 访问令牌 ─────────────────────────────────────────────────
+   服务端接受 bearer / X-Yaobi-Token / ?t= / cookie 四种通道，但页面此前
+   一个都不发：只有最初那次带 ?t= 的 HTML 请求能过，随后每个 XHR 都 401。
+   在 Colab 内嵌（用 ?t= 打开 iframe）和 ngrok 公开链接下，控制台因此完全不可用。
+
+   令牌来源按优先级：URL → sessionStorage → cookie。三条都留着是因为
+   第三方 iframe 里 storage 与 cookie 都可能被浏览器拦掉，而 URL 一定在。
+   也正因如此**不从地址栏抹掉 ?t=**：storage 被拦时，刷新只能靠它。          */
+let TOKEN = "";
+(function readToken() {
+  const fromUrl = new URLSearchParams(location.search).get("t");
+  const fromStore = (() => { try { return sessionStorage.getItem("yaobi_token"); } catch { return null; } })();
+  const fromCookie = (document.cookie.match(/(?:^|;\s*)yaobi_token=([^;]*)/) || [])[1];
+  TOKEN = fromUrl || fromStore || (fromCookie ? decodeURIComponent(fromCookie) : "") || "";
+  if (!TOKEN) return;
+  // Best-effort persistence so a reload without ?t= still works. Either channel
+  // may be blocked in an embedded frame; failing silently is correct because the
+  // in-memory copy already covers this page's lifetime.
+  try { sessionStorage.setItem("yaobi_token", TOKEN); } catch {}
+  try { document.cookie = `yaobi_token=${encodeURIComponent(TOKEN)}; Path=/; SameSite=None; Secure`; } catch {}
+})();
+
 /* ─── API ──────────────────────────────────────────────────── */
 async function api(path, body) {
-  const res = await fetch(path, body === undefined ? {} : {
-    method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify(body),
-  });
+  const headers = {};
+  if (TOKEN) headers["X-Yaobi-Token"] = TOKEN;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const res = await fetch(path, body === undefined
+    ? { headers }
+    : { method:"POST", headers, body:JSON.stringify(body) });
   const data = await res.json().catch(() => ({ error:`HTTP ${res.status}` }));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    // 401 with no token in hand is a setup problem, not a backend fault; say which.
+    if (res.status === 401 && !TOKEN) {
+      throw new Error("需要访问令牌：请使用启动时打印的带 ?t=… 的完整链接打开本页");
+    }
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
   return data;
 }
 

@@ -31,7 +31,7 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 | `--skill-manifest` | 指定技能清单（例如合并了生成的专家技能的那份） |
 | `--open` | 启动后打开浏览器 |
 | `--public` | 经 ngrok 映射为公开链接，**强制启用访问令牌**（仅演示/评审） |
-| `--access-token` | 固定访问令牌；`--public` 时会自动生成一个 |
+| `--access-token` | 固定访问令牌；`--public` 时会自动生成一个。启动时打印的链接**已包含 `?t=`**，请用那个链接打开 |
 | `--ngrok-authtoken` / `--ngrok-region` | 覆盖 `NGROK_AUTHTOKEN` / 选择区域 |
 | `--no-vision` | 即使配置了视觉模型也禁用 |
 | `--skill-dir` | 追加 `SKILL.md` 根目录（最高优先级），可重复 |
@@ -55,6 +55,23 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 **用药速查** — 不跑完整病例，只做相互作用筛查。适合门诊快速核对。
 
 **知识库** — 知识库统计、来源目录与许可状态（哪些启用、哪些被禁用及原因）、内置规则包全文。
+
+## 访问令牌怎么流转
+
+配置了令牌之后，页面必须**自己把令牌带上**——这一点曾经是坏的，值得写清楚。
+
+服务端接受四种通道：`Authorization: Bearer`、`X-Yaobi-Token` 头、`?t=` 查询串、
+`yaobi_token` cookie。但页面此前一个都不发：只有最初那次带 `?t=` 的 HTML 请求能过，
+随后每个 XHR 都 401。于是 Colab 内嵌与 ngrok 公开链接下，控制台会**把界面渲染出来**，
+然后在第一个动作上失败并提示"缺少或错误的访问令牌"。
+
+现在页面按 URL → `sessionStorage` → cookie 的顺序取令牌，并在每个请求上带
+`X-Yaobi-Token`。三条通道都留着，是因为在第三方 iframe 里 storage 与 cookie
+都可能被浏览器拦掉，而 URL 一定在——也正因如此**不从地址栏抹掉 `?t=`**：
+storage 被拦时，刷新只能靠它。
+
+已验证：跨域 iframe 下正常、阻止第三方 cookie 时正常、cookie 与 storage 全部阻止时仍正常；
+无令牌与错误令牌一律 401。
 
 ## API
 

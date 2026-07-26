@@ -199,6 +199,7 @@ class ToolRegistry:
         max_attempts: int = 2,
         knowledge: KnowledgeStore | None = None,
         drug_normalizer: Any | None = None,
+        vision: Any | None = None,
     ) -> None:
         if records is not None:
             self.case_store = ExpertCaseStore.from_records(records, deid_key=deid_key)
@@ -213,6 +214,9 @@ class ToolRegistry:
         self.knowledge = knowledge
         #: Optional live RxNorm connector for medication name resolution.
         self.drug_normalizer = drug_normalizer
+        #: Optional multimodal client. Absent means the image tools report
+        #: themselves unavailable rather than the harness failing to start.
+        self.vision = vision
         self.tools: dict[str, Callable[..., ToolResult]] = {
             "red_flag_evidence_search": self.red_flag_evidence_search,
             "similar_case_search": self.similar_case_search,
@@ -231,6 +235,8 @@ class ToolRegistry:
             "drug_label_lookup": self.drug_label_lookup,
             "drug_normalize": self.drug_normalize,
             "expert_practice_profile": self.expert_practice_profile,
+            "interview_axis_lookup": self.interview_axis_lookup,
+            "medical_image_read": self.medical_image_read,
         }
         self._profile = None
 
@@ -421,6 +427,114 @@ class ToolRegistry:
             + (f"; 命中证型 {matched.pattern}({matched.n_cases}例)" if matched else ""),
             {**brief, "requested_pattern": pattern, "matched_pattern": matched.pattern if matched else None},
             evidence_level=EvidenceLevel.EXPERT_CASE.value,
+        )
+
+    def interview_axis_lookup(self, axis_id: str | None = None, tier: str | None = None) -> ToolResult:
+        """Look up history-taking axes: what to ask and why it matters.
+
+        Exposed as a tool rather than baked into a prompt so an autonomous agent
+        can pull the professional rationale for an axis on demand, and so the
+        lookup lands in the evidence ledger like any other retrieval. The axis
+        table is authored content, not a placeholder, so it is graded
+        ``guideline_or_standard`` rather than ``stub``.
+        """
+        from .interview.axes import AXES, AXES_BY_ID, TIERS
+
+        if axis_id:
+            axis = AXES_BY_ID.get(axis_id)
+            if axis is None:
+                return ToolResult(
+                    "interview_axis_lookup", False, f"未知问诊轴 {axis_id!r}",
+                    {"available": sorted(AXES_BY_ID)}, error="unknown_axis", recoverable=True,
+                )
+            return ToolResult(
+                "interview_axis_lookup", True, f"问诊轴: {axis.label}({axis.tier})",
+                {"axis": axis.to_dict()}, evidence_level=EvidenceLevel.GUIDELINE.value,
+            )
+
+        if tier:
+            if tier not in TIERS:
+                return ToolResult(
+                    "interview_axis_lookup", False, f"未知层级 {tier!r}",
+                    {"available": list(TIERS)}, error="unknown_tier", recoverable=True,
+                )
+            selected = [a for a in AXES if a.tier == tier]
+        else:
+            selected = list(AXES)
+        return ToolResult(
+            "interview_axis_lookup", True,
+            f"返回 {len(selected)} 条问诊轴" + (f"（{tier}）" if tier else "（十问歌+骨科专科全表）"),
+            {
+                "axes": [
+                    {"axis_id": a.axis_id, "label": a.label, "tier": a.tier,
+                     "tradition": a.tradition, "rationale": a.rationale,
+                     "probes": list(a.probes)}
+                    for a in selected
+                ],
+                "tiers": list(TIERS),
+            },
+            evidence_level=EvidenceLevel.GUIDELINE.value,
+        )
+
+    def medical_image_read(
+        self,
+        image: str,
+        kind: str = "other",
+        context: str = "",
+        deidentified: bool = False,
+    ) -> ToolResult:
+        """Read one clinical image through the vision model — never diagnostically.
+
+        Two refusals come before any reading happens:
+
+        * **No attestation, no read.** The caller must assert the image is
+          de-identified. That is a deliberate speed bump on the one input channel
+          that most easily carries a name and a hospital number.
+        * **Identifiers found, read discarded.** The vision client's PHI
+          pre-check runs first; when it fires, the findings are thrown away and
+          the warning is returned in their place.
+
+        The result is graded ``model_reasoning``, which is in
+        ``NON_RELEASABLE_LEVELS`` — so an image finding can raise a red flag and
+        suggest an examination, but can never on its own justify a released claim.
+        """
+        from .vision.client import VisionError
+
+        if self.vision is None or not getattr(self.vision, "available", False):
+            return ToolResult(
+                "medical_image_read", True, "未配置视觉模型，跳过影像判读",
+                {"configured": False,
+                 "how_to_fix": "设置 YAOBI_VISION_PROVIDER=poe、POE_API_KEY 与 YAOBI_VISION_MODEL=Gemini-3.1-Pro"},
+                is_stub=True,
+            )
+        if not deidentified:
+            return ToolResult(
+                "medical_image_read", False,
+                "缺少去标识化声明：请先遮盖姓名/ID/日期/条码/人脸，并显式声明 deidentified=true",
+                {"required": "deidentified=true"}, error="deidentification_not_attested", recoverable=True,
+            )
+        try:
+            read = self.vision.read(image, kind=kind, context=context)
+        except VisionError as exc:
+            return ToolResult(
+                "medical_image_read", False, f"影像判读失败: {exc}",
+                {"kind": kind}, error=str(exc), retryable=True,
+            )
+
+        payload = read.to_dict()
+        if read.phi_detected:
+            # Not a tool failure — the tool did exactly its job. It is returned
+            # as a successful *refusal* so the run records why no findings exist.
+            return ToolResult(
+                "medical_image_read", True, "图片含可识别身份信息，已拒绝判读",
+                payload, evidence_level=EvidenceLevel.MODEL.value,
+            )
+        summary = f"{read.image_kind} 视觉所见 {len(read.observations)} 条"
+        if read.urgent_signals:
+            summary += f"；急症外观信号 {len(read.urgent_signals)} 条"
+        return ToolResult(
+            "medical_image_read", True, summary + "（模型判读，不能替代正式阅片）",
+            payload, evidence_level=EvidenceLevel.MODEL.value,
         )
 
     def patient_timeline_search(self, research_patient_id: str) -> ToolResult:
@@ -919,6 +1033,24 @@ def tool_specs() -> list[ToolSpec]:
                   "required": ["ingredient"]}),
         ToolSpec("drug_normalize", "将自由文本药名标准化为 RxCUI 与 ATC 分类",
                  {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+        ToolSpec("interview_axis_lookup", "查询问诊轴（十问歌 + 骨科专科）：该轴要问什么、为什么问、属于哪个层级",
+                 {"type": "object", "properties": {
+                     "axis_id": {"type": "string", "description": "指定轴 id；留空则返回全表"},
+                     "tier": {"type": "string", "enum": ["RED_FLAG", "CORE", "SPECIALTY", "TCM", "CONTEXT"],
+                              "description": "按层级筛选"}}}),
+        ToolSpec("medical_image_read",
+                 "判读一张临床图片（X线/MRI-CT 翻拍、舌象、体态、肢体外观、报告单）。"
+                 "结果为模型视觉所见，证据等级为 model_reasoning，**不能替代正式阅片、不能作为诊断依据**。"
+                 "调用前必须确认图片已去标识化。",
+                 {"type": "object", "properties": {
+                     "image": {"type": "string", "description": "本地文件路径或 data: URI"},
+                     "kind": {"type": "string",
+                              "enum": ["radiograph", "mri_ct", "tongue", "posture_gait",
+                                       "limb_surface", "report_document", "other"]},
+                     "context": {"type": "string", "description": "临床背景，帮助模型聚焦"},
+                     "deidentified": {"type": "boolean",
+                                      "description": "必须为 true：声明已遮盖姓名/ID/日期/条码/人脸"}},
+                  "required": ["image", "deidentified"]}),
         ToolSpec("physician_review_submit", "提交处方草案给医师逐味审核签名",
                  {"type": "object", "properties": {"prescription": {"type": "object"}, "approvals": {"type": "object"},
                                                     "physician_id": {"type": "string"}, "signature": {"type": "string"}},

@@ -35,6 +35,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--knowledge-store", help="path to the licensed knowledge store built by `knowledge build`")
     run.add_argument("--skill-manifest", help="skill manifest to use (e.g. one merged with a generated expert skill)")
     run.add_argument("--debug-state", action="store_true", help="print the full internal state instead of the role view")
+    run.add_argument("--panel", action="store_true",
+                     help="convene the multi-speciality consult panel (several subagents; costs more tokens)")
+    run.add_argument("--image", action="append", metavar="KIND:PATH",
+                     help="attach a de-identified image, e.g. radiograph:/path/x.jpg; repeatable. "
+                          "Attaching one asserts you have removed名/ID/日期/条码/人脸")
+    run.add_argument("--no-vision", action="store_true", help="disable the vision model even if configured")
+    run.add_argument("--skill-dir", action="append", help="extra SKILL.md root, highest precedence; repeatable")
 
     resume = sub.add_parser("resume", help="resume a checkpointed run")
     resume.add_argument("checkpoint")
@@ -54,6 +61,10 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--transcript", help="write the full transcript and state here on exit")
     chat.add_argument("--message", action="append",
                       help="send this message and exit; repeat for a scripted conversation")
+    chat.add_argument("--image", action="append", metavar="KIND:PATH",
+                      help="attach a de-identified image before the first turn; repeatable")
+    chat.add_argument("--no-vision", action="store_true")
+    chat.add_argument("--skill-dir", action="append")
 
     inspect = sub.add_parser("inspect-xlsx", help="summarise a local authorized Excel without returning raw rows")
     inspect.add_argument("path")
@@ -75,6 +86,24 @@ def _build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--access-token", help="fixed access token; one is generated when --public is set")
     ui.add_argument("--ngrok-authtoken", help="overrides NGROK_AUTHTOKEN")
     ui.add_argument("--ngrok-region")
+    ui.add_argument("--no-vision", action="store_true", help="disable the vision model even if configured")
+    ui.add_argument("--skill-dir", action="append", help="extra SKILL.md root, highest precedence; repeatable")
+
+    interview = sub.add_parser("interview", help="inspect the history-taking axes (十问歌 + 骨科专科)")
+    interview.add_argument("--tier", choices=["RED_FLAG", "CORE", "SPECIALTY", "TCM", "CONTEXT"])
+    interview.add_argument("--axis", help="show one axis in full")
+    interview.add_argument("--complaint", help="show which axes this complaint makes relevant, and which are required")
+    interview.add_argument("--facts", help="JSON object of known facts, to see what is already closed")
+    interview.add_argument("--role", choices=["patient", "physician", "researcher"], default="patient")
+
+    vision = sub.add_parser("vision", help="read one clinical image (non-diagnostic; requires a vision model)")
+    vision.add_argument("image", help="local image path")
+    vision.add_argument("--kind", default="other",
+                        choices=["radiograph", "mri_ct", "tongue", "posture_gait",
+                                 "limb_surface", "report_document", "other"])
+    vision.add_argument("--context", default="", help="clinical background to focus the read")
+    vision.add_argument("--deidentified", action="store_true",
+                        help="required: asserts名/ID/日期/条码/人脸 have been masked")
 
     skill = sub.add_parser("skill", help="inspect skills and generate one from the expert corpus")
     ssub = skill.add_subparsers(dest="skcmd", required=True)
@@ -143,9 +172,103 @@ def _make_llm(provider: str | None, model: str | None):
     return build_client(provider, **overrides)
 
 
+def _make_vision(enabled: bool = True):
+    """Build the vision client, or ``None`` when it is off or unconfigured.
+
+    Never raises: an unset ``POE_API_KEY`` should leave the image tools reporting
+    themselves unavailable, not stop the CLI from running a text-only case.
+    """
+    if not enabled:
+        return None
+    from .vision.client import build_vision_client
+
+    return build_vision_client()
+
+
 def _emit(payload) -> int:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
+
+
+def _parse_images(specs: list[str] | None) -> list[dict]:
+    """Parse ``KIND:PATH`` image arguments.
+
+    Passing an image on the command line is itself the de-identification
+    attestation: the operator typed the path, so they are the one asserting the
+    file is masked. The tool still refuses to read anything the PHI pre-check
+    flags, so the attestation is a declaration of intent, not a bypass.
+    """
+    from .vision.client import IMAGE_KINDS
+
+    images: list[dict] = []
+    for spec in specs or []:
+        kind, _, path = str(spec).partition(":")
+        if not path:
+            kind, path = "other", spec
+        if kind not in IMAGE_KINDS:
+            raise ValueError(f"未知图片类型 {kind!r}；支持 {list(IMAGE_KINDS)}")
+        images.append({"kind": kind, "ref": path, "deidentified": True})
+    return images
+
+
+def _interview_command(args) -> int:
+    """Show the history-taking axes, and what a given complaint makes relevant."""
+    from .interview.axes import AXES, AXES_BY_ID, coverage, plan_next, relevant_axes, required_open_axes
+
+    if args.axis:
+        axis = AXES_BY_ID.get(args.axis)
+        if axis is None:
+            return _emit({"error": f"未知问诊轴 {args.axis!r}", "available": sorted(AXES_BY_ID)})
+        return _emit(axis.to_dict())
+
+    if args.complaint:
+        facts = json.loads(args.facts) if args.facts else {}
+        return _emit({
+            "complaint": args.complaint,
+            "role": args.role,
+            "relevant": [
+                {"axis_id": a.axis_id, "label": a.label, "tier": a.tier,
+                 "answered": a.satisfied(facts)}
+                for a in relevant_axes(facts, args.complaint, role=args.role)
+            ],
+            "required_open": [a.label for a in required_open_axes(facts, args.complaint, role=args.role)],
+            "next_round": plan_next(facts, args.complaint, role=args.role).to_dict(),
+            "coverage": coverage(facts, args.complaint, role=args.role),
+        })
+
+    selected = [a for a in AXES if not args.tier or a.tier == args.tier]
+    return _emit({
+        "total": len(selected),
+        "axes": [
+            {"axis_id": a.axis_id, "label": a.label, "tier": a.tier, "tradition": a.tradition,
+             "closes": list(a.closes), "rationale": a.rationale, "probes": list(a.probes)}
+            for a in selected
+        ],
+    })
+
+
+def _vision_command(args) -> int:
+    """Read one image. Refuses without the de-identification attestation."""
+    from .vision.client import VisionError, build_vision_client, describe_vision
+
+    if not args.deidentified:
+        return _emit({
+            "error": "缺少去标识化声明",
+            "required": "--deidentified",
+            "why": "影像翻拍照片常带姓名/住院号/日期/条码；请先遮盖再判读",
+        })
+    client = build_vision_client()
+    if client is None or not client.available:
+        return _emit({
+            "error": "未配置视觉模型",
+            "how_to_fix": "export YAOBI_VISION_PROVIDER=poe POE_API_KEY=... YAOBI_VISION_MODEL=Gemini-3.1-Pro",
+            "status": describe_vision(client),
+        })
+    try:
+        read = client.read(args.image, kind=args.kind, context=args.context)
+    except VisionError as exc:
+        return _emit({"error": str(exc)})
+    return _emit({"vision": describe_vision(client), "read": read.to_dict()})
 
 
 def _chat_command(args) -> int:
@@ -155,14 +278,22 @@ def _chat_command(args) -> int:
     try:
         llm = _make_llm(args.llm_provider, args.llm_model)
         knowledge = _open_knowledge(args.knowledge_store)
-        tools = ToolRegistry(args.xlsx or None, knowledge=knowledge)
+        tools = ToolRegistry(args.xlsx or None, knowledge=knowledge,
+                             vision=_make_vision(not getattr(args, "no_vision", False)))
     except (LLMError, DeidentificationKeyError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 2
 
-    runner = YaobiGraphRunner(tools, skill_manifest=args.skill_manifest, llm=llm)
+    runner = YaobiGraphRunner(tools, skill_manifest=args.skill_manifest, llm=llm,
+                              skill_dirs=getattr(args, "skill_dir", None))
     session = ConversationSession(role=args.role, runner=runner,
                                   allow_prescription=args.allow_prescription)
+    try:
+        for image in _parse_images(getattr(args, "image", None)):
+            session.attach_image(image["ref"], kind=image["kind"], deidentified=True)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
 
     def show(reply) -> None:
         flag = " ⚠已升级为急症" if reply.escalated else ""
@@ -170,6 +301,17 @@ def _chat_command(args) -> int:
         print("   " + reply.message.replace("\n", "\n   "))
         if reply.extracted:
             print(f"   ↳ 本轮获得: {json.dumps(reply.extracted, ensure_ascii=False)}")
+        interview = reply.interview or {}
+        if interview.get("verdict"):
+            print(
+                f"   ↳ 问诊: 第{interview['rounds_used']}轮 覆盖{interview['coverage_ratio']:.0%} "
+                f"判定={interview['verdict']}({interview.get('judged_by') or 'rule'}) "
+                f"提问来源={interview['composer']}"
+            )
+            if interview.get("blocking"):
+                print(f"   ↳ 必答未闭合: {'、'.join(interview['blocking'])}")
+            for note in interview.get("rejected", [])[:2]:
+                print(f"   ↳ 提问被拦下: {note}")
 
     if args.message:
         for message in args.message:
@@ -341,6 +483,12 @@ def _open_knowledge(path: str | None):
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
 
+    if args.cmd == "interview":
+        return _interview_command(args)
+
+    if args.cmd == "vision":
+        return _vision_command(args)
+
     if args.cmd == "chat":
         return _chat_command(args)
 
@@ -360,6 +508,7 @@ def main(argv=None) -> int:
             checkpoint_dir=args.checkpoint_dir, skill_manifest=args.skill_manifest,
             open_browser=args.open, public=args.public, access_token=args.access_token,
             ngrok_authtoken=args.ngrok_authtoken, ngrok_region=args.ngrok_region,
+            skill_dirs=getattr(args, "skill_dir", None), vision=not getattr(args, "no_vision", False),
         )
         return 0
 
@@ -411,20 +560,28 @@ def main(argv=None) -> int:
 
     try:
         knowledge = _open_knowledge(args.knowledge_store)
-        tools = ToolRegistry(args.xlsx or None, knowledge=knowledge)
+        tools = ToolRegistry(args.xlsx or None, knowledge=knowledge,
+                             vision=_make_vision(not getattr(args, "no_vision", False)))
     except DeidentificationKeyError as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 2
 
     state = ClinicalRunState(complaint=args.complaint, role=args.role)
     state.facts.update(_load_facts(args.facts, args.facts_file))
+    state.enable_panel = bool(getattr(args, "panel", False))
+    try:
+        state.images = _parse_images(getattr(args, "image", None))
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
     state.budget = Budget(
         max_loops=args.max_loops,
         max_tool_calls=args.max_tool_calls,
         max_llm_calls=args.max_llm_calls,
     )
     runner = YaobiGraphRunner(tools, checkpoint_dir=args.checkpoint_dir,
-                              skill_manifest=args.skill_manifest, llm=llm)
+                              skill_manifest=args.skill_manifest, llm=llm,
+                              skill_dirs=getattr(args, "skill_dir", None))
     out = runner.run(state, allow_prescription=args.allow_prescription)
     print(json.dumps(render(out, debug=args.debug_state), ensure_ascii=False, indent=2))
     return 0

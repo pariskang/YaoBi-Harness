@@ -27,6 +27,9 @@ yaobi-harness = "yaobi_harness.cli:main"
 [tool.setuptools.packages.find]
 include = ["yaobi_harness*"]
 
-# The console page and the skill manifest are runtime assets, not just source.
+# The console page and the skill files are runtime assets, not just source. The
+# SKILL.md library in particular *is* the procedure the model follows, so an
+# installed wheel that omitted it would silently lose the interview, vision and
+# consult skills — the harness would still start, just with far less capability.
 [tool.setuptools.package-data]
-yaobi_harness = ["ui/static/*.html", "skills/*.yaml"]
+yaobi_harness = ["ui/static/*.html", "skills/*.yaml", "skills/library/*/SKILL.md"]

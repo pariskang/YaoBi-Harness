@@ -34,6 +34,29 @@ class AgentSpec:
 AGENT_CATALOG: dict[str, AgentSpec] = {
     "TimelineAgent": AgentSpec("TimelineAgent", "yaobi.timeline", "整理病史时间线与既往就诊轨迹", ("patient_timeline_search",)),
     "IntakeAgent": AgentSpec("IntakeAgent", "yaobi.intake", "红旗筛查与信息缺口识别", ("red_flag_evidence_search",)),
+    "InterviewAgent": AgentSpec(
+        "InterviewAgent", "yaobi.interview", "自主追问：十问歌与骨科专科问诊，逐轮追问至病史充分",
+        ("interview_axis_lookup", "red_flag_evidence_search"),
+    ),
+    "ConsultPanelAgent": AgentSpec(
+        "ConsultPanelAgent", "yaobi.consult_panel", "多学科会诊子体（骨科/疼痛/康复/中医骨伤/药师），最保守优先合议",
+        (
+            "clinical_guideline_search", "tcm_pattern_knowledge_search", "similar_case_search",
+            "counterexample_case_search", "expert_practice_profile", "patient_timeline_search",
+            "drug_label_lookup", "drug_normalize", "drug_interaction_check", "interaction_check",
+            "special_population_check", "red_flag_evidence_search", "interview_axis_lookup",
+            "medical_image_read",
+        ),
+    ),
+    "VisionAgent": AgentSpec(
+        "VisionAgent", "yaobi.vision_read", "临床图片判读（影像翻拍/舌象/体态/患肢外观/报告转录）",
+        ("medical_image_read", "red_flag_evidence_search", "interview_axis_lookup"),
+    ),
+    "OsteoporosisAgent": AgentSpec(
+        "OsteoporosisAgent", "yaobi.osteoporosis_risk", "骨质疏松与脆性骨折风险评估、跌倒风险与用药前置条件",
+        ("clinical_guideline_search", "drug_label_lookup", "drug_interaction_check",
+         "special_population_check", "interview_axis_lookup", "medical_image_read"),
+    ),
     "UrgentPlannerAgent": AgentSpec("UrgentPlannerAgent", "yaobi.urgent_triage", "急症假设与追问排序", (), risk_modes=("urgent",)),
     "UrgentCareAgent": AgentSpec(
         "UrgentCareAgent", "yaobi.urgent_triage", "急症鉴别、即时行动与转运建议",
@@ -79,7 +102,12 @@ def rule_plan(state: ClinicalRunState) -> list[Task]:
     tasks = [
         Task("T1", "TimelineAgent", "标准化病历与时间线", ["patient_timeline_search"]),
         Task("T2", "IntakeAgent", "识别信息缺口和红旗", ["red_flag_evidence_search"]),
+        # The interview runs on every path, urgent included: an emergency still
+        # needs its cauda-equina questions asked, just fewer of everything else.
+        Task("T3", "InterviewAgent", "自主追问，评估病史充分性", ["interview_axis_lookup"], ["T2"]),
     ]
+    if state.images:
+        tasks.append(Task("T4", "VisionAgent", "判读随诊图片（非诊断）", ["medical_image_read"], ["T2"]))
     if state.risk_mode == "urgent":
         tasks += [
             Task("U1", "UrgentPlannerAgent", "急症假设、追问与资源预算"),
@@ -99,6 +127,13 @@ def rule_plan(state: ClinicalRunState) -> list[Task]:
             ),
             Task("N6", "PhysicianReviewAgent", "医师逐味审核", ["physician_review_submit"], ["N5"]),
         ]
+        # The panel is opt-in rather than default: five subagents multiply the
+        # token cost of a run several-fold, and that is the operator's call to
+        # make, not a default to discover on the bill. An LLM planner may still
+        # schedule it on its own — it is in the catalogue — which is exactly the
+        # autonomy this design is for.
+        if state.enable_panel:
+            tasks.insert(-3, Task("N8", "ConsultPanelAgent", "多学科会诊合议", ["clinical_guideline_search"], ["T3"]))
     return tasks
 
 

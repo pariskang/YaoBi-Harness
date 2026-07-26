@@ -26,7 +26,8 @@ from typing import Any
 #: cardiopulmonary causes seen in an orthopaedic front door.
 HARD_RED_FLAGS: dict[str, list[str]] = {
     "cauda_equina": [
-        "尿潴留", "不能排尿", "尿不出来", "尿不出", "解不出小便", "小便解不出来", "排尿困难",
+        "尿潴留", "不能排尿", "不会排尿", "尿不出来", "尿不出", "解不出小便", "小便解不出来",
+        "不会解小便", "排尿困难", "要用力才能解",
         "大小便失禁", "小便失禁", "大便失禁", "尿失禁", "尿憋不住", "憋不住尿", "控制不住大小便",
         "会阴麻木", "鞍区麻木", "下身迟钝", "肛周麻木", "屁股麻木", "私处麻木", "性功能突然减退",
     ],
@@ -49,7 +50,7 @@ HARD_RED_FLAGS: dict[str, list[str]] = {
     ],
     "progressive_neuro": [
         "肌力下降", "足下垂", "进行性麻木", "越来越无力", "双腿越来越无力", "抬不起脚",
-        "拿不住东西", "走路踩棉花", "行走不稳", "四肢无力",
+        "拿不住东西", "走路踩棉花", "行走不稳", "走路不稳", "四肢无力", "拖步", "扣不上纽扣", "拿筷子费劲",
     ],
     "cervical_myelopathy": [
         "手笨拙", "系扣子困难", "写字变差", "踩棉花感", "束带感", "颈部外伤后麻木",
@@ -73,6 +74,21 @@ SOFT_CORROBORATION = [
 ]
 
 NEGATION_CUES = ["无", "否认", "未见", "未出现", "没有", "不伴", "无明显", "排除", "不存在", "未诉"]
+
+#: Spoken-Chinese denials. The list above is written for clinical notes, where a
+#: clinician records "无夜间痛"; a patient answering the same question says
+#: "晚上不会痛醒". Without these, an ordinary denial in dialogue screened as a
+#: *positive* — every cooperative patient got escalated, which is alarm fatigue by
+#: construction and worse in practice than the false negative it guards against.
+COLLOQUIAL_NEGATION_CUES = ["不太", "没怎么", "从来不", "从没", "不曾", "不会", "不咋"]
+
+#: Terms where a "不会/不能" prefix means *inability*, i.e. a symptom rather than a
+#: denial. "不会痛醒" denies pain; "不会走路" reports disability. The colloquial cues
+#: are therefore not applied to these.
+ABILITY_TERMS = [
+    "走路", "走", "站", "坐", "弯腰", "抬", "动", "使劲", "用力", "起身", "翻身",
+    "排尿", "小便", "大便", "解", "控制",
+]
 THIRD_PARTY_CUES = ["父亲", "母亲", "家族", "亲属", "家人", "朋友", "别人", "他人", "同事"]
 HYPOTHETICAL_CUES = ["如果", "假如", "万一", "担心", "害怕", "会不会", "怎么办", "是否会"]
 HISTORY_CUES = ["既往", "去年", "多年前", "以前", "曾经", "曾", "陈旧", "已痊愈", "已恢复", "慢性", "旧伤"]
@@ -135,6 +151,17 @@ def _contains(clause: str, cues: list[str]) -> str | None:
     return next((c for c in cues if c in clause), None)
 
 
+def _negation_cues_for(term: str) -> list[str]:
+    """Cues usable against ``term``.
+
+    Colloquial cues are withheld from ability terms, where "不会" reports a
+    disability instead of denying a symptom.
+    """
+    if any(ability in term for ability in ABILITY_TERMS):
+        return NEGATION_CUES
+    return NEGATION_CUES + COLLOQUIAL_NEGATION_CUES
+
+
 def _is_negated(clause: str, term: str) -> bool:
     """True when a negation cue governs ``term`` inside this clause.
 
@@ -145,7 +172,8 @@ def _is_negated(clause: str, term: str) -> bool:
     if idx < 0:
         return False
     left = clause[:idx]
-    cue_pos = max((left.rfind(c) for c in NEGATION_CUES if c in left), default=-1)
+    cues = _negation_cues_for(term)
+    cue_pos = max((left.rfind(c) for c in cues if c in left), default=-1)
     if cue_pos < 0:
         return False
     between = left[cue_pos:]
@@ -172,6 +200,24 @@ def _classify_clause(clause: str, term: str) -> tuple[bool, str]:
     return False, "current_patient_symptom"
 
 
+def _corroborated(clauses: list[str]) -> bool:
+    """Whether any corroborating context is actually *present*.
+
+    This used to be a substring test over the whole text, so "没有发热" corroborated
+    a soft signal elsewhere in the sentence and promoted it to a hard hit — a
+    denial acting as evidence for the thing it denied. Corroboration is now
+    clause-scoped and must survive the same classification as any other finding.
+    """
+    for clause in clauses:
+        for cue in SOFT_CORROBORATION:
+            if cue not in clause:
+                continue
+            suppressed, _ = _classify_clause(clause, cue)
+            if not suppressed:
+                return True
+    return False
+
+
 def screen(text: str) -> ScreenResult:
     """Screen ``text`` for emergency signals.
 
@@ -180,7 +226,7 @@ def screen(text: str) -> ScreenResult:
     """
     result = ScreenResult()
     clauses = split_clauses(text)
-    corroborated = any(c in (text or "") for c in SOFT_CORROBORATION)
+    corroborated = _corroborated(clauses)
 
     for clause in clauses:
         for signal, terms in HARD_RED_FLAGS.items():

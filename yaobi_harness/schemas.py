@@ -81,7 +81,40 @@ SCHEMAS: dict[str, dict[str, tuple[bool, tuple[type, ...]]]] = {
         "checks_run": (True, (list,)),
         "issues": (False, (list,)),
     },
+    "InterviewProgress": {
+        "coverage": (True, (dict,)),
+        "questions": (True, (list,)),
+        "verdict": (True, (dict,)),
+        "rounds_used": (False, (int,)),
+    },
+    # One consult subagent's opinion. ``urgency`` is required because a member
+    # that cannot state an urgency has not done the one job the panel needs.
+    "ConsultOpinion": {
+        "urgency": (True, (str,)),
+        "key_findings": (True, (list,)),
+        "concerns": (True, (list,)),
+        "recommend_next": (True, (list,)),
+        "questions_for_patient": (False, (list,)),
+        "dissent": (False, (str,)),
+        "evidence_note": (False, (str,)),
+    },
+    # A vision read. ``requires_formal_read`` is required and must be true for a
+    # radiograph or MRI/CT — see the check in ``validate`` below.
+    "ImageFindings": {
+        "image_kind": (True, (str,)),
+        "readable": (True, (bool,)),
+        "observations": (True, (list,)),
+        "requires_formal_read": (True, (bool,)),
+        "not_assessable": (False, (list,)),
+        "urgent_signals": (False, (list,)),
+        "suggest_ask": (False, (list,)),
+        "suggest_exam": (False, (list,)),
+        "caveat": (False, (str,)),
+    },
 }
+
+#: Image kinds whose findings may never claim to stand in for a formal report.
+_RADIOLOGY_KINDS = {"radiograph", "mri_ct"}
 
 
 def validate(schema_name: str, payload: Any) -> tuple[bool, list[str]]:
@@ -111,4 +144,13 @@ def validate(schema_name: str, payload: Any) -> tuple[bool, list[str]]:
         if not isinstance(value, types):
             expected = "/".join(t.__name__ for t in types)
             problems.append(f"{schema_name}: field {field_name!r} should be {expected}, got {type(value).__name__}")
+
+    # A radiology read that sets ``requires_formal_read: false`` is claiming to
+    # be a report. Shape validation would pass it, so it is checked as a value.
+    if (
+        schema_name == "ImageFindings"
+        and str(payload.get("image_kind", "")) in _RADIOLOGY_KINDS
+        and payload.get("requires_formal_read") is False
+    ):
+        problems.append("ImageFindings: 影像判读不得声明 requires_formal_read=false（模型判读不能替代正式阅片）")
     return not problems, problems

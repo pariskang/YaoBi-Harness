@@ -176,6 +176,19 @@ class ClinicalRunState:
     requires_physician_approval: bool = True
     planner_mode: str = "rule"
     loop_index: int = 0
+    #: Clinical images attached to this run, as ``{"kind": ..., "ref": ...}``.
+    #: ``ref`` is a local path or a ``data:`` URI; the bytes are never stored in
+    #: the state, so a checkpoint on disk cannot become an image archive.
+    images: list[dict[str, Any]] = field(default_factory=list)
+    #: Whether the multi-speciality consult panel may be scheduled by rule.
+    #: Off by default: five subagents multiply the cost of a run, which is an
+    #: operator decision rather than a default.
+    enable_panel: bool = False
+    #: Whether this run was started with dose-bearing output permitted. Set by
+    #: the runner from its ``allow_prescription`` argument so agents can see the
+    #: decision — the interview needs it to know whether 四诊 completeness is
+    #: required, and a checkpoint needs it to resume with the same permission.
+    allow_prescription: bool = False
 
     # ---------------------------------------------------------------- evidence
     def add_evidence(

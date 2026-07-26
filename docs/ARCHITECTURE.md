@@ -10,17 +10,20 @@
                 cognition (replaceable, advisory)
    ┌────────────────────────────────────────────────────────┐
    │ PlannerAgent(LLM)   ReAct tool loop per autonomous skill│
-   │ semantic red-flag screen  questions  adversarial critic │
+   │ InterviewLoop(ask_patient) · ConsultPanel(subagents)    │
+   │ VisionClient · semantic red-flag screen · critic        │
    └───────────────────────────┬────────────────────────────┘
                                │  proposals only
    ┌───────────────────────────▼────────────────────────────┐
    │ control plane (never bypassable)                       │
    │  plan validator · CapabilityBroker · SkillRegistry     │
-   │  ToolHealth circuit breaker · Budget · Evidence ledger │
+   │  AdequacyJudge · consult-mode filter · Budget slices   │
+   │  ToolHealth circuit breaker · Evidence ledger          │
    │  CitationGuard · release-status machine · CriticAgent  │
    └───────────────────────────┬────────────────────────────┘
    ┌───────────────────────────▼────────────────────────────┐
    │ tools · de-identified expert-case store · safety tables│
+   │ interview axes (十问歌 + 骨科专科) · image reader        │
    └───────────────────────────┬────────────────────────────┘
    ┌───────────────────────────▼────────────────────────────┐
    │ knowledge (licence-gated, operator-ingested)           │
@@ -60,7 +63,25 @@
    facts (through an allowlist that excludes `physician_review`) and rephrase
    the released answer, nothing more. The urgent script is never rephrased and
    replies are dose-scanned before they leave. See [CONVERSATION.md](CONVERSATION.md).
-9. **Licences are enforced at write time.** `KnowledgeStore` rejects a
+9. **Asking is an action, and its scope is not the model's to choose.** The model
+   composes questions through the ``ask_patient`` tool, but which axes are
+   *required* is rule-derived; a skipped required axis is added back from the
+   probe bank. An interview may only end on an :class:`AdequacyJudge` verdict,
+   and a ``blocked`` verdict — a red-flag axis still unanswered — can never be
+   waived by the model, a round cap, or a verifier outage. See [INTERVIEW.md](INTERVIEW.md).
+10. **No subagent is prescriptive.** ``consult_mode`` intersects with a skill's
+    grant rather than unioning, so no persona or site ``SKILL.md`` can reach
+    ``formula_composition_search``, ``herb_dose_distribution`` or
+    ``physician_review_submit``. Consult depth is capped at one and each member
+    runs on a carved budget slice that charges back to the parent. Panel synthesis
+    takes the *maximum* urgency, never a majority vote. See [PANEL.md](PANEL.md).
+11. **A model image read is never a report.** Vision results are graded
+    ``model_reasoning`` (non-releasable), carry a mandatory
+    ``requires_formal_read`` that the schema refuses to see set false for
+    radiology, and are discarded wholesale when the PHI pre-check finds
+    identifiers. Images are never persisted — only a SHA-256 survives. See
+    [VISION.md](VISION.md).
+12. **Licences are enforced at write time.** `KnowledgeStore` rejects a
    non-commercial dataset in a commercial deployment, strips body text from
    read-only sources, and keeps credentialed sources closed without an
    attestation. The repository therefore ships connectors, never content. See
@@ -77,6 +98,9 @@
 | Tool use | choose tools and arguments from its skill's set, self-correct | see or reach a tool outside the skill; skip the broker |
 | Outputs | any shape the skill's schema allows | violate the schema; emit a gram value |
 | Dialogue | extract allowlisted facts, rephrase a released answer | set `physician_review`, add clinical content, rephrase the urgent script, emit a dose |
+| Interview | word/order/deepen the enquiry, add axes, propose that it is complete | skip a required axis, embed advice or a dose in a question, decide that asking may stop |
+| Consult panel | reason inside a speciality view, raise urgency, add concerns | reach a prescriptive tool, convene a nested consult, lower urgency or overspend its slice |
+| Vision | describe what is visible, raise a red flag, suggest questions and examinations | diagnose, claim to replace a formal read, emit a dose, read an image carrying identifiers |
 | Doses | nothing | anything |
 
 Execution autonomy is documented in [AUTONOMY.md](AUTONOMY.md); a skill's
@@ -91,6 +115,9 @@ errors, timeouts and budget exhaustion degrade the same way.
 
 ```
 bootstrap(IntakeAgent) → plan → ┌ execute tasks ┐
+                                │  T3 InterviewAgent (every path, urgent too)
+                                │  T4 VisionAgent   (only when images attached)
+                                │  N8 ConsultPanelAgent (opt-in, or LLM-planned)
                                 │               │
                                 └── critic ─────┘  repair_requests & budget.can_loop("repair")
                                         │
@@ -118,3 +145,10 @@ conversation turns (the agent answers and asks, but never opens a turn itself),
 persistent sessions, structured recommendation extraction from Chinese
 guidelines, and large-scale adversarial evaluation with red-flag
 recall/specificity baselines.
+
+Also deliberately absent: a content-addressed replay journal. Checkpoints record
+state after each node, which is enough to resume, but not enough to *prove* a
+resumed run reissued the same calls. Grok Build's workflow journal hashes each
+host request and detects replay divergence; that is the right shape for this
+problem and remains unbuilt. Consult members run sequentially rather than
+concurrently, and persona I/O contracts are declared but not enforced.

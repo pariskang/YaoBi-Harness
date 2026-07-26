@@ -54,11 +54,14 @@ class ConsoleService:
         checkpoint_dir: str | Path | None = None,
         skill_manifest: str | Path | None = None,
         access_token: str | None = None,
+        skill_dirs: list[str] | None = None,
+        vision: bool = True,
     ) -> None:
         self.knowledge_store_path = str(knowledge_store_path) if knowledge_store_path else None
         self.xlsx_path = str(xlsx_path) if xlsx_path else None
         self.checkpoint_dir = str(checkpoint_dir) if checkpoint_dir else None
         self.skill_manifest = str(skill_manifest) if skill_manifest else None
+        self.skill_dirs = list(skill_dirs or [])
         #: When set, every request must present it. Required for public tunnels.
         self.access_token = access_token or None
         self.llm_error: str | None = None
@@ -71,7 +74,8 @@ class ConsoleService:
             self.llm_error = str(exc)
 
         self.knowledge = self._open_knowledge()
-        self.tools = ToolRegistry(self.xlsx_path or None, knowledge=self.knowledge)
+        self.vision = self._open_vision(vision)
+        self.tools = ToolRegistry(self.xlsx_path or None, knowledge=self.knowledge, vision=self.vision)
         #: Live conversations, keyed by session id. In-memory only: transcripts
         #: are clinical content and must not be persisted by a demo console.
         self.sessions: dict[str, Any] = {}
@@ -82,6 +86,29 @@ class ConsoleService:
         from ..knowledge.ingest import open_store
 
         return open_store(self.knowledge_store_path)
+
+    @staticmethod
+    def _open_vision(enabled: bool):
+        """Build the vision client, tolerating an unconfigured environment."""
+        if not enabled:
+            return None
+        from ..vision.client import build_vision_client
+
+        try:
+            return build_vision_client()
+        except Exception as exc:  # noqa: BLE001 - the console must still start
+            logger.warning("vision client unavailable: %s", exc)
+            return None
+
+    def _runner(self, use_llm: bool = True, interview_loop: Any | None = None) -> YaobiGraphRunner:
+        return YaobiGraphRunner(
+            self.tools,
+            checkpoint_dir=self.checkpoint_dir,
+            skill_manifest=self.skill_manifest,
+            llm=self.llm if use_llm else NullLLMClient(),
+            skill_dirs=self.skill_dirs or None,
+            interview_loop=interview_loop,
+        )
 
     # ------------------------------------------------------------------ routes
     def bootstrap(self) -> dict[str, Any]:
@@ -102,13 +129,27 @@ class ConsoleService:
             from ..skills.loader import SkillRegistry
 
             manifest = self.skill_manifest or (Path(__file__).parent.parent / "skills" / "manifest.yaml")
-            skills = SkillRegistry.from_file(manifest).catalog()
+            skills = SkillRegistry.discover(manifest, extra_roots=self.skill_dirs or None).catalog()
         except Exception as exc:  # noqa: BLE001 - chrome must render even on a bad manifest
             logger.warning("skill catalog unavailable: %s", exc)
 
+        from ..interview.axes import AXES, TIERS
+        from ..vision.client import IMAGE_KINDS, describe_vision
+
         return {
             "llm": {**describe_client(self.llm), "error": self.llm_error},
+            "vision": {**describe_vision(self.vision), "kinds": list(IMAGE_KINDS)},
             "skills": skills,
+            "interview": {
+                "tiers": list(TIERS),
+                "axes": [
+                    {"axis_id": a.axis_id, "label": a.label, "tier": a.tier,
+                     "tradition": a.tradition, "rationale": a.rationale,
+                     "probes": list(a.probes)}
+                    for a in AXES
+                ],
+            },
+            "personas": _persona_catalog(),
             "expert": self.expert_summary(),
             "auth_required": bool(self.access_token),
             "knowledge": {
@@ -142,13 +183,9 @@ class ConsoleService:
             max_llm_calls=int(payload.get("max_llm_calls", 40)),
         )
 
-        use_llm = bool(payload.get("use_llm", True))
-        runner = YaobiGraphRunner(
-            self.tools,
-            checkpoint_dir=self.checkpoint_dir,
-            skill_manifest=self.skill_manifest,
-            llm=self.llm if use_llm else NullLLMClient(),
-        )
+        state.enable_panel = bool(payload.get("enable_panel"))
+        state.images = _coerce_images(payload.get("images"))
+        runner = self._runner(bool(payload.get("use_llm", True)))
         # One run at a time: the shared ToolRegistry and circuit breaker are not
         # designed for concurrent mutation from several browser tabs.
         with self._lock:
@@ -169,23 +206,22 @@ class ConsoleService:
         session_id = str(payload.get("session_id") or "")
         session = self.sessions.get(session_id)
         if session is None:
-            runner = YaobiGraphRunner(
-                self.tools, checkpoint_dir=self.checkpoint_dir,
-                skill_manifest=self.skill_manifest,
-                llm=self.llm if payload.get("use_llm", True) else NullLLMClient(),
-            )
             session = ConversationSession(
-                role=role, runner=runner,
+                role=role, runner=self._runner(bool(payload.get("use_llm", True))),
                 allow_prescription=bool(payload.get("allow_prescription")),
             )
             self.sessions[session.session_id] = session
             if len(self.sessions) > 50:  # bound memory on a long-lived console
                 self.sessions.pop(next(iter(self.sessions)))
 
+        for image in _coerce_images(payload.get("images")):
+            session.attach_image(image["ref"], kind=image["kind"], deidentified=image["deidentified"])
+
         with self._lock:
             reply = session.send(message)
         return {
             "session_id": session.session_id,
+            "interview": session.interview.summary(session.facts, session.complaint, role=session.role),
             "reply": reply.to_dict(),
             "audit": console_payload(session.state, session.role)["audit"] if session.state else {},
             "meta": console_payload(session.state, session.role)["meta"] if session.state else {},
@@ -233,6 +269,53 @@ class ConsoleService:
             ],
             "classes": {name: list(members) for name, members in ortho_interactions.DRUG_CLASSES.items()},
         }
+
+
+def _persona_catalog() -> list[dict[str, Any]]:
+    """The consult panel's members, for the console to show before a run."""
+    from ..agent.panel import DEFAULT_PANEL, PERSONAS
+
+    return [
+        {
+            "persona": name,
+            "label": profile.get("label", name),
+            "consult_mode": profile.get("consult_mode", "screening"),
+            "default": name in DEFAULT_PANEL,
+            "brief": str(profile.get("instructions", ""))[:220],
+            "inputs": list(profile.get("inputs") or ()),
+            "outputs": list(profile.get("outputs") or ()),
+        }
+        for name, profile in PERSONAS.items()
+    ]
+
+
+def _coerce_images(raw: Any) -> list[dict[str, Any]]:
+    """Validate inbound image attachments from the browser.
+
+    The de-identification attestation must be explicit: a payload that omits it is
+    rejected rather than defaulted, because defaulting it to ``true`` would let a
+    forgotten checkbox send an identifiable image to a third-party model.
+    """
+    from ..vision.client import IMAGE_KINDS, MAX_IMAGE_BYTES
+
+    images: list[dict[str, Any]] = []
+    for entry in (raw or [])[:6]:
+        if not isinstance(entry, dict):
+            continue
+        ref = str(entry.get("ref") or "").strip()
+        if not ref:
+            continue
+        kind = str(entry.get("kind") or "other")
+        if kind not in IMAGE_KINDS:
+            raise ValueError(f"未知图片类型: {kind}")
+        if not entry.get("deidentified"):
+            raise ValueError("上传图片前必须勾选「已去标识化」：请先遮盖姓名、各类编号、日期、条码与人脸")
+        # A data URI inflates ~4/3 over the raw bytes; check before decoding so an
+        # oversized upload fails fast instead of after a full base64 pass.
+        if ref.startswith("data:") and len(ref) > MAX_IMAGE_BYTES * 4 // 3 + 512:
+            raise ValueError(f"图片过大，上限约 {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+        images.append({"kind": kind, "ref": ref, "deidentified": True})
+    return images
 
 
 EXAMPLE_CASES = [
@@ -405,6 +488,8 @@ def serve(
     access_token: str | None = None,
     ngrok_authtoken: str | None = None,
     ngrok_region: str | None = None,
+    skill_dirs: list[str] | None = None,
+    vision: bool = True,
 ) -> None:
     """Run the console until interrupted, optionally behind a public tunnel."""
     from .tunnel import TunnelError, banner, new_token, open_ngrok
@@ -418,12 +503,15 @@ def serve(
         checkpoint_dir=checkpoint_dir,
         skill_manifest=skill_manifest,
         access_token=token,
+        skill_dirs=skill_dirs,
+        vision=vision,
     )
     httpd = create_server(service, host, port)
     url = f"http://{host}:{port}/"
     print(f"Yaobi 控制台已启动: {url}")
     print(f"  LLM      : {describe_client(service.llm)}")
     print(f"  知识库   : {service.knowledge_store_path or '未配置（指南/药典证据为占位数据）'}")
+    print(f"  视觉模型 : {service.vision.model if service.vision else '未配置（影像/舌象工具不可用）'}")
     print("  按 Ctrl+C 停止")
     tunnel = None
     if public:  # pragma: no cover - network path

@@ -17,9 +17,10 @@ from typing import Any
 
 from . import schemas
 from .agent.agents import (
-    BiomedicalAgent, CriticAgent, DoseAgent, ExpertCaseAgent, FormulaAgent,
-    IntakeAgent, MedicationSafetyAgent, PhysicianReviewAgent, TCMPatternAgent,
-    TimelineAgent, UrgentCareAgent, UrgentPlannerAgent,
+    BiomedicalAgent, ConsultPanelAgent, CriticAgent, DoseAgent, ExpertCaseAgent,
+    FormulaAgent, IntakeAgent, InterviewAgent, MedicationSafetyAgent,
+    OsteoporosisAgent, PhysicianReviewAgent, TCMPatternAgent, TimelineAgent,
+    UrgentCareAgent, UrgentPlannerAgent, VisionAgent,
 )
 from .agent.planner import AGENT_CATALOG, PlannerAgent
 from .llm.base import NullLLMClient
@@ -41,16 +42,27 @@ class YaobiGraphRunner:
         checkpoint_dir: str | Path | None = None,
         skill_manifest: str | Path | None = None,
         llm: Any | None = None,
+        skill_dirs: list[str | Path] | None = None,
+        interview_loop: Any | None = None,
     ) -> None:
         self.tools = tools or ToolRegistry()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         manifest = Path(skill_manifest) if skill_manifest else Path(__file__).parent / "skills" / "manifest.yaml"
-        self.skill_registry = SkillRegistry.from_file(manifest) if manifest.exists() else None
+        # ``discover`` layers every ``SKILL.md`` over the manifest, so the rich
+        # procedure files are policy too, not just prose the model happens to read.
+        self.skill_registry = SkillRegistry.discover(manifest, extra_roots=skill_dirs)
         self.llm = llm or NullLLMClient()
         self.health = ToolHealth()
         self.agents = {
             "TimelineAgent": TimelineAgent(self.llm),
             "IntakeAgent": IntakeAgent(self.llm),
+            # The interview keeps one loop across every node and every dialogue
+            # turn, so its round history — and therefore stall detection — is
+            # continuous rather than reset on each call.
+            "InterviewAgent": InterviewAgent(self.llm, loop=interview_loop),
+            "VisionAgent": VisionAgent(self.llm),
+            "ConsultPanelAgent": ConsultPanelAgent(self.llm),
+            "OsteoporosisAgent": OsteoporosisAgent(self.llm),
             "UrgentPlannerAgent": UrgentPlannerAgent(self.llm),
             "UrgentCareAgent": UrgentCareAgent(self.llm),
             "BiomedicalAgent": BiomedicalAgent(self.llm),
@@ -191,6 +203,7 @@ class YaobiGraphRunner:
     def _finalize(self, state: ClinicalRunState) -> None:
         # Repair loops re-run agents, so the same finding can be recorded twice.
         state.safety_issues = list(dict.fromkeys(state.safety_issues))
+        self._backfill_questions(state)
         if state.release_status == "needs_more_information":
             has_soft = bool(state.outputs.get("intake", {}).get("screening", {}).get("soft_hits"))
             critical_gaps = [m for m in state.missing_information if m in {"神经症状", "大小便/会阴感觉", "发热外伤肿瘤史"}]
@@ -212,6 +225,37 @@ class YaobiGraphRunner:
             "tool_health": self.health.snapshot(),
             "knowledge": self._knowledge_meta(),
         }
+
+    @staticmethod
+    def _backfill_questions(state: ClinicalRunState) -> None:
+        """Guarantee a run that still needs information actually asks for it.
+
+        InterviewAgent normally owns questioning, but an LLM-proposed plan may
+        legitimately omit it, and a run can fail closed before it executes. In
+        either case a patient who is told "需要更多信息" without being asked
+        anything has been given nothing to act on, so the axis probe bank fills in.
+        """
+        if state.open_questions or state.release_status == "urgent_action_plan":
+            return
+        # An interview that ran and was satisfied deliberately produced no
+        # questions. Backfilling then would re-open an enquiry the judge just
+        # closed, and the patient would be asked filler after answering everything.
+        verdict = ((state.outputs.get("interview") or {}).get("verdict") or {}).get("verdict")
+        if verdict in ("achieved", "stalled", "cap_reached"):
+            return
+        from .interview.axes import plan_next
+
+        plan = plan_next(
+            state.facts, state.complaint, role=state.role,
+            risk_mode=state.risk_mode, limit=3,
+        )
+        questions = [
+            plan.suggested_probes[axis_id][0]
+            for axis_id in plan.axis_ids
+            if plan.suggested_probes.get(axis_id)
+        ]
+        allowed = state.budget.reserve_questions(len(questions))
+        state.open_questions = questions[: allowed or len(questions)]
 
     def _knowledge_meta(self) -> dict[str, Any]:
         """Which external sources backed this run, and under which licence policy."""
@@ -255,6 +299,11 @@ class YaobiGraphRunner:
         state.outputs.pop("safety_audit", None)
 
     def run(self, state: ClinicalRunState, allow_prescription: bool = False, resumed: bool = False) -> ClinicalRunState:
+        # Record the permission on the state so agents can read it. The interview
+        # needs it: 四诊 completeness is required before a dose-bearing draft, and
+        # demanding it of every physician run — including ones that never asked
+        # for a prescription — reports a blocking deficit that does not exist.
+        state.allow_prescription = bool(allow_prescription)
         try:
             if not resumed:
                 self._bootstrap(state)

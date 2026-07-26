@@ -179,6 +179,69 @@ textarea:focus, input:focus, select:focus {
 .check small { display:block; color:var(--text-3); font-size:11.5px; line-height:1.45; }
 
 .chips { display:flex; flex-wrap:wrap; gap:6px; }
+
+/* ── 问诊进度：覆盖率环 + 分层轴 ───────────────────────────── */
+.cov { display:flex; align-items:center; gap:12px; }
+.cov-ring {
+  --pct:0; width:52px; height:52px; flex:0 0 52px; border-radius:50%;
+  background:conic-gradient(var(--accent) calc(var(--pct) * 1%), var(--line) 0);
+  display:grid; place-items:center; position:relative;
+}
+.cov-ring::after {
+  content:attr(data-pct); position:absolute; inset:5px; border-radius:50%;
+  background:var(--card); display:grid; place-items:center;
+  font:600 12px/1 var(--sans); color:var(--fg);
+}
+.cov-meta { min-width:0; }
+.cov-meta b { font-size:13px; }
+.cov-meta small { display:block; color:var(--muted); font-size:11px; line-height:1.5; }
+
+#axisPanel { max-height:230px; overflow-y:auto; margin-top:2px; padding-right:4px; }
+.axis-group { margin-top:10px; }
+.axis-group:first-child { margin-top:4px; }
+.axis-group > h4 {
+  font:600 11px/1 var(--sans); letter-spacing:.06em; text-transform:uppercase;
+  color:var(--muted); margin:0 0 5px;
+}
+.axis { display:flex; gap:7px; align-items:flex-start; padding:3px 0; font-size:12px; }
+.axis i { flex:0 0 14px; font-style:normal; text-align:center; line-height:1.45; }
+.axis.done i { color:var(--ok); }
+.axis.open i { color:var(--muted); }
+.axis.open span { color:var(--muted); }
+.axis.req i { color:var(--danger); }
+
+.tierbar { display:flex; gap:3px; margin:8px 0 2px; }
+.tierbar div { height:5px; border-radius:3px; flex:1; background:var(--line); overflow:hidden; }
+.tierbar div span { display:block; height:100%; background:var(--accent); }
+
+/* ── 图片附件 ───────────────────────────────────────────── */
+.imgs { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+.imgs figure {
+  margin:0; width:64px; border:1px solid var(--line); border-radius:8px;
+  overflow:hidden; background:var(--bg-soft); position:relative;
+}
+.imgs img { display:block; width:100%; height:48px; object-fit:cover; }
+.imgs figcaption {
+  font:500 9px/1.3 var(--sans); padding:3px 4px; color:var(--muted);
+  text-align:center; word-break:break-all;
+}
+.imgs button {
+  position:absolute; top:2px; right:2px; width:16px; height:16px; padding:0;
+  border:none; border-radius:50%; background:rgba(0,0,0,.55); color:#fff;
+  font:700 10px/16px var(--sans); cursor:pointer;
+}
+.drop {
+  border:1px dashed var(--line); border-radius:10px; padding:12px;
+  text-align:center; color:var(--muted); font-size:12px; cursor:pointer;
+  transition:border-color .15s, background .15s;
+}
+.drop:hover, .drop.over { border-color:var(--accent); background:var(--accent-soft); color:var(--accent); }
+.drop.locked { opacity:.55; cursor:not-allowed; }
+
+/* ── 会诊合议 ───────────────────────────────────────────── */
+.opinion { border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:8px; }
+.opinion > header { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
+.opinion > header b { font-size:13px; }
 .chip {
   border:1px solid var(--line-strong); background:var(--surface); color:var(--text-2);
   padding:4px 10px; border-radius:99px; font-size:12px; cursor:pointer; transition:.15s;
@@ -383,7 +446,7 @@ pre.json {
   .brand span { display:none; }
   .brand b { font-size:13.5px; }
   .nav button { padding:5px 9px; font-size:12.5px; }
-  #badgeLlm, #badgeKnow { display:none; }
+  #badgeLlm, #badgeKnow, #badgeVision { display:none; }
   .card-head, .card-body, .sec, .tabs { padding-left:var(--sp-4); padding-right:var(--sp-4); }
   .hero { padding:var(--sp-4); }
   .tabs { gap:var(--sp-4); }
@@ -420,6 +483,7 @@ pre.json {
   <div class="top-right">
     <span class="badge mono" id="badgeLlm">LLM …</span>
     <span class="badge mono" id="badgeKnow">知识库 …</span>
+    <span class="badge mono" id="badgeVision">视觉 …</span>
     <button class="icon-btn" id="themeBtn" title="切换主题" aria-label="切换主题">◐</button>
   </div>
 </header>
@@ -448,17 +512,49 @@ pre.json {
           </label>
         </div>
         <div class="field">
-          <label class="lbl">已获得的信息</label>
-          <pre class="json" id="chatFacts" style="max-height:240px">{}</pre>
+          <label class="lbl">问诊进度 <em>十问歌 + 骨科专科</em></label>
+          <div class="cov">
+            <div class="cov-ring" id="covRing" data-pct="0%" style="--pct:0"></div>
+            <div class="cov-meta" id="covMeta">
+              <b>尚未开始</b>
+              <small>发出第一条消息后，这里会显示已闭合与仍缺的问诊轴。</small>
+            </div>
+          </div>
+          <div class="tierbar" id="tierBar" title="按层级的覆盖率：红旗 / 核心 / 专科 / 中医四诊 / 背景"></div>
+          <div id="axisPanel"></div>
         </div>
         <div class="field">
-          <label class="lbl">仍缺失</label>
-          <div class="chips" id="chatMissing"></div>
+          <label class="lbl">图片 <em>影像翻拍 / 舌象 / 体态 / 患肢 / 报告单</em></label>
+          <label class="check">
+            <input type="checkbox" id="imgDeid">
+            <div>已去标识化<small>已遮盖姓名、各类编号、日期、条码与人脸；勾选后才能上传</small></div>
+          </label>
+          <select id="imgKind" class="inp" style="margin-top:8px">
+            <option value="radiograph">X 线翻拍</option>
+            <option value="mri_ct">MRI / CT 翻拍</option>
+            <option value="tongue">舌象</option>
+            <option value="posture_gait">体态 / 步态</option>
+            <option value="limb_surface">患肢外观</option>
+            <option value="report_document">检查报告单</option>
+            <option value="other">其它</option>
+          </select>
+          <div class="drop locked" id="imgDrop" style="margin-top:8px">
+            点击或拖入图片<br><small id="imgDropNote">请先勾选「已去标识化」</small>
+          </div>
+          <input type="file" id="imgFile" accept="image/*" multiple hidden>
+          <div class="imgs" id="imgList"></div>
+          <p class="hint">判读结果为模型视觉所见，证据等级 <code>model_reasoning</code>，
+             <b>不能替代正式阅片</b>，也不能单独支撑放行结论。系统会先做一次身份信息预检，
+             检出即拒绝判读。</p>
+        </div>
+        <div class="field">
+          <label class="lbl">已获得的信息</label>
+          <pre class="json" id="chatFacts" style="max-height:200px">{}</pre>
         </div>
         <button class="btn btn-ghost" id="chatReset">重新开始</button>
         <p class="hint" style="margin-top:10px">
           每一轮都是一次完整审计运行：整段叙述会被重新红旗筛查，缺口重新计算。
-          对话记录只存在内存中，刷新即清空。</p>
+          追问由模型按问诊轴自主组织，必答轴不能被跳过。对话记录只存在内存中，刷新即清空。</p>
       </div>
     </div>
 
@@ -531,6 +627,11 @@ pre.json {
             <input type="checkbox" id="useLlm" checked>
             <div>启用 LLM 规划与审查
               <small>提案经规则层校验，越权即整体驳回并回退默认计划</small></div>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="enablePanel">
+            <div>召集多学科会诊
+              <small>骨科/疼痛/康复/中医骨伤/药师子体各自独立运行；最保守意见优先。token 开销显著增加</small></div>
           </label>
         </div>
 
@@ -677,6 +778,18 @@ async function boot() {
   $("#badgeKnow").textContent = kn.configured ? `知识库 ${nSrc} 源` : "知识库 未配置";
   $("#badgeKnow").className = "badge mono" + (kn.configured ? " b-ok" : " b-warn");
 
+  const vis = BOOT.vision || {};
+  $("#badgeVision").textContent = vis.configured ? `视觉 ${vis.model}` : "视觉 未配置";
+  $("#badgeVision").className = "badge mono" + (vis.configured ? " b-accent" : "");
+  if (!vis.configured) {
+    $("#imgDeid").disabled = true;
+    $("#imgDropNote").textContent = "未配置视觉模型：设置 YAOBI_VISION_PROVIDER 与 POE_API_KEY 后可用";
+  }
+
+  // Axis metadata is fetched once so the progress panel can label a tier and
+  // surface an axis's clinical rationale on hover without another round trip.
+  AXES = Object.fromEntries((BOOT.interview?.axes || []).map(a => [a.axis_id, a]));
+
   $("#caseStoreInfo").textContent = BOOT.case_store_records
     ? `专家病例 ${BOOT.case_store_records} 条` : "未加载专家病例库";
 
@@ -755,6 +868,7 @@ async function runCase() {
       complaint, role: currentRole(), facts,
       allow_prescription: $("#allowRx").checked,
       use_llm: $("#useLlm").checked,
+      enable_panel: $("#enablePanel").checked,
     });
     ACTIVE_TAB = "answer";
     renderRun();
@@ -776,6 +890,7 @@ function renderRun() {
   const tabs = [
     ["answer", "交付内容", null],
     ["plan",   "规划与执行", (audit.tasks || []).length],
+    ["intake", "问诊与会诊", ((audit.interview?.coverage?.open) || []).length || null],
     ["meds",   "用药安全", (audit.medication_safety?.findings || []).length],
     ["evidence","证据台账", (audit.evidence || []).length],
     ["safety", "安全审查", blockers],
@@ -830,7 +945,8 @@ const roleName = (r) => ({ patient:"患者", physician:"医师", researcher:"研
 function renderTab() {
   const body = $("#tabBody");
   const { delivered, audit, meta } = LAST;
-  const fns = { answer:tabAnswer, plan:tabPlan, meds:tabMeds, evidence:tabEvidence, safety:tabSafety, raw:tabRaw };
+  const fns = { answer:tabAnswer, plan:tabPlan, intake:tabIntake, meds:tabMeds,
+                evidence:tabEvidence, safety:tabSafety, raw:tabRaw };
   body.replaceChildren(el(fns[ACTIVE_TAB](delivered, audit, meta)));
 }
 
@@ -982,6 +1098,137 @@ const statusLabel = (s) => ({
 }[s] || s);
 const statusTone = (s) => ({ ok:"ok", failed:"danger", repair_requested:"warn" }[s] || "mute");
 
+/* ── tab: interview coverage + consult panel + image reads ─── */
+function tabIntake(d, audit, meta) {
+  const out = [];
+  const iv = audit.interview || {};
+  const cov = iv.coverage || {};
+  const verdict = iv.verdict || {};
+
+  if (!Object.keys(iv).length) {
+    out.push(`<div class="sec">${emptyBlock("本次运行未执行问诊节点")}</div>`);
+  } else {
+    const v = VERDICT[verdict.verdict] || { label:verdict.verdict || "-", tone:"mute" };
+    out.push(`<div class="sec"><h3>问诊充分性</h3>
+      <div class="hero-meta" style="margin-bottom:12px">
+        ${badge(v.label, v.tone)}
+        ${badge("第 " + (iv.rounds_used || 0) + " 轮", "mute")}
+        ${badge("覆盖 " + Math.round((cov.ratio || 0) * 100) + "%", "mute")}
+        ${badge(iv.composer === "llm" ? "模型自主提问" : "题库提问", iv.composer === "llm" ? "accent" : "mute")}
+        ${badge(verdict.judged_by === "llm" ? "模型复核" : "规则判定",
+                verdict.judged_by === "llm" ? "accent" : "mute")}
+        ${iv.model_claimed_complete ? badge("模型声称已充分", "warn") : ""}
+      </div>
+      ${verdict.reason ? `<p class="why">${esc(verdict.reason)}</p>` : ""}
+      ${(verdict.blocking_labels || []).length ? `<div class="note n-danger"><span class="ico">▲</span>
+        <div><b>必答项未闭合：</b>${esc(verdict.blocking_labels.join("、"))}<br>
+        这些轴未获答复前不能进入含剂量或处方环节。</div></div>` : ""}
+      ${(verdict.contradictions || []).length ? `<div class="note n-warn" style="margin-top:10px">
+        <span class="ico">▲</span><div><b>病史需澄清：</b>${esc(verdict.contradictions.join("；"))}</div></div>` : ""}
+    </div>`);
+
+    // Questions asked this round, with the axis each one closes. Showing "why"
+    // is the point: it is the difference between a questionnaire and an enquiry.
+    if ((iv.questions || []).length) {
+      out.push(`<div class="sec"><h3>本轮提问</h3>${iv.questions.map(q => `
+        <div class="finding">
+          <div class="finding-head">
+            ${badge(TIER_LABEL[q.tier] || q.tier, q.tier === "RED_FLAG" ? "danger" : "mute")}
+            <b>${esc(q.label || q.axis_id)}</b>
+            ${badge(q.origin === "llm" ? "模型" : "题库", q.origin === "llm" ? "accent" : "mute")}
+          </div>
+          <div class="obj">${esc(q.question)}</div>
+          ${q.why ? `<div class="hint">为什么问：${esc(q.why)}</div>` : ""}
+        </div>`).join("")}</div>`);
+    }
+    if ((iv.rejected || []).length) {
+      out.push(listSec("被拦下的提问（含剂量/夹带建议/重复/未知轴）", iv.rejected));
+    }
+
+    // Coverage by tier, both answered and open, so a gap is visible as a gap.
+    const byTier = cov.by_tier || {};
+    const rows = TIER_ORDER.filter(tier => byTier[tier]).map(tier => {
+      const b = byTier[tier];
+      const name = (ids) => ids.map(id => esc(AXES[id]?.label || id)).join("、") || "—";
+      return `<tr><td>${TIER_LABEL[tier]}</td>
+        <td>${b.answered.length}/${b.answered.length + b.open.length}</td>
+        <td>${name(b.answered)}</td><td style="color:var(--muted)">${name(b.open)}</td></tr>`;
+    }).join("");
+    if (rows) {
+      out.push(`<div class="sec"><h3>问诊轴覆盖</h3>
+        <div class="tbl-wrap"><table><thead><tr>
+          <th>层级</th><th>已闭合</th><th>已问到</th><th>仍缺</th>
+        </tr></thead><tbody>${rows}</tbody></table></div>
+        <p class="hint">红旗与核心层是必答层：未闭合会阻断含剂量放行。
+           中医四诊层在开方前必答。背景层影响方案，不阻断放行。</p></div>`);
+    }
+  }
+
+  // Consult panel
+  const panel = audit.consult_panel || {};
+  if ((panel.opinions || []).length) {
+    out.push(`<div class="sec"><h3>多学科会诊合议</h3>
+      <div class="hero-meta" style="margin-bottom:12px">
+        ${badge("紧急度 " + panel.urgency, panel.urgency === "routine" ? "mute" : "danger")}
+        ${badge(panel.agreement || "", "mute")}
+      </div>
+      <p class="hint" style="margin-bottom:12px">
+        合议采取<b>最保守优先</b>而非多数票：紧急度取所有会诊者中的最高值，关切取并集。
+        一致程度只作为信息呈现，不作为过滤条件。</p>
+      ${panel.opinions.map(o => `
+        <div class="opinion">
+          <header><b>${esc(o.label)}</b>
+            ${badge("紧急度 " + o.urgency, o.urgency === "routine" ? "mute" : "danger")}
+            ${o.ok ? badge(o.tool_calls + " 次取证", "mute") : badge("未产出: " + esc(o.error || ""), "warn")}
+          </header>
+          ${(o.key_findings || []).length ? `<div class="obj">${o.key_findings.map(esc).join("；")}</div>` : ""}
+          ${(o.concerns || []).length ? `<div class="obj"><b>关切：</b>${o.concerns.map(esc).join("；")}</div>` : ""}
+          ${(o.recommend_next || []).length ? `<div class="obj"><b>下一步：</b>${o.recommend_next.map(esc).join("；")}</div>` : ""}
+          ${o.dissent ? `<div class="hint"><b>分歧：</b>${esc(o.dissent)}</div>` : ""}
+          ${o.evidence_note ? `<div class="hint">${esc(o.evidence_note)}</div>` : ""}
+        </div>`).join("")}</div>`);
+    out.push(listSec("合议分歧", panel.dissents));
+  } else if (panel.mode && panel.mode !== "not_run") {
+    out.push(`<div class="sec">${emptyBlock("会诊未运行：" + panel.mode)}</div>`);
+  }
+
+  // Image reads
+  const img = audit.image_findings || {};
+  if ((img.reads || []).length) {
+    out.push(`<div class="sec"><h3>图片判读</h3>
+      <div class="note n-warn" style="margin-bottom:12px"><span class="ico">▲</span><div>
+        ${esc(img.caveat || "模型视觉判读，不能替代正式阅片")}</div></div>
+      ${img.reads.map(r => r.phi_detected
+        ? `<div class="note n-danger" style="margin-bottom:10px"><span class="ico">▲</span><div>
+             <b>检出身份信息，已拒绝判读。</b>${esc((r.phi_kinds || []).join("、"))}<br>
+             ${esc(r.caveat || "")}</div></div>`
+        : `<div class="opinion">
+             <header><b>${esc(r.image_kind)}</b>
+               ${badge(r.readable ? "可判读" : "不可判读", r.readable ? "ok" : "warn")}
+               ${badge("置信 " + (r.confidence || "low"), "mute")}
+               ${badge("需正式阅片", "danger")}
+               <span class="badge mono">${esc((r.image_sha256 || "").slice(0, 10))}</span>
+             </header>
+             ${(r.observations || []).length ? `<div class="obj">${r.observations.map(esc).join("；")}</div>` : ""}
+             ${(r.urgent_signals || []).length ? `<div class="obj"><b>急症外观：</b>${r.urgent_signals.map(esc).join("；")}</div>` : ""}
+             ${(r.not_assessable || []).length ? `<div class="hint">不可判读：${r.not_assessable.map(esc).join("；")}</div>` : ""}
+             ${(r.suggest_ask || []).length ? `<div class="hint">建议追问：${r.suggest_ask.map(esc).join("；")}</div>` : ""}
+             ${(r.suggest_exam || []).length ? `<div class="hint">建议检查：${r.suggest_exam.map(esc).join("；")}</div>` : ""}
+             ${r.caveat ? `<div class="hint">${esc(r.caveat)}</div>` : ""}
+           </div>`).join("")}</div>`);
+  }
+
+  // Osteoporosis assessment
+  const osteo = audit.osteoporosis_risk || {};
+  if ((osteo.differentials || []).length) {
+    out.push(listSec("骨质疏松鉴别（先排除病理性骨折）", osteo.differentials));
+    out.push(listSec("骨质疏松相关检查与用药前置条件", osteo.exam_advice));
+    if (osteo.evidence_note) out.push(`<div class="sec"><p class="hint">${esc(osteo.evidence_note)}</p></div>`);
+  }
+
+  return out.filter(Boolean).join("") || emptyBlock("本次运行没有问诊或会诊记录");
+}
+
 /* ── tab: medication safety ────────────────────────────────── */
 function tabMeds(d, audit) {
   const ms = audit.medication_safety || {};
@@ -1106,6 +1353,126 @@ function kv(pairs) {
 }
 const emptyBlock = (msg) => `<div class="empty"><h3>${esc(msg)}</h3></div>`;
 
+/* ═══════════════════ 问诊进度 ═══════════════════ */
+const TIER_LABEL = { RED_FLAG:"红旗", CORE:"核心", SPECIALTY:"专科", TCM:"中医四诊", CONTEXT:"背景" };
+const TIER_ORDER = ["RED_FLAG", "CORE", "SPECIALTY", "TCM", "CONTEXT"];
+const VERDICT = {
+  achieved:     { label:"问诊充分",     tone:"ok" },
+  not_achieved: { label:"仍需追问",     tone:"info" },
+  stalled:      { label:"追问停滞",     tone:"warn" },
+  cap_reached:  { label:"达轮次上限",   tone:"warn" },
+  blocked:      { label:"必答项未闭合", tone:"danger" },
+};
+
+/* Axis metadata arrives once in /api/bootstrap, so the panel can name a tier and
+   show an axis's clinical rationale without another round trip. */
+let AXES = {};
+
+function renderInterview(interview) {
+  if (!interview) return;
+  const cov = interview.coverage || {};
+  const pct = Math.round((cov.ratio || 0) * 100);
+  const ring = $("#covRing");
+  ring.style.setProperty("--pct", pct);
+  ring.dataset.pct = pct + "%";
+
+  const v = VERDICT[interview.verdict] || null;
+  const rounds = interview.rounds_used || 0;
+  const composer = interview.composer === "llm"
+    ? badge("模型自主提问", "accent")
+    : (interview.composer === "probe_bank" ? badge("题库提问", "mute") : "");
+  $("#covMeta").innerHTML = `
+    <b>${(cov.answered || []).length} / ${(cov.answered || []).length + (cov.open || []).length} 轴已闭合</b>
+    <small>第 ${rounds} 轮 ${v ? "· " + v.label : ""}
+      ${interview.judged_by === "llm" ? "· 模型复核" : (interview.verdict ? "· 规则判定" : "")}</small>
+    <div style="margin-top:5px">${v ? badge(v.label, v.tone) : ""}${composer}</div>`;
+
+  // Per-tier coverage: a full red-flag bar with an empty TCM bar is a very
+  // different state from the reverse, and one overall percentage hides that.
+  const byTier = cov.by_tier || {};
+  $("#tierBar").replaceChildren(...TIER_ORDER.map(tier => {
+    const b = byTier[tier] || { answered:[], open:[] };
+    const total = b.answered.length + b.open.length;
+    const ratio = total ? Math.round((b.answered.length / total) * 100) : 0;
+    const box = el(`<div title="${TIER_LABEL[tier]}：${b.answered.length}/${total}"><span style="width:${ratio}%"></span></div>`);
+    return box;
+  }));
+
+  const required = new Set(interview.blocking_axis_ids || []);
+  const groups = TIER_ORDER.map(tier => {
+    const b = byTier[tier];
+    if (!b || !(b.answered.length + b.open.length)) return "";
+    const rows = [
+      ...b.answered.map(id => ({ id, done:true })),
+      ...b.open.map(id => ({ id, done:false })),
+    ].map(({ id, done }) => {
+      const axis = AXES[id] || { label:id, rationale:"" };
+      const req = !done && required.has(id);
+      return `<div class="axis ${done ? "done" : "open"}${req ? " req" : ""}" title="${esc(axis.rationale || "")}">
+        <i>${done ? "✓" : (req ? "!" : "○")}</i><span>${esc(axis.label || id)}</span></div>`;
+    }).join("");
+    return `<div class="axis-group"><h4>${TIER_LABEL[tier]}</h4>${rows}</div>`;
+  }).join("");
+  $("#axisPanel").innerHTML = groups;
+}
+
+/* ═══════════════════ 图片附件 ═══════════════════ */
+/* Images are held in the page only until the next turn sends them, and never
+   written to any store. The de-identification checkbox gates the file picker
+   itself, so there is no path that uploads before the attestation is made. */
+let PENDING_IMAGES = [];
+
+function syncImgLock() {
+  const ok = $("#imgDeid").checked;
+  $("#imgDrop").classList.toggle("locked", !ok);
+  $("#imgDropNote").textContent = ok
+    ? "支持 PNG / JPG / WEBP，单张不超过 12 MB"
+    : "请先勾选「已去标识化」";
+}
+
+function renderImages() {
+  $("#imgList").replaceChildren(...PENDING_IMAGES.map((img, index) => {
+    const fig = el(`<figure>
+      <img alt="${esc(img.name)}" src="${img.ref}">
+      <figcaption>${esc(img.kindLabel)}</figcaption>
+      <button type="button" title="移除">×</button></figure>`);
+    fig.querySelector("button").addEventListener("click", () => {
+      PENDING_IMAGES.splice(index, 1);
+      renderImages();
+    });
+    return fig;
+  }));
+}
+
+async function addImages(files) {
+  if (!$("#imgDeid").checked) return;
+  const kind = $("#imgKind").value;
+  const kindLabel = $("#imgKind").selectedOptions[0].textContent;
+  for (const file of Array.from(files).slice(0, 6 - PENDING_IMAGES.length)) {
+    if (!file.type.startsWith("image/")) continue;
+    if (file.size > 12 * 1024 * 1024) { alert(`${file.name} 超过 12 MB`); continue; }
+    const ref = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    PENDING_IMAGES.push({ kind, kindLabel, ref, name:file.name, deidentified:true });
+  }
+  renderImages();
+}
+
+$("#imgDeid").addEventListener("change", syncImgLock);
+$("#imgDrop").addEventListener("click", () => { if ($("#imgDeid").checked) $("#imgFile").click(); });
+$("#imgFile").addEventListener("change", e => { addImages(e.target.files); e.target.value = ""; });
+["dragenter", "dragover"].forEach(evt => $("#imgDrop").addEventListener(evt, e => {
+  e.preventDefault(); if ($("#imgDeid").checked) $("#imgDrop").classList.add("over");
+}));
+["dragleave", "drop"].forEach(evt => $("#imgDrop").addEventListener(evt, e => {
+  e.preventDefault(); $("#imgDrop").classList.remove("over");
+}));
+$("#imgDrop").addEventListener("drop", e => addImages(e.dataTransfer.files));
+
 /* ═══════════════════ CHAT ═══════════════════ */
 let CHAT = { sessionId:null, turns:0 };
 const chatRole = () => $("#chatRoleSeg button[aria-pressed=true]")?.dataset.role || "patient";
@@ -1157,7 +1524,12 @@ async function chatSend(text) {
     const data = await api("/api/chat", {
       message, role: chatRole(), session_id: CHAT.sessionId,
       allow_prescription: $("#chatAllowRx").checked, use_llm: $("#chatUseLlm").checked,
+      images: PENDING_IMAGES.map(i => ({ kind:i.kind, ref:i.ref, deidentified:true })),
     });
+    // Sent images belong to the session now; clearing keeps the next turn from
+    // re-reading them and re-charging the vision budget.
+    PENDING_IMAGES = [];
+    renderImages();
     CHAT.sessionId = data.session_id;
     CHAT.turns = data.turn_count;
     const reply = data.reply;
@@ -1173,24 +1545,30 @@ async function chatSend(text) {
     }
 
     $("#chatFacts").textContent = JSON.stringify(reply.known_facts || {}, null, 2);
-    $("#chatMissing").replaceChildren(...(reply.still_missing || []).map(gap => {
-      const tag = document.createElement("span");
-      tag.className = "badge";
-      tag.textContent = gap;
-      return tag;
-    }));
     $("#chatTurns").textContent = `${data.turn_count} 条消息`;
+    renderInterview({ ...(data.interview || {}), ...(reply.interview || {}),
+                      coverage: (data.interview || {}).coverage || {} });
+    if ((reply.interview || {}).rejected?.length) {
+      pendingBubble.appendChild(el(
+        `<div class="learned">提问已被拦下：${esc(reply.interview.rejected.join("；"))}</div>`));
+    }
 
     // Clicking a suggested question drops it into the box so the user can edit
     // their answer rather than sending the question text back verbatim.
-    $("#chatQuestions").replaceChildren(...(reply.questions || []).map(question => {
+    const asked = (reply.structured_questions || []).length
+      ? reply.structured_questions
+      : (reply.questions || []).map(q => ({ question:q, label:"", tier:"CORE" }));
+    $("#chatQuestions").replaceChildren(...asked.map(item => {
       const chip = document.createElement("button");
       chip.className = "chip";
       chip.type = "button";
-      chip.textContent = question;
+      // The tier prefix tells the operator *why* this is being asked now; a
+      // RED_FLAG chip and a CONTEXT chip carry very different urgency.
+      chip.textContent = item.label ? `${TIER_LABEL[item.tier] || ""}·${item.question}` : item.question;
+      chip.title = item.why || item.label || "";
       chip.addEventListener("click", () => {
         input.value = "";
-        input.placeholder = question;
+        input.placeholder = item.question;
         input.focus();
       });
       return chip;
@@ -1218,8 +1596,14 @@ $("#chatReset").addEventListener("click", async () => {
     <h3>说说你的情况</h3><p>例如「腰痛3个月，久坐加重」。</p></div>`));
   $("#chatQuestions").replaceChildren();
   $("#chatFacts").textContent = "{}";
-  $("#chatMissing").replaceChildren();
   $("#chatTurns").textContent = "";
+  $("#axisPanel").replaceChildren();
+  $("#tierBar").replaceChildren();
+  $("#covRing").style.setProperty("--pct", 0);
+  $("#covRing").dataset.pct = "0%";
+  $("#covMeta").innerHTML = `<b>尚未开始</b><small>发出第一条消息后，这里会显示已闭合与仍缺的问诊轴。</small>`;
+  PENDING_IMAGES = [];
+  renderImages();
 });
 
 /* ═══════════════════ DRUG CHECK ═══════════════════ */

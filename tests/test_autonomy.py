@@ -511,14 +511,24 @@ class SkillCatalogTests(unittest.TestCase):
         self.assertNotIn("yaobi.dose_generation", {c["skill_id"] for c in catalog})
 
     def test_agent_catalog_tools_never_exceed_their_skill(self):
+        """Every catalogued agent's tools must be inside its skill's grant.
+
+        Checked against the *discovered* registry, because a skill may be defined
+        in ``manifest.yaml`` or in a ``SKILL.md``; either way the grant is what
+        the broker enforces.
+        """
         from yaobi_harness.agent.planner import AGENT_CATALOG
 
-        skills = SkillRegistry.from_file(MANIFEST)
+        skills = SkillRegistry.discover(MANIFEST)
         for spec in AGENT_CATALOG.values():
             with self.subTest(agent=spec.name):
                 skill = skills.specs.get(spec.skill_id)
-                self.assertIsNotNone(skill, f"{spec.skill_id} missing from manifest")
-                self.assertTrue(set(spec.tools).issubset(set(skill.allowed_tools)))
+                self.assertIsNotNone(skill, f"{spec.skill_id} is not declared in any skill source")
+                self.assertTrue(
+                    set(spec.tools).issubset(set(skill.allowed_tools)),
+                    f"{spec.name} requests {sorted(set(spec.tools) - set(skill.allowed_tools))} "
+                    f"outside {spec.skill_id}",
+                )
 
 
 if __name__ == "__main__":

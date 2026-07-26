@@ -247,8 +247,11 @@ class IntakeAgent(BaseAgent):
             state.warn("存在待证实的弱风险信号，建议线下评估以排除结构性病因")
 
         state.missing_information = missing_information(state.facts)
-        allowed = state.budget.reserve_questions(3 if state.risk_mode == "urgent" else 5)
-        state.open_questions = cognition.followup_questions(state, self.llm, DEFAULT_QUESTIONS, allowed)
+        # Questioning belongs to InterviewAgent, which composes it from the axis
+        # table and has the model word it. Generating a second, unrelated set here
+        # spent an LLM call and a slice of the question budget on questions the
+        # interview then overwrote. Intake now records the gaps and stops there;
+        # the runner backfills questions only if no interview ran.
 
         state.outputs["intake"] = {
             "risk_mode": state.risk_mode,
@@ -264,6 +267,293 @@ class IntakeAgent(BaseAgent):
             output_summary=f"risk={state.risk_mode}; hits={len(screening.get('hits', []))}; missing={len(state.missing_information)}",
             evidence_ids=[evidence_id],
         )
+        return state
+
+
+class InterviewAgent(BaseAgent):
+    """Model-driven history taking, bounded by rule-derived axes.
+
+    Sits between intake and everything else: intake decides *whether this is an
+    emergency*, the interview decides *whether we know enough to proceed*. Making
+    it a graph node rather than a chat-only concern means a single-shot ``run``
+    also reports its history deficit, instead of quietly assessing a case on four
+    facts.
+    """
+
+    name = "InterviewAgent"
+    skill_id = "yaobi.interview"
+    output_schema = "InterviewProgress"
+    output_key = "interview"
+
+    def __init__(self, llm: Any | None = None, loop: Any | None = None) -> None:
+        super().__init__(llm)
+        #: Shared across turns by :class:`~yaobi_harness.conversation.ConversationSession`
+        #: so stall detection spans the conversation rather than one call.
+        self.loop = loop
+
+    def interview_loop(self, broker: CapabilityBroker) -> Any:
+        from ..interview.loop import InterviewLoop
+
+        if self.loop is None:
+            self.loop = InterviewLoop(self.llm, skill_spec=self.skill_spec(broker))
+        return self.loop
+
+    def run(self, state, tools, broker):
+        from ..interview.axes import coverage
+
+        loop = self.interview_loop(broker)
+        # 四诊 completeness gates a dose-bearing draft, so it is required only when
+        # this run may actually produce one.
+        prescriptive = state.role == "physician" and state.allow_prescription
+        round_result = loop.next_round(
+            state.facts, state.complaint,
+            role=state.role, risk_mode=state.risk_mode,
+            prescriptive=prescriptive, budget=state.budget,
+        )
+        verdict = round_result.verdict
+        report = coverage(state.facts, state.complaint, role=state.role)
+
+        state.outputs[self.output_key] = {
+            "coverage": report,
+            "questions": [q.to_dict() for q in round_result.questions],
+            "verdict": verdict.to_dict() if verdict else {},
+            "rounds_used": loop.rounds_used,
+            "composer": round_result.composer,
+            "rejected": round_result.rejected,
+            "model_claimed_complete": round_result.model_claimed_complete,
+            "_produced_by": "llm_interview_loop" if round_result.composer == "llm" else "probe_bank",
+        }
+        # The interview's questions become the run's open questions, so every
+        # surface (CLI, console, chat) shows the same enquiry.
+        asked = [q.question for q in round_result.questions]
+        if asked:
+            allowed = state.budget.reserve_questions(len(asked))
+            state.open_questions = asked[: allowed or len(asked)]
+
+        if verdict is not None:
+            if verdict.verdict == "blocked":
+                labels = "、".join(verdict.to_dict()["blocking_labels"]) or "必答项缺失"
+                state.warn(f"问诊必答项未闭合，不能进入含剂量或处方环节: {labels}")
+                state.safety_issues.append(
+                    "问诊充分性判定为 blocked：" + (verdict.reason or "必答问诊轴未获答复")
+                )
+            elif verdict.deficit:
+                state.warn(f"问诊带缺口继续({verdict.verdict}): {verdict.reason}")
+            for contradiction in verdict.contradictions:
+                state.warn(f"病史存在需澄清之处: {contradiction}")
+
+        state.trace(
+            self.name, "interview_round",
+            output_summary=(
+                f"round={loop.rounds_used}; composer={round_result.composer}; "
+                f"verdict={verdict.verdict if verdict else 'n/a'}; "
+                f"coverage={report['ratio']}"
+            ),
+        )
+        return state
+
+
+class ConsultPanelAgent(BaseAgent):
+    """Convenes the multi-speciality panel and records its combined view.
+
+    Deliberately *not* wired into the release-status machine: the panel raises
+    concerns and can raise urgency, but a status change still comes from the
+    ordinary screening and safety machinery. A panel of models must not be able
+    to talk the run into a more permissive outcome — only a more cautious one.
+    """
+
+    name = "ConsultPanelAgent"
+    skill_id = "yaobi.consult_panel"
+    output_schema = "ConsultOpinion"
+    output_key = "consult_panel"
+
+    def run(self, state, tools, broker):
+        from .panel import ConsultPanel
+
+        registry = getattr(broker, "skill_registry", None)
+        if registry is None or self.skill_id not in getattr(registry, "specs", {}):
+            state.warn("未登记会诊技能，跳过多学科会诊")
+            return state
+
+        panel = ConsultPanel(self.llm, skill_id=self.skill_id)
+        result = panel.run(state, tools, registry, health=broker.health)
+        state.outputs[self.output_key] = result.to_dict()
+
+        if result.mode != "panel":
+            state.trace(self.name, "panel_skipped", output_summary=result.mode)
+            return state
+
+        # Urgency may only be raised. A panel that thinks a rule-flagged
+        # emergency is routine changes nothing.
+        if result.urgency in ("urgent", "emergency") and state.risk_mode != "urgent":
+            state.risk_mode = "urgent"
+            state.warn(f"多学科会诊上调紧急度为 {result.urgency}（最保守优先），已切换急症模式")
+        for concern in result.concerns[:6]:
+            state.warn(f"会诊关切: {concern}")
+        for dissent in result.dissents[:3]:
+            state.warn(f"会诊分歧: {dissent}")
+
+        state.trace(
+            self.name, "panel",
+            output_summary=f"{len(result.opinions)}位会诊者; urgency={result.urgency}; {result.agreement}",
+            evidence_ids=[eid for o in result.opinions for eid in o.evidence_ids],
+        )
+        return state
+
+
+class VisionAgent(BaseAgent):
+    """Reads the images attached to a run. Descriptive, never diagnostic.
+
+    Runs deterministically rather than as a tool loop: there is exactly one call
+    to make per image, so a ReAct loop would add latency and a chance of drift
+    without adding a decision. What the *model* contributes here is the reading
+    itself, inside :mod:`yaobi_harness.vision`.
+    """
+
+    name = "VisionAgent"
+    skill_id = "yaobi.vision_read"
+    output_schema = "ImageFindings"
+    output_key = "image_findings"
+
+    #: Vision may escalate, so a surface finding maps onto a screening signal.
+    URGENT_KEYWORDS = {
+        "cauda_equina": ("鞍区", "会阴", "失禁"),
+        "vascular_dvt_pe": ("发紫", "苍白", "花斑", "肿胀", "张力"),
+        "compartment_syndrome": ("张力", "水疱", "苍白", "肌腹"),
+        "infection_or_tumor": ("红肿", "窦道", "脓", "坏死", "分界"),
+        "fracture": ("畸形", "成角", "短缩", "骨皮质中断"),
+    }
+
+    def run(self, state, tools, broker):
+        images = list(state.images or [])
+        if not images:
+            return state
+
+        reads: list[dict[str, Any]] = []
+        evidence_ids: list[str] = []
+        for image in images[:6]:
+            result = tools.call(
+                broker, "medical_image_read",
+                image=str(image.get("ref") or ""),
+                kind=str(image.get("kind") or "other"),
+                context=(state.complaint or "")[:600],
+                # Attestation travels with the image, so the run records who
+                # asserted de-identification rather than the tool assuming it.
+                deidentified=bool(image.get("deidentified")),
+            )
+            evidence_ids.append(record_tool(state, result))
+            if not result.ok:
+                state.warn(f"图片判读未完成: {result.summary}")
+                continue
+            payload = dict(result.data)
+            reads.append(payload)
+            if payload.get("phi_detected"):
+                state.warn(
+                    "上传图片含可识别身份信息，已拒绝判读并丢弃结果。请遮盖姓名/ID/日期/条码/人脸后重传。"
+                )
+                state.safety_issues.append("影像通道检出未去标识化图片，已拒绝判读")
+                continue
+            for signal in payload.get("urgent_signals", []):
+                state.warn(f"图片可见急症外观信号: {signal}")
+
+        signals = self._signals(reads)
+        if signals:
+            # Vision widens caution only. It can add a signal and switch the run
+            # to urgent mode; it can never clear one the rules already raised.
+            state.risk_mode = "urgent"
+            state.warn("图片外观提示急症风险，已升级为急症模式: " + signal_text(sorted(signals)))
+            screening = state.outputs.setdefault("intake", {}).setdefault("screening", {})
+            screening.setdefault("hits", []).extend(
+                {"signal": s, "term": "image_finding", "source": "vision", "tier": "hard"} for s in sorted(signals)
+            )
+
+        state.outputs[self.output_key] = {
+            "image_kind": reads[0].get("image_kind", "other") if reads else "none",
+            "readable": bool(reads and reads[0].get("readable")),
+            "observations": [o for r in reads for o in r.get("observations", [])][:20],
+            "not_assessable": [n for r in reads for n in r.get("not_assessable", [])][:12],
+            "urgent_signals": [u for r in reads for u in r.get("urgent_signals", [])][:8],
+            "suggest_ask": [s for r in reads for s in r.get("suggest_ask", [])][:8],
+            "suggest_exam": [s for r in reads for s in r.get("suggest_exam", [])][:8],
+            "caveat": "模型视觉判读，证据等级为 model_reasoning，不能替代正式阅片或体格检查",
+            "requires_formal_read": True,
+            "reads": reads,
+            "_evidence_ids": evidence_ids,
+        }
+        state.trace(
+            self.name, "read_images",
+            output_summary=f"{len(reads)}/{len(images)} 张完成判读; 升级信号={sorted(signals) or '无'}",
+            evidence_ids=evidence_ids,
+        )
+        return state
+
+    def _signals(self, reads: list[dict[str, Any]]) -> set[str]:
+        found: set[str] = set()
+        for read in reads:
+            for text in read.get("urgent_signals", []):
+                for signal, keywords in self.URGENT_KEYWORDS.items():
+                    if any(k in str(text) for k in keywords):
+                        found.add(signal)
+        return found
+
+
+class OsteoporosisAgent(BaseAgent):
+    """Fragility-fracture risk, FRAX element capture and drug prerequisites."""
+
+    name = "OsteoporosisAgent"
+    skill_id = "yaobi.osteoporosis_risk"
+    output_schema = "BiomedicalAssessment"
+    output_key = "osteoporosis_risk"
+
+    FALLBACK_DIFFERENTIALS = [
+        "病理性骨折需先排除（转移瘤、多发性骨髓瘤）",
+        "骨软化症",
+        "原发性甲状旁腺功能亢进",
+        "Paget 骨病",
+        "原发性骨质疏松（绝经后/老年性）",
+        "糖皮质激素相关骨质疏松",
+    ]
+    FALLBACK_EXAMS = [
+        "血校正钙、25-OH 维生素 D（启动抗骨吸收治疗前必须）",
+        "肾功能 eGFR（决定双膦酸盐可否使用）",
+        "碱性磷酸酶、血磷（排除骨软化与 Paget 病）",
+        "DXA 腰椎+股骨颈，记录 T 值与测量日期",
+        "胸腰段侧位片或 VFA，查找无症状椎体骨折",
+        "身高测量并与年轻时最高身高比较（下降 >4cm 提示椎体骨折）",
+        "近一年跌倒次数与镇静/抗胆碱类用药审查",
+    ]
+
+    def run(self, state, tools, broker):
+        result = self.autonomous(
+            state, tools, broker,
+            objective="评估本例的骨质疏松与脆性骨折风险，采集 FRAX 要素，给出检查与用药前置条件。",
+            context={
+                "chief_complaint": state.complaint,
+                "known_facts": {k: v for k, v in state.facts.items() if k != "physician_review"},
+                "interview_coverage": (state.outputs.get("interview") or {}).get("coverage", {}),
+                "image_findings": (state.outputs.get("image_findings") or {}).get("observations", []),
+            },
+        )
+        if result is not None:
+            evidence_ids = self.bind_autonomous_output(state, result, "osteoporosis")
+            for item in state.outputs[self.output_key].get("differentials", [])[:8]:
+                state.add_claim("differential", str(item), evidence_ids, confidence=0.5, origin="llm")
+            return state
+
+        guideline = tools.call(broker, "clinical_guideline_search", topic="osteoporosis fracture risk")
+        evidence_id = record_tool(state, guideline)
+        state.outputs[self.output_key] = {
+            "differentials": self.FALLBACK_DIFFERENTIALS,
+            "exam_advice": self.FALLBACK_EXAMS,
+            "evidence_note": (
+                "未获授权指南背书" if guideline.is_stub or not guideline.ok
+                else f"依据 {guideline.summary}"
+            ),
+            "_produced_by": "rule",
+            "_evidence_ids": [evidence_id],
+        }
+        state.trace(self.name, "fallback_assessment", output_summary="规则路径给出骨质疏松风险评估",
+                    evidence_ids=[evidence_id])
         return state
 
 

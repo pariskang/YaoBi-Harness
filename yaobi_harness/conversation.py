@@ -34,9 +34,12 @@ from typing import Any
 
 from .agent.agents import DEFAULT_QUESTIONS, signal_text
 from .graph import YaobiGraphRunner
+from .interview.axes import AXES_BY_ID
+from .interview.loop import InterviewLoop
 from .knowledge.ortho_interactions import KNOWN_CONDITIONS
 from .llm.base import LLMError
 from .render import render
+from .safety import red_flags
 from .state import Budget, ClinicalRunState
 
 #: Facts a chat message is allowed to establish. Anything else is dropped.
@@ -63,6 +66,28 @@ EXTRACTABLE_FACTS: dict[str, type] = {
     "odi": int,
     "location": str,
     "conditions": list,
+    # Facts the history-taking axes close. They are answers to questions the
+    # interview asked, so they belong on the allowlist for the same reason the
+    # originals do — and, like the originals, none of them can grant a capability.
+    "night_pain": str,
+    "limb_vascular": str,
+    "morning_stiffness": str,
+    "walking_tolerance": str,
+    "myelopathy_signs": str,
+    "fragility_risk": str,
+    "surgical_history": str,
+    "cold_heat": str,
+    "sweating": str,
+    "head_body": str,
+    "bowel_urine_pattern": str,
+    "appetite": str,
+    "chest_abdomen": str,
+    "hearing_thirst": str,
+    "past_history": str,
+    "menstruation": str,
+    "sleep": str,
+    "occupation": str,
+    "yellow_flags": str,
 }
 
 #: Keys the dose pipeline reads out of ``facts["special_population"]``.
@@ -100,11 +125,17 @@ age(整数) sex onset pain_location radiation neuro_symptoms bowel_bladder
 fever_trauma_tumor pregnancy(布尔) renal liver medications(数组) allergies(数组)
 medications_confirmed(布尔) allergies_confirmed(布尔) four_diagnoses vas(整数)
 odi(整数) location conditions(数组)
+night_pain limb_vascular morning_stiffness walking_tolerance myelopathy_signs
+fragility_risk surgical_history cold_heat sweating head_body bowel_urine_pattern
+appetite chest_abdomen hearing_thirst past_history menstruation sleep occupation
+yellow_flags
 
 规则：
 - 用户明确列出在用药物，或明确说"没有在吃药"时，medications_confirmed 才为 true。
 - 过敏史同理对应 allergies_confirmed。
 - conditions 只能取自：{conditions}
+- **否定回答也是回答**：用户说"没有大小便问题"要抽成 bowel_bladder="否认"，
+  说"晚上不痛"要抽成 night_pain="否认"。漏掉否定回答会让系统反复追问同一件事。
 - 绝不要输出上面列表以外的键。
 
 只输出 JSON 对象，例如：{{"age": 63, "medications": ["布洛芬"], "medications_confirmed": true}}"""
@@ -152,6 +183,11 @@ class AgentReply:
     still_missing: list[str] = field(default_factory=list)
     delivered: dict[str, Any] = field(default_factory=dict)
     composer: str = "template"
+    #: The interview's own record for this turn: which axes were raised, who
+    #: composed the wording, and how the adequacy judge ruled.
+    interview: dict[str, Any] = field(default_factory=dict)
+    #: Questions with their axis and tier, for a surface that wants to group them.
+    structured_questions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -223,14 +259,175 @@ def _extract_medications(text: str) -> list[str]:
     return drugs
 
 
-def rule_extract(message: str) -> dict[str, Any]:
+#: **Symptom** terms: their un-suppressed presence means the symptom is reported.
+#:
+#: Whether an occurrence is suppressed is decided by the *existing* clause-scoped
+#: logic in :mod:`yaobi_harness.safety.red_flags` — the same code that decides
+#: whether a red flag fires. Re-implementing negation here produced exactly the
+#: failure that module exists to prevent.
+RED_FLAG_SYMPTOMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("bowel_bladder", ("失禁", "尿不出", "解不出", "漏尿", "尿失禁", "大便失禁", "控制不住",
+                       "会阴麻", "会阴发麻", "鞍区麻", "会阴部麻")),
+    ("neuro_symptoms", ("越来越无力", "越来越没力", "抬不起", "走路不稳", "拖步", "麻木加重", "无力加重")),
+    ("fever_trauma_tumor", ("发烧", "发热", "寒战", "盗汗", "体重下降", "消瘦", "肿瘤", "癌",
+                            "摔倒", "跌倒", "车祸", "外伤")),
+    ("night_pain", ("痛醒", "疼醒", "夜间加重", "静息痛")),
+    ("limb_vascular", ("发紫", "花斑", "咳血", "张力性", "明显肿胀")),
+)
+
+#: **Topic** terms: they merely name the axis. "大小便" says nothing on its own —
+#: "大小便正常" is a denial and "大小便失禁" is a report. Treating a topic word as a
+#: symptom is what turned "大小便正常" into a cauda-equina emergency.
+RED_FLAG_TOPICS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("bowel_bladder", ("大小便", "小便", "大便", "排尿", "排便", "会阴", "鞍区")),
+    ("neuro_symptoms", ("无力", "没力", "麻木", "发麻", "腿麻", "脚麻")),
+    ("fever_trauma_tumor", ("发烧", "发热", "体温", "盗汗", "体重", "肿瘤", "外伤")),
+    ("night_pain", ("夜里", "夜间", "晚上", "半夜")),
+    ("limb_vascular", ("肿", "皮温", "胸闷", "气短")),
+)
+
+#: Cues that turn a topic mention into a denial. ``red_flags.NEGATION_CUES``
+#: covers 没有/无/否认; these cover the way patients actually answer "正常"、"没事"。
+NORMALITY_CUES = ("正常", "没事", "挺好", "都好", "还好", "没问题", "无异常", "没异常", "不痛", "没变化")
+
+#: Colloquial denials that ``red_flags.NEGATION_CUES`` deliberately omits.
+#:
+#: That list is tuned for clinical notes, where a nurse writes "无发热" rather than
+#: "不会发烧". Extending the shared list would change red-flag screening for every
+#: run, so the conversational forms are handled here, at the extraction layer only.
+COLLOQUIAL_DENIALS = ("不会", "不太", "没怎么", "从来不", "从没", "不曾", "不咋")
+
+#: Axes where a *historical* mention is a positive answer rather than a suppressed
+#: one. "以前查出过肿瘤" is precisely what this axis asks about, even though the
+#: screening layer correctly declines to treat an old diagnosis as an emergency.
+HISTORY_IS_ANSWER = {"fever_trauma_tumor", "surgical_history", "past_history"}
+
+#: Standalone phrases that answer whatever was just asked, naming no topic at all.
+BARE_DENIALS = ("都正常", "都好", "没事", "一切正常", "没什么", "都没有", "没有这些", "以上都无", "都不是")
+
+#: Literal denials the topic-plus-cue machinery cannot reach, because the negation
+#: is fused into the phrase: "腿不麻" contains neither the topic "腿麻" nor a
+#: recognised cue before it. These are frequent enough in speech that leaving them
+#: out kept re-asking a question the patient had just answered.
+AXIS_DENIAL_PHRASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("neuro_symptoms", ("腿不麻", "脚不麻", "手不麻", "不麻", "没麻", "没无力", "力气正常", "没觉得无力")),
+    ("bowel_bladder", ("能解出来", "尿得出", "解得出", "会阴不麻", "屁股不麻")),
+    ("night_pain", ("晚上不痛", "夜里不痛", "夜间不痛", "睡得着", "不影响睡眠")),
+    ("limb_vascular", ("腿不肿", "没肿", "不肿", "两条腿一样粗")),
+    ("fever_trauma_tumor", ("不发烧", "没发烧", "体温正常", "没受伤", "没摔", "没外伤")),
+)
+
+#: Onset phrasing. Kept broad because it is low-risk: a wrong onset changes
+#: wording, not safety, and having *no* onset blocks a CORE axis indefinitely.
+ONSET_RE = re.compile(r"((?:\d+\s*(?:天|周|个?月|年)|昨天|今天|前天|这两天|最近|突然|逐渐)[^。；;，,]{0,10})")
+PAIN_SITE_RE = re.compile(r"((?:腰|颈|背|肩|膝|髋|踝|肘|腕|足|手|臀|大腿|小腿|脊柱|骶)[^。；;，,]{0,6}(?:痛|疼|酸|麻|不适))")
+RADIATION_RE = re.compile(r"((?:放射|窜|串|传|连)到?[^。；;，,]{0,12}|往[^。；;，,]{0,10}(?:窜|串|放射))")
+
+
+def _colloquially_denied(clause: str, term: str) -> bool:
+    """True when a colloquial denial governs ``term`` within this clause.
+
+    Scoped the same way as :func:`red_flags._is_negated`: the cue must sit before
+    the term and close to it, so "不会痛醒" denies and "不会走路了，晚上痛醒" does not.
+    """
+    index = clause.find(term)
+    if index < 0:
+        return False
+    left = clause[:index]
+    position = max((left.rfind(cue) for cue in COLLOQUIAL_DENIALS if cue in left), default=-1)
+    return position >= 0 and len(left[position:]) <= 8
+
+
+def _extract_red_flag_answers(text: str, asked_axes: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Record explicit answers — positive or negative — to the red-flag axes.
+
+    Classification is delegated to :func:`red_flags.is_current_patient_symptom`,
+    so a denial, a family history and a hypothetical all read the same way here as
+    they do in the screening itself. An affirmation is stored as ``"报告"`` and a
+    denial as ``"否认"``; both close the axis, which is the point — the interview
+    must be able to tell "answered no" from "not asked".
+    """
+    facts: dict[str, Any] = {}
+    clauses = red_flags.split_clauses(text)
+
+    # Reports first: a symptom term that survives clause classification wins over
+    # any denial elsewhere in the message.
+    for key, terms in RED_FLAG_SYMPTOMS:
+        for clause in clauses:
+            hit = next((t for t in terms if t in clause), None)
+            if hit is None:
+                continue
+            if _colloquially_denied(clause, hit):
+                facts.setdefault(key, "否认")
+                continue
+            suppressed, reason = red_flags._classify_clause(clause, hit)
+            if not suppressed:
+                facts[key] = "报告"
+                break
+            if reason.startswith("historical") and key in HISTORY_IS_ANSWER:
+                facts[key] = "既往报告"
+                break
+            if reason == "negated_in_clause":
+                # An explicit denial is an answer. Third-party and hypothetical
+                # mentions are not — "我爸有肿瘤" says nothing about this patient.
+                facts.setdefault(key, "否认")
+
+    # Then denials expressed against the topic rather than the symptom.
+    for key, terms in RED_FLAG_TOPICS:
+        if facts.get(key) == "报告":
+            continue
+        for clause in clauses:
+            hit = next((t for t in terms if t in clause), None)
+            if hit is None:
+                continue
+            if (
+                red_flags._is_negated(clause, hit)
+                or _colloquially_denied(clause, hit)
+                or any(cue in clause for cue in NORMALITY_CUES)
+            ):
+                facts.setdefault(key, "否认")
+                break
+
+    # Fused denials, checked last so an explicit report always wins.
+    for key, phrases in AXIS_DENIAL_PHRASES:
+        if facts.get(key) == "报告":
+            continue
+        if any(phrase in text for phrase in phrases):
+            facts.setdefault(key, "否认")
+
+    if not facts and any(phrase in text for phrase in BARE_DENIALS):
+        # A bare "都正常" answers whatever was just asked, and nothing else.
+        for axis_id in asked_axes:
+            axis = AXES_BY_ID.get(axis_id)
+            if axis is not None and axis.tier == "RED_FLAG":
+                for key in axis.closes:
+                    facts.setdefault(key, "否认")
+    return facts
+
+
+def rule_extract(message: str, asked_axes: tuple[str, ...] = ()) -> dict[str, Any]:
     """Deterministic fallback extractor.
 
-    Deliberately conservative: only patterns that cannot plausibly mean anything
-    else, because a wrong fact is worse than a missing one.
+    Deliberately conservative on anything that feeds a dose decision, and
+    deliberately broader on narrative fields like onset and pain site — getting
+    those wrong changes wording, while never having them stalls the interview.
+
+    ``asked_axes`` is what the previous round asked about, which is what makes a
+    bare "都正常" interpretable.
     """
     facts: dict[str, Any] = {}
     text = message or ""
+    facts.update(_extract_red_flag_answers(text, asked_axes))
+
+    onset = ONSET_RE.search(text)
+    if onset:
+        facts["onset"] = onset.group(1).strip()
+    site = PAIN_SITE_RE.search(text)
+    if site:
+        facts["pain_location"] = site.group(1).strip()
+    radiation = RADIATION_RE.search(text)
+    if radiation:
+        facts["radiation"] = radiation.group(1).strip()
 
     age = re.search(r"(\d{1,3})\s*(?:岁|周岁)", text)
     if age and 0 < int(age.group(1)) < 130:
@@ -262,6 +459,35 @@ def rule_extract(message: str) -> dict[str, Any]:
     tongue = re.search(r"(舌[^。；;，,]{1,24})", text)
     if tongue:
         facts["four_diagnoses"] = tongue.group(1)
+
+    # Specialty axes patients answer in a recognisable form. Without these the
+    # deterministic path cannot close a SPECIALTY axis at all, so a model-less run
+    # re-asks the same three questions until the judge calls it stalled.
+    walking = re.search(r"(?:走|步行)[^。；;，,]{0,4}(\d+)\s*(?:米|m|公里|km|步)", text)
+    if walking:
+        facts["walking_tolerance"] = walking.group(0)
+    elif re.search(r"(?:走|步行)[^。；;，,]{0,6}(?:就得?停|要休息|停下来|走不了)", text):
+        facts["walking_tolerance"] = "行走受限，具体距离未量化"
+
+    stiff = re.search(r"(?:晨僵|早上|晨起)[^。；;，,]{0,8}(?:僵|硬)[^。；;，,]{0,10}", text)
+    if stiff:
+        facts["morning_stiffness"] = stiff.group(0)
+    elif re.search(r"(?:早上|晨起)[^。；;，,]{0,6}(?:不僵|没有?僵)", text):
+        facts["morning_stiffness"] = "否认晨僵"
+
+    odi = re.search(r"(?:ODI|功能障碍指数)\D{0,4}(\d{1,3})", text, re.I)
+    if odi and int(odi.group(1)) <= 100:
+        facts["odi"] = int(odi.group(1))
+    elif re.search(r"(?:穿袜|剪脚趾甲|弯腰洗脸|系鞋带)[^。；;，,]{0,8}(?:困难|费劲|做不了|不方便)", text):
+        facts["odi"] = 40  # a coarse marker of real functional limitation
+
+    job = re.search(r"(?:做|干|从事|职业是)[^。；;，,]{0,10}(?:工作|工人|搬运|司机|教师|护士|程序员|销售|农活|厨师)[^。；;，,]{0,6}", text)
+    if job:
+        facts["occupation"] = job.group(0)
+
+    sleep = re.search(r"(?:睡|入睡|失眠)[^。；;，,]{0,12}", text)
+    if sleep and any(cue in text for cue in ("睡不", "失眠", "睡得", "易醒", "入睡")):
+        facts["sleep"] = sleep.group(0)
     return facts
 
 
@@ -291,8 +517,21 @@ class ConversationSession:
         self.facts: dict[str, Any] = {}
         self.turns: list[Turn] = []
         self.asked: list[str] = []
+        self.images: list[dict[str, Any]] = []
         self.state: ClinicalRunState | None = None
         self.llm = getattr(self.runner, "llm", None)
+        # One interview loop for the whole conversation. This is what makes
+        # "不断追问" converge: round history spans turns, so the judge can see that
+        # two consecutive rounds produced the same gaps and stop asking, rather
+        # than each turn starting over and re-asking forever.
+        self.interview = InterviewLoop(
+            self.llm,
+            skill_spec=getattr(self.runner, "skill_registry", None)
+            and self.runner.skill_registry.specs.get("yaobi.interview"),
+        )
+        interview_agent = getattr(self.runner, "agents", {}).get("InterviewAgent")
+        if interview_agent is not None:
+            interview_agent.loop = self.interview
 
     # ------------------------------------------------------------------ public
     def send(self, message: str) -> AgentReply:
@@ -338,6 +577,10 @@ class ConversationSession:
             "asked": list(self.asked),
             "turns": self.transcript(),
             "state": self.state.to_dict() if self.state else None,
+            "interview": self.interview.summary(self.facts, self.complaint, role=self.role),
+            # Attachments carry a path or data URI; the image bytes themselves are
+            # never written into a transcript.
+            "images": [{"kind": i["kind"], "deidentified": i["deidentified"]} for i in self.images],
         }
 
     @classmethod
@@ -374,9 +617,25 @@ class ConversationSession:
         if population:
             self.facts["special_population"] = population
 
+    def attach_image(self, ref: str, *, kind: str = "other", deidentified: bool = False) -> dict[str, Any]:
+        """Attach an image to the conversation; it is read on the next turn.
+
+        The attestation is stored with the attachment rather than assumed, so the
+        run records who asserted de-identification. Bytes are not copied anywhere:
+        ``ref`` is a path or a ``data:`` URI that the vision tool reads once.
+        """
+        from .vision.client import IMAGE_KINDS
+
+        if kind not in IMAGE_KINDS:
+            raise ValueError(f"未知图片类型 {kind!r}；支持 {list(IMAGE_KINDS)}")
+        entry = {"kind": kind, "ref": ref, "deidentified": bool(deidentified)}
+        self.images.append(entry)
+        return entry
+
     def _run(self) -> ClinicalRunState:
         state = ClinicalRunState(complaint=self.complaint, role=self.role)
         state.facts.update(self.facts)
+        state.images = [dict(i) for i in self.images]
         state.budget = self.budget_factory()
         return self.runner.run(state, allow_prescription=self.allow_prescription)
 
@@ -403,28 +662,60 @@ class ConversationSession:
             except (LLMError, Exception):  # noqa: BLE001 - extraction must never break a turn
                 proposed = None
 
+        asked_axes = tuple(
+            q.get("axis_id", "") for q in (
+                (self.state.outputs.get("interview") or {}).get("questions", []) if self.state else []
+            )
+        )
         accepted, ignored = coerce_facts(proposed)
-        if not accepted:
-            accepted, _ = coerce_facts(rule_extract(text))
+        # Merge rather than replace: the model is better at narrative fields, the
+        # rules are better at explicit denials, and losing a denial is what makes
+        # the interview re-ask a question the patient already answered.
+        rules, _ = coerce_facts(rule_extract(text, asked_axes))
+        for key, value in rules.items():
+            accepted.setdefault(key, value)
         return accepted, sorted(set(ignored))
 
-    def _next_questions(self, limit: int = 3) -> list[str]:
-        """Ask about the gaps that actually block progress, without repeating."""
+    def _next_questions(self, limit: int = 3) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """The interview's questions for this turn, plus its own record.
+
+        The questions come from :class:`~yaobi_harness.interview.loop.InterviewLoop`,
+        which ran as a graph node during ``_run``. Reading its output rather than
+        re-deriving questions here is what keeps a single source of enquiry: what
+        the audit trail records is exactly what the patient was asked.
+        """
         state = self.state
-        missing = list(state.missing_information) if state else []
-        questions = [GAP_QUESTIONS[gap] for gap in missing if gap in GAP_QUESTIONS]
-        questions += [q for q in (state.open_questions if state else []) if q not in questions]
-        questions += [q for q in DEFAULT_QUESTIONS if q not in questions]
-        fresh = [q for q in questions if q not in self.asked]
-        return (fresh or questions)[:limit]
+        record = dict((state.outputs.get("interview") or {})) if state else {}
+        questions = [dict(q) for q in record.get("questions", [])][:limit]
+        if questions:
+            return questions, record
+
+        # An interview that ran and was satisfied has nothing to ask. Only fall
+        # back when no interview produced a decision at all — an LLM plan that
+        # omitted the node, or a run that failed closed before reaching it.
+        if (record.get("verdict") or {}).get("verdict") in ("achieved", "stalled", "cap_reached"):
+            return [], record
+
+        fallback = [q for q in (state.open_questions if state else []) if q not in self.asked]
+        fallback = fallback or [q for q in DEFAULT_QUESTIONS if q not in self.asked]
+        return [
+            {"axis_id": "", "label": "补充信息", "tier": "CORE", "question": q,
+             "why": "", "options": [], "origin": "fallback"}
+            for q in fallback[:limit]
+        ], record
 
     def _compose(self, *, escalated: bool, extracted: dict[str, Any], ignored: list[str]) -> AgentReply:
         state = self.state
         delivered = render(state, self.role)
         awaiting = state.release_status not in TERMINAL_STATUSES
-        questions = self._next_questions() if awaiting else []
+        # The interview record is read on every turn, including terminal ones: the
+        # interview node still ran, and its coverage and verdict belong in the
+        # audit trail even when there is nothing further to ask.
+        record = dict(state.outputs.get("interview") or {})
+        structured = self._next_questions()[0] if awaiting else []
+        questions = [q["question"] for q in structured]
 
-        body = self._template_reply(delivered, questions, escalated)
+        body = self._template_reply(delivered, structured, escalated)
         composer = "template"
         rephrased = self._rephrase(body, delivered, questions)
         if rephrased:
@@ -443,9 +734,34 @@ class ConversationSession:
             still_missing=list(state.missing_information),
             delivered=delivered,
             composer=composer,
+            interview=self._interview_meta(record),
+            structured_questions=structured,
         )
 
-    def _template_reply(self, delivered: dict[str, Any], questions: list[str], escalated: bool) -> str:
+    def _interview_meta(self, record: dict[str, Any]) -> dict[str, Any]:
+        """The interview summary a surface can show without reading the audit."""
+        verdict = dict(record.get("verdict") or {})
+        coverage = dict(record.get("coverage") or {})
+        return {
+            "rounds_used": record.get("rounds_used", self.interview.rounds_used),
+            "composer": record.get("composer", "not_run"),
+            "verdict": verdict.get("verdict", ""),
+            "verdict_reason": verdict.get("reason", ""),
+            "judged_by": verdict.get("judged_by", ""),
+            "blocking": verdict.get("blocking_labels", []),
+            # Ids as well as labels: the console marks a required-but-open axis
+            # differently from a merely open one, and it keys off the id.
+            "blocking_axis_ids": verdict.get("blocking_axes", []),
+            "still_missing_axes": verdict.get("missing_labels", []),
+            "contradictions": verdict.get("contradictions", []),
+            "coverage_ratio": coverage.get("ratio", 0.0),
+            "answered_axes": [AXES_BY_ID[a].label for a in coverage.get("answered", []) if a in AXES_BY_ID],
+            "open_axes": [AXES_BY_ID[a].label for a in coverage.get("open", []) if a in AXES_BY_ID],
+            "model_claimed_complete": bool(record.get("model_claimed_complete")),
+            "rejected": record.get("rejected", []),
+        }
+
+    def _template_reply(self, delivered: dict[str, Any], questions: list[dict[str, Any]], escalated: bool) -> str:
         """Deterministic prose built only from what the run already released."""
         lines: list[str] = []
 
@@ -480,7 +796,11 @@ class ConversationSession:
 
         if questions:
             lines.append("为了更准确，还想请你回答：")
-            lines += [f"· {q}" for q in questions]
+            for question in questions:
+                line = f"· {question['question']}"
+                if question.get("options"):
+                    line += "（" + " / ".join(question["options"][:4]) + "）"
+                lines.append(line)
 
         if delivered.get("disclaimer"):
             lines.append(delivered["disclaimer"])

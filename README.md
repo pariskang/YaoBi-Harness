@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-229%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-379%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -11,32 +11,68 @@
 Yaobi-Harness 是一个 **证据受控的骨科/腰痹多智能体临床决策支持骨架**。V0.1 在 V0.0 安全骨架的基础上补齐了
 自主规划层和 LLM 接入，同时保持"认知层可换、控制层不可绕过"的分层：
 
-* **认知层**：LLM 驱动的**规划**与**执行**——鉴别诊断、辨证、专家经验综合、方剂组成均由模型
-  自主选择工具、自主决定参数、自我纠错并绑定证据（ReAct 工具调用循环）。
+* **认知层**：LLM 驱动的**规划**、**执行**与**追问**——鉴别诊断、辨证、专家经验综合、方剂组成均由模型
+  自主选择工具、自主决定参数、自我纠错并绑定证据（ReAct 工具调用循环）；问诊由模型通过
+  `ask_patient` 工具自主组织，多学科会诊由若干独立子体各自运行；临床图片由多模态模型判读。
 * **控制层**：能力经纪（角色/风险/技能/熔断/预算）、证据台账与等级、逐断言引用校验、放行状态机、医师审核闭环。
 
 LLM 在本系统中是**只能加安全、不能减安全**的执行者：它可以规划、选工具、下结论，但看不到技能未授权的工具、
 不能发明 Agent、不能清除规则层命中的风险信号、**永远不能生成剂量**。任何一步越界（越权/输出不合 schema/
 出现克数/预算或步数耗尽）都会**整体回退**到确定性逻辑，而不是带病放行。未配置模型时，全流程确定性运行。
 
-自主性的确切边界见 [docs/AUTONOMY.md](docs/AUTONOMY.md)。
+自主性的确切边界见 [docs/AUTONOMY.md](docs/AUTONOMY.md)；
+问诊追问见 [docs/INTERVIEW.md](docs/INTERVIEW.md)，
+会诊子体与技能库见 [docs/PANEL.md](docs/PANEL.md)，
+视觉判读见 [docs/VISION.md](docs/VISION.md)。
 
 > 严禁把原始 Excel 身份数据提交、打包或直接返回给模型。病例检索只能使用脱敏 ETL 后的结构化字段；含剂量方剂只能以
 > `draft_for_physician` 作为医师草案，未逐味审核签名不得发布为最终处方。
 
-## 多轮对话问诊
+## 自主追问：十问歌 × 骨科专科问诊
 
 ```bash
 python -m yaobi_harness chat --role patient
 # 或脚本化：
 python -m yaobi_harness chat --role patient \
   --message "腰痛3个月，久坐加重" \
-  --message "63岁，没怀孕，在吃布洛芬和华法林" \
+  --message "大小便正常，没有发烧，腿不麻，晚上不痛" \
+  --message "63岁，没怀孕，肝肾功能正常，在吃布洛芬和华法林" \
   --message "这两天突然尿不出来，会阴发麻"
 ```
 
-系统会按**真正缺失的信息**追问，把回答抽取成结构化事实，并在**每一轮**重新做红旗筛查——
-上例第三轮会立即升级为急症、停止追问、直接给出行动计划。
+追问不是念问卷。**模型决定问什么、怎么问、往哪个方向追下去**——它通过 `ask_patient`
+工具提问，每个问题必须声明它要闭合哪条**问诊轴**。28 条轴覆盖十问歌全十条与骨科专科的
+六条鉴别轴（炎症性/机械性、节段定位、间歇性跛行、髓性症状、FRAX 骨脆性、外伤植入物），
+分五个层级：
+
+| 层级 | 未闭合的后果 |
+| --- | --- |
+| 红旗（5 条） | **阻断任何含剂量放行**，永不可豁免 |
+| 核心（4 条） | 阻断含剂量放行 |
+| 专科（6 条） | 不阻断，但缺了就分不开病因 |
+| 中医四诊（10 条） | **开方前必答** |
+| 背景（3 条） | 影响方案，不阻断 |
+
+三者分开是这一层唯一重要的设计：**模型决定措辞与深度，规则决定必答范围，
+一个独立审核者决定什么时候可以停。** 模型说"问够了"只是提案——审核者会按苛刻的骨科主任标准
+复核，必答轴未闭合时判 `blocked`（不得进入含剂量环节）；连续三轮问不出新信息判 `stalled`
+（带缺口继续并记录在案，不把病人困在无尽问卷里）。
+
+**否定回答也是回答**：说"大小便正常、没有发烧"会闭合对应的红旗轴，
+否则系统会反复追问同一件事，最后把一个完全配合的病人判成"病史不足"。
+分类复用 `safety/red_flags.py` 既有的从句级否定逻辑——顺带修掉了筛查层的两个真实缺陷
+（口语否定"不会痛醒"被读成阳性；被否认的佐证仍在把软信号促成硬信号）。
+
+```bash
+python -m yaobi_harness interview --tier RED_FLAG      # 看全部红旗轴
+python -m yaobi_harness interview --complaint "68岁女性腰痛3月，走远了要停"
+```
+
+完整说明见 [docs/INTERVIEW.md](docs/INTERVIEW.md)。
+
+## 多轮对话
+
+每一轮都会重新做红旗筛查——上例最后一轮会立即升级为急症、停止追问、直接给出行动计划。
 
 核心设计约束：**聊天不是新的生成通道。** 每一轮都是一次完整审计运行（同一个图、同一个能力经纪、
 同一份证据台账），模型只被允许改写已产出的结论。三条硬边界：
@@ -47,6 +83,30 @@ python -m yaobi_harness chat --role patient \
 * **回复出库前扫描剂量**——确定性链路没产出的克数不可能出现在自然语言里。
 
 完整说明见 [docs/CONVERSATION.md](docs/CONVERSATION.md)。
+
+## 会诊子体与视觉判读
+
+```bash
+# 多学科会诊：骨科主任 / 疼痛科 / 康复科 / 中医骨伤 / 临床药师，各自独立运行
+python -m yaobi_harness run --complaint "腰痛3月，右下肢麻木" --role physician --panel
+
+# 临床图片判读（X线翻拍 / MRI-CT / 舌象 / 体态 / 患肢 / 报告单）
+export YAOBI_VISION_PROVIDER=poe POE_API_KEY=... YAOBI_VISION_MODEL=Gemini-3.1-Pro
+python -m yaobi_harness vision ./xray.jpg --kind radiograph --deidentified
+python -m yaobi_harness run --complaint "左小腿肿胀2天" --image limb_surface:./leg.jpg
+```
+
+会诊的价值在**分歧**，所以合议采取**最保守优先而非多数票**：紧急度取所有成员中的最高值，
+关切取并集，一致程度只作为信息呈现。一位会诊者看到急症，其分量压过四位没看到的——
+两个方向的代价不对称。任何子体都拿不到方剂、剂量、签名三类工具（`consult_mode` 只能收窄授权，
+用交集而非并集实现），深度上限 1，每位成员用切分预算并回记到父预算。
+
+视觉判读**永远不是影像报告**：证据等级为 `model_reasoning`（不可放行），
+`requires_formal_read` 是必填且影像类不允许写 false，图片不落盘（只留 sha256），
+调用前必须声明已去标识化，且系统会先做一次身份信息预检——**检出即丢弃全部判读结果**。
+它只能**升级**风险（患肢发紫/张力高 → 血管或骨筋膜室信号），不能撤销规则已判定的红旗。
+
+详见 [docs/PANEL.md](docs/PANEL.md) 与 [docs/VISION.md](docs/VISION.md)。
 
 ## 可视化控制台
 
@@ -127,10 +187,32 @@ python -m yaobi_harness run --llm-provider poe --llm-model Claude-Sonnet-4.5 --c
 未设置 `YAOBI_LLM_PROVIDER` 时使用 `NullLLMClient`，全流程确定性运行；显式指定了 provider 但凭据不全会**直接报错**，
 避免配置错误伪装成"正常的规则输出"。
 
-## 把专家 xlsx 变成技能
+## 技能：既是授权，也是规程
 
-专家病例不该只用于"检索相似病例"。`skill build-expert` 把语料挖掘成**技能**——在本系统里技能同时是
-能力经纪强制执行的**权限授权**，和模型执行时读取的**规程说明**：
+技能在本系统里同时是两样东西：能力经纪强制执行的**权限授权**，和模型执行时读取的**规程说明**。
+这两样东西的载体需求正好相反，所以有两种写法：
+
+* **`manifest.yaml`** —— 工具授权、输出契约、角色限制集中在一份文件里，合规审查者一眼看完。
+* **`SKILL.md`** —— 一个目录加一份 markdown：frontmatter 放策略，正文放流程。
+  一份完整的骨科问诊协议有几百行，塞进 YAML 标量就不可读，而这恰恰最需要临床评审。
+  布局与 Grok Build、Claude Code 相同，同一份文件可在几个 harness 之间移植。
+
+随包发布四份专业技能：`yaobi.interview`（十问歌 + 骨科专科全流程）、
+`yaobi.vision_read`（七类图片各自的判读边界）、`yaobi.consult_panel`（五个专科视角 + 14 组用药风险核对表）、
+`yaobi.osteoporosis_risk`（FRAX 要素、椎体骨折线索、治疗顺序硬约束、跌倒风险）。
+
+优先级从高到低：`$YAOBI_SKILL_PATH` / `--skill-dir` → `./.yaobi/skills/` → 随包库 → `manifest.yaml`。
+同 `skill_id` 高优先级**替换**低优先级，所以医院能钉住自己的问诊协议而不用改包。
+
+```bash
+python -m yaobi_harness skill list                    # 全部技能与来源（manifest / SKILL.md）
+python -m yaobi_harness skill show yaobi.interview    # 完整流程文本
+python -m yaobi_harness run --skill-dir ./my-skills --complaint "..."
+```
+
+### 把专家 xlsx 变成技能
+
+`skill build-expert` 把语料挖掘成技能：
 
 ```bash
 python -m yaobi_harness skill build-expert --xlsx ./authorized.xlsx --merge
@@ -184,15 +266,23 @@ python -m yaobi_harness run --role physician --knowledge-store ./knowledge.db --
 * **医师审核闭环**：`draft_for_physician` → 逐味审批 + 签名 → `approved_by_physician`。
 * **角色化输出**：患者视图不返回他人病例与证据台账；研究者视图只返回聚合统计；`--debug-state` 才输出完整内部状态。
 * **检查点与续跑**：每个节点落盘，`resume` 子命令可从检查点继续。
+* **问诊必答范围由规则决定**：模型可以改措辞、加轴、提议结束，但跳过的必答轴会被从题库补回；
+  `blocked` 裁决（红旗轴未获答复）不可被模型、轮次上限或审核者故障豁免。
+* **子体永不出处方**：`consult_mode` 用交集收窄授权，方剂/剂量/签名三类工具对任何会诊子体不可达；
+  深度上限 1；预算切分并回记父预算；合议取最高紧急度而非多数票。
+* **视觉不做诊断**：判读等级 `model_reasoning`（不可放行），影像类不允许声明
+  `requires_formal_read=false`，图片不落盘，PHI 预检命中即丢弃全部结果。
 
 ## 仍未完成
 
 LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化推荐抽取、
-大规模对抗性安全评测与红旗召回率基线仍未实现。内置骨科规则包不能替代完整的相互作用数据库，
+大规模对抗性安全评测与红旗召回率基线仍未实现。模型**不能主动发起对话轮次**（它会答会问，
+但不会自己开口）；会诊成员串行执行而非并发；persona 的 I/O 契约是声明性的、未被强制校验；
+内容寻址的重放日志（能证明续跑发出了同样的调用）尚未实现。内置骨科规则包不能替代完整的相互作用数据库，
 且须经本机构药师/医师复核后启用。**本项目不能对外宣称为临床可用系统。**
 
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 229 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 379 个用例，无需 pytest 与网络
 ```

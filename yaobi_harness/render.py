@@ -211,6 +211,13 @@ def console_payload(state: ClinicalRunState, role: str | None = None) -> dict[st
             # Per-agent record of the model-driven tool loop: which tools it
             # chose, with what arguments, and whether it fell back.
             "autonomy": state.outputs.get("autonomy", {}),
+            # History taking: axis coverage, the questions actually asked, and the
+            # adequacy verdict. Operator-only — the patient sees the questions, not
+            # the judge's reasoning about whether they were enough.
+            "interview": state.outputs.get("interview", {}),
+            "consult_panel": state.outputs.get("consult_panel", {}),
+            "image_findings": state.outputs.get("image_findings", {}),
+            "osteoporosis_risk": state.outputs.get("osteoporosis_risk", {}),
             "safety_audit": state.outputs.get("safety_audit", {}),
             "safety_issues": state.safety_issues,
             "warnings": state.warnings,

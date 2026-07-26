@@ -375,6 +375,38 @@ class ConsoleService:
             "turn_count": len(session.turns),
         }
 
+    def open_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Start a conversation with the agent speaking first.
+
+        The page calls this before the patient has typed anything. A blank box and
+        a blinking cursor is the worst possible history-taking prompt: it gets
+        「腰」 where an opening question gets 「腰痛一个月，还乏力」.
+        """
+        from ..conversation import ConversationSession
+
+        role = self._role_of(payload, default="patient")
+        with self._sessions_lock:
+            session = ConversationSession(
+                role=role,
+                runner=self._runner(
+                    bool(payload.get("use_llm", True)),
+                    panel_concurrency=_coerce_concurrency(payload.get("panel_concurrency")),
+                ),
+                allow_prescription=bool(payload.get("allow_prescription")),
+            )
+            self.sessions[session.session_id] = session
+            while len(self.sessions) > MAX_SESSIONS:
+                self.sessions.pop(next(iter(self.sessions)))
+        reply = session.open()
+        return {
+            "session_id": session.session_id,
+            "reply": reply.to_dict(),
+            "interview": session.interview.summary({}, "", role=session.role),
+            "audit": {},
+            "meta": {},
+            "turn_count": len(session.turns),
+        }
+
     def reset_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._sessions_lock:
             self.sessions.pop(str(payload.get("session_id") or ""), None)
@@ -640,6 +672,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return self._safely(lambda: self.service.check_interactions(payload))
         if path == "/api/chat":
             return self._safely(lambda: self.service.chat(payload))
+        if path == "/api/chat/open":
+            return self._safely(lambda: self.service.open_chat(payload))
         if path == "/api/chat/reset":
             return self._safely(lambda: self.service.reset_chat(payload))
         return self._error(404, f"未知路径 {path}")

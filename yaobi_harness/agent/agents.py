@@ -227,24 +227,46 @@ class IntakeAgent(BaseAgent):
 
         screening = dict(result.data)
         rule_hits = list(screening.get("hits", []))
+        soft_hits = list(screening.get("soft_hits", []))
 
-        # The model may only *add* signals; it can never clear a rule-based hit.
-        llm_signals = cognition.semantic_red_flag_signals(state, self.llm, rule_hits)
-        if llm_signals:
-            merged = red_flags.merge_llm_hits(
-                red_flags.ScreenResult(
-                    hits=[red_flags.RedFlagHit(**{**h, "source": h.get("source", "rule")}) for h in rule_hits],
-                    soft_hits=[],
-                ),
-                llm_signals,
+        # Triage is a clinical judgement, so the model makes it and the keyword
+        # screen supplies material. Treating a screen hit as the decision is what
+        # sent "腰痛1个月，乏力" to the emergency script: "乏力" matched a
+        # constitutional-symptom pattern for infection/tumour, and one month of
+        # back pain with fatigue is a clinic visit, not an ambulance.
+        decision = cognition.triage(state, self.llm, rule_hits, soft_hits)
+        rule_mode = "urgent" if rule_hits else "routine"
+
+        if decision and decision["triage"]:
+            state.risk_mode = "urgent" if decision["triage"] in ("urgent", "emergency") else "routine"
+            screening["triage_by"] = "llm"
+            screening["triage_level"] = decision["triage"]
+            screening["triage_reason"] = decision["reason"]
+            # Every disagreement in both directions is recorded. An auditor needs
+            # "the screen said infection, the model said no, here is why" far more
+            # than a tidy single verdict.
+            screening["disputed_rule_hits"] = decision["disputed"]
+            if state.risk_mode != rule_mode:
+                state.note(
+                    f"分诊由模型判定为 {decision['triage']}（规则关键词筛查倾向 {rule_mode}）："
+                    f"{decision['reason'] or '模型未给出理由'}"
+                )
+            # The model's own findings are its findings, kept apart from the
+            # screen's so the ledger never blurs a keyword match with a clinical
+            # inference.
+            screening["model_signals"] = decision["signals"]
+        else:
+            state.risk_mode = rule_mode
+            screening["triage_by"] = "rule"
+            screening["triage_level"] = "urgent" if rule_hits else "routine"
+            screening["triage_reason"] = (
+                "未配置模型或模型未作答，按规则关键词筛查结论处置" if rule_hits or soft_hits else ""
             )
-            screening["hits"] = [h.to_dict() for h in merged.hits]
-            screening["llm_added"] = len(merged.hits) - len(rule_hits)
+            screening["model_signals"] = []
+            screening["disputed_rule_hits"] = []
 
-        if screening.get("hits"):
-            state.risk_mode = "urgent"
-        elif screening.get("soft_hits"):
-            state.warn("存在待证实的弱风险信号，建议线下评估以排除结构性病因")
+        if state.risk_mode == "routine" and (soft_hits or screening["model_signals"]):
+            state.note("存在待证实的风险线索，已作为线索记录；如症状变化请线下评估")
 
         state.missing_information = missing_information(state.facts)
         # Questioning belongs to InterviewAgent, which composes it from the axis
@@ -319,7 +341,7 @@ class InterviewAgent(BaseAgent):
             "verdict": verdict.to_dict() if verdict else {},
             "rounds_used": loop.rounds_used,
             "composer": round_result.composer,
-            "rejected": round_result.rejected,
+            "notes": round_result.notes,
             "model_claimed_complete": round_result.model_claimed_complete,
             "_produced_by": "llm_interview_loop" if round_result.composer == "llm" else "probe_bank",
         }
@@ -583,10 +605,44 @@ class UrgentPlannerAgent(BaseAgent):
 
 
 class UrgentCareAgent(BaseAgent):
+    """The emergency action plan. Written by the model when one is available.
+
+    It used to be a fixed template, and the template was the complaint: a patient
+    with one month of back pain and fatigue was told to call an ambulance in
+    wording that could not adapt, because the wording was not produced by anything
+    that had looked at the case. An emergency instruction that fires on routine
+    presentations trains people to ignore it, which is the opposite of safe.
+    """
+
     name = "UrgentCareAgent"
     skill_id = "yaobi.urgent_triage"
+    output_schema = "UrgentCarePlan"
+    output_key = "urgent_action_plan"
 
     def run(self, state, tools, broker):
+        screening = state.outputs.get("intake", {}).get("screening", {})
+        result = self.autonomous(
+            state, tools, broker,
+            objective="为本例撰写急症行动计划。紧急程度要与本例相称，写法见技能说明。",
+            context={
+                "chief_complaint": state.complaint,
+                "triage_level": screening.get("triage_level", state.risk_mode),
+                "triage_reason": screening.get("triage_reason", ""),
+                "triage_decided_by": screening.get("triage_by", "rule"),
+                "rule_keyword_hits": screening.get("hits", []),
+                "model_signals": screening.get("model_signals", []),
+                "disputed_rule_hits": screening.get("disputed_rule_hits", []),
+                "known_facts": {k: v for k, v in state.facts.items() if k != "physician_review"},
+                "location": state.facts.get("location", "中国大陆"),
+            },
+        )
+        if result is not None:
+            self.bind_autonomous_output(state, result, "urgent_action")
+            state.add_claim("urgent_action", "存在红旗信号，需线下急诊评估",
+                            result.citations or result.evidence_ids, confidence=0.85, origin="llm")
+            state.release_status = "urgent_action_plan"
+            return state
+
         guideline = tools.call(broker, "clinical_guideline_search", topic="acute low back pain and non-spine emergency red flags")
         guideline_id = record_tool(state, guideline)
         resource = tools.call(broker, "emergency_resource_lookup", location=state.facts.get("location", "中国大陆"))

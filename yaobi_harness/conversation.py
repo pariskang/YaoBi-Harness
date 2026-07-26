@@ -140,16 +140,56 @@ yellow_flags
 
 只输出 JSON 对象，例如：{{"age": 63, "medications": ["布洛芬"], "medications_confirmed": true}}"""
 
-REPLY_SYSTEM_PROMPT = """你是骨科智能体的对话表达层。把系统**已经产出**的结论改写成自然、得体的中文，面向{role}。
+REPLY_SYSTEM_PROMPT = """你是骨科智能体，正在直接和{role}对话。**这段回复由你写**，不是让你润色模板。
 
-绝对约束：
-1. 只能复述给定材料里的内容。**不得新增任何诊断、治疗建议或药物。**
-2. **不得出现任何剂量数值**（克/g/mg）。
-3. 不得弱化或省略安全提示与免责声明。
-4. 材料里有待追问的问题时，自然地引出，不要生硬罗列编号。
-5. 简洁：正文控制在 6 句以内。
+材料里给了你这一轮运行的结果：分诊判断、鉴别方向、用药筛查、待追问的问题、安全提示。
+这些是**你的工作产物和参考资料**，你按临床判断决定说什么、按什么顺序说、哪些值得强调、
+哪些这一轮不必提。你可以补充材料里没有但你认为该说的临床解释、鉴别思路、自我照护要点。
 
-只输出改写后的正文纯文本，不要 JSON，不要 markdown 标题。"""
+写法：
+
+1. **像医生说话。** 先回应对方最关心的事，再讲你的判断和理由。不要罗列编号清单。
+2. **说清不确定性。** 线上不能确诊，该说的就说；但不要每句都加免责套话。
+3. **该紧急就紧急。** 如果分诊是急症，第一句就要让对方知道要立刻做什么；
+   如果不是急症，不要用急症口吻——对慢性腰痛说"立即拨打120"会让人不再相信你。
+4. **把要问的问题自然带进去。** 材料里的 `questions` 是你上一步自己拟的，
+   照你的原话问，不要改写成别的问题。
+5. **不写具体药名剂量。** 处方必须走医师逐味审核签名的流程，这是法定环节，
+   不是表达偏好。其余内容你怎么写都可以。
+6. 长度自便，通常 4–8 句最合适。
+
+只输出正文纯文本，不要 JSON，不要 markdown 标题。"""
+
+OPENING_SYSTEM_PROMPT = """你是骨科门诊的问诊智能体，现在是**你先开口**——对方还没有说任何话。
+
+写一段简短的开场：说明你是谁、能帮什么、然后问出第一个问题。第一个问题应当是开放的
+（"你哪里不舒服？是什么时候开始的？"这一类），让对方能自己讲，而不是让他做选择题。
+
+要求：不超过 3 句；不要罗列免责条款；不要在还不知道任何情况时就提任何诊断或药物。
+只输出正文纯文本。"""
+
+#: Used when there is no model to write the opening. Deliberately the same shape
+#: as what the model is asked for: a greeting and one open question.
+DEFAULT_OPENING = (
+    "你好，我是骨科问诊助手，先了解一下你的情况，再帮你判断需不需要线下检查。\n"
+    "你哪里不舒服？是什么时候开始的？"
+)
+
+
+#: Sentence boundaries that end a Chinese or English sentence. Used to pull the
+#: questions out of an opening the model wrote as flowing prose — splitting on
+#: lines would fuse "你好，我是骨科助手。你哪里不舒服？" into a single "question".
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?\n])")
+
+
+def questions_in(text: str) -> list[str]:
+    """The interrogative sentences in a block of prose, in order."""
+    found = []
+    for part in _SENTENCE_SPLIT_RE.split(text or ""):
+        sentence = part.strip()
+        if sentence.endswith(("？", "?")) and sentence not in found:
+            found.append(sentence)
+    return found
 
 
 def now() -> str:
@@ -534,6 +574,65 @@ class ConversationSession:
             interview_agent.loop = self.interview
 
     # ------------------------------------------------------------------ public
+    def open(self) -> AgentReply:
+        """Speak first. The agent opens the consultation; nobody has said anything yet.
+
+        A clinician does not sit in silence waiting for the patient to start
+        reciting symptoms — they ask. Making the patient produce the first
+        complaint unprompted is not just cold, it produces worse histories: an
+        opening question gets "腰痛一个月，还乏力" where an empty box gets "腰".
+
+        No graph run happens here. There is nothing to screen yet, so screening
+        would be theatre, and a run over an empty narrative would emit a risk
+        judgement about no information at all.
+        """
+        if self.turns:
+            raise ValueError("对话已经开始，开场只能在第一轮之前调用")
+        text = self._authored_opening() or DEFAULT_OPENING
+        composer = "llm" if text != DEFAULT_OPENING else "template"
+        questions = questions_in(text)
+        self.asked += [q for q in questions if q not in self.asked]
+        self.turns.append(Turn("agent", text))
+        return AgentReply(
+            message=text,
+            questions=questions,
+            release_status="needs_more_information",
+            risk_mode="routine",
+            awaiting_answer=True,
+            composer=composer,
+            structured_questions=[
+                {"axis_id": "", "label": "开场", "tier": "CORE", "question": q,
+                 "why": "开放式开场，让对方自己讲", "options": [], "origin": composer}
+                for q in questions
+            ],
+        )
+
+    def _authored_opening(self) -> str | None:
+        """Ask the model for the opening. Budget and failures fall back silently."""
+        if self.llm is None or not getattr(self.llm, "available", False):
+            return None
+        # No run has happened yet, so there is no run state to charge. A scratch
+        # budget keeps the opening from being free — a session that opens itself a
+        # thousand times should still hit a wall.
+        budget = self.state.budget if self.state else self.budget_factory()
+        if budget is not None and not budget.reserve_llm():
+            return None
+        try:
+            response = self.llm.chat(
+                [
+                    {"role": "system", "content": OPENING_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(
+                        {"role": self.role, "specialty": "骨科 / 腰痹"}, ensure_ascii=False)},
+                ],
+                temperature=0.5, max_tokens=300,
+            )
+            if budget is not None:
+                budget.charge_llm_tokens(response.total_tokens)
+        except (LLMError, Exception):  # noqa: BLE001 - an opening must never fail a session
+            return None
+        text = (response.text or "").strip()
+        return text or None
+
     def send(self, message: str) -> AgentReply:
         """Take one user message, run the graph, and return the agent's reply."""
         text = (message or "").strip()
@@ -715,11 +814,15 @@ class ConversationSession:
         structured = self._next_questions()[0] if awaiting else []
         questions = [q["question"] for q in structured]
 
-        body = self._template_reply(delivered, structured, escalated)
-        composer = "template"
-        rephrased = self._rephrase(body, delivered, questions)
-        if rephrased:
-            body, composer = rephrased, "llm_rephrase"
+        # The model writes the reply; the template is what happens when there is
+        # no model. The old order — template first, model allowed only to polish —
+        # is why an emergency read like a leaflet and a routine case read like an
+        # emergency: the words were never the model's.
+        template = self._template_reply(delivered, structured, escalated)
+        body, composer = template, "template"
+        authored = self._author(delivered, structured, escalated)
+        if authored:
+            body, composer = authored, "llm"
 
         return AgentReply(
             message=body,
@@ -758,7 +861,7 @@ class ConversationSession:
             "answered_axes": [AXES_BY_ID[a].label for a in coverage.get("answered", []) if a in AXES_BY_ID],
             "open_axes": [AXES_BY_ID[a].label for a in coverage.get("open", []) if a in AXES_BY_ID],
             "model_claimed_complete": bool(record.get("model_claimed_complete")),
-            "rejected": record.get("rejected", []),
+            "notes": record.get("notes", []),
         }
 
     def _template_reply(self, delivered: dict[str, Any], questions: list[dict[str, Any]], escalated: bool) -> str:
@@ -806,47 +909,85 @@ class ConversationSession:
             lines.append(delivered["disclaimer"])
         return "\n".join(line for line in lines if line)
 
-    def _rephrase(self, body: str, delivered: dict[str, Any], questions: list[str]) -> str | None:
-        """Let the model polish wording — never add content.
+    def _author(
+        self, delivered: dict[str, Any], structured: list[dict[str, Any]], escalated: bool
+    ) -> str | None:
+        """Let the model write this turn's reply. ``None`` means it did not run.
 
-        Rejected outright if it contains a dose or comes back empty; rejection
-        simply keeps the template text, so the conversation never depends on the
-        model behaving. The urgent script is never sent here at all: its wording
-        is safety-critical and must not drift.
+        The whole run is handed over as material — triage, differentials,
+        medication findings, the questions the model itself composed a step
+        earlier, the safety notices. What comes back is used as written, with two
+        additions and no substitutions: a dose is redacted in place (the
+        prescription signature flow is a legal gate, not a wording preference),
+        and the emergency instruction is appended if the model wrote an urgent
+        reply without one.
         """
         if self.llm is None or not getattr(self.llm, "available", False):
             return None
-        if self.state.risk_mode == "urgent":
-            return None
         if not self.state.budget.reserve_llm():
             return None
+
+        intake = dict(self.state.outputs.get("intake") or {})
+        screening = dict(intake.get("screening") or {})
+        material = {
+            "role": self.role,
+            "narrative_so_far": self.narrative[-6:],
+            "known_facts": {k: v for k, v in self.facts.items() if k != "physician_review"},
+            "triage": {
+                "level": screening.get("triage_level", self.state.risk_mode),
+                "decided_by": screening.get("triage_by", "rule"),
+                "reason": screening.get("triage_reason", ""),
+                "rule_keyword_hits": [h.get("signal") for h in screening.get("hits") or []],
+                "your_own_signals": screening.get("model_signals") or [],
+                "escalated_this_turn": escalated,
+            },
+            "release_status": self.state.release_status,
+            "differentials": (delivered.get("what_this_might_be")
+                              or (delivered.get("biomedical") or {}).get("differentials") or []),
+            "next_steps": delivered.get("what_to_do_next") or [],
+            "medication_findings": delivered.get("medication_warnings") or [],
+            "urgent_plan": delivered.get("urgent") or {},
+            "questions": [q["question"] for q in structured],
+            "safety_notices": list(self.state.safety_issues),
+            "notes": list(getattr(self.state, "notes", [])),
+            "disclaimer": delivered.get("disclaimer", ""),
+        }
         try:
             response = self.llm.chat(
                 [
                     {"role": "system", "content": REPLY_SYSTEM_PROMPT.format(role=self.role)},
-                    {"role": "user", "content": json.dumps(
-                        {
-                            "release_status": self.state.release_status,
-                            "draft_reply": body,
-                            "questions": questions,
-                            "disclaimer": delivered.get("disclaimer", ""),
-                        },
-                        ensure_ascii=False,
-                    )},
+                    {"role": "user", "content": json.dumps(material, ensure_ascii=False)},
                 ],
-                temperature=0.2, max_tokens=600,
+                temperature=0.4, max_tokens=900,
             )
             self.state.budget.charge_llm_tokens(response.total_tokens)
         except (LLMError, Exception):  # noqa: BLE001
-            self.state.warn("回复改写失败，使用模板回复")
+            self.state.warn("模型撰写回复失败，使用模板回复")
             return None
 
         text = (response.text or "").strip()
         if not text:
             return None
+        return self._finalise(text, delivered)
+
+    def _finalise(self, text: str, delivered: dict[str, Any]) -> str:
+        """Additions only. Nothing the model wrote is removed except a dose.
+
+        Redacting the number rather than discarding the reply is the whole
+        difference between a legal gate and censorship: the patient still gets the
+        model's reasoning, they just do not get a gram count nobody has signed for.
+        """
         if DOSE_RE.search(text):
-            self.state.warn("模型改写的回复中出现剂量数值，已丢弃并使用模板回复")
-            return None
+            text = DOSE_RE.sub("（具体剂量需医师审核后给出）", text)
+            self.state.note("回复中的剂量数值已隐去：含剂量内容必须经医师逐味审核签名后发布")
+        urgent = delivered.get("urgent") or {}
+        if self.state.risk_mode == "urgent" and urgent.get("immediate_action"):
+            # Appended, not substituted: if the model already said it, this adds
+            # nothing; if it did not, the instruction still reaches the patient.
+            if urgent["immediate_action"][:8] not in text:
+                text = f"{text}\n{urgent['immediate_action']}"
+            if urgent.get("transport_advice") and urgent["transport_advice"][:8] not in text:
+                text = f"{text}\n{urgent['transport_advice']}"
         disclaimer = delivered.get("disclaimer", "")
         if disclaimer and disclaimer[:12] not in text:
             text = f"{text}\n{disclaimer}"

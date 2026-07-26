@@ -207,6 +207,157 @@ class ConversationFlowTests(unittest.TestCase):
         self.assertTrue(convo.state.outputs["safety_audit"]["checks_run"])
 
 
+class AgentSpeaksFirstTests(unittest.TestCase):
+    """The agent opens the consultation.
+
+    Waiting for the patient to type an unprompted complaint is both colder and
+    worse at collecting a history: the reported transcript's first message was
+    literally 「腰」, because a blank box asks nothing.
+    """
+
+    def make(self, chat_fn=None, role="patient"):
+        if chat_fn is None:
+            return session(role)
+
+        class Stub:
+            name, model, available = "stub", "stub", True
+
+            def chat(self, messages, **kwargs):
+                return chat_fn(messages)
+
+        return session(role, llm=Stub())
+
+    def test_the_agent_opens_with_a_question_and_no_model(self):
+        reply = self.make().open()
+        self.assertEqual(reply.composer, "template")
+        self.assertTrue(reply.questions, "an opening with no question is not an opening")
+        self.assertTrue(reply.awaiting_answer)
+        self.assertEqual(reply.risk_mode, "routine")
+
+    def test_the_model_writes_the_opening_when_available(self):
+        def chat(messages):
+            if "你先开口" in messages[0]["content"]:
+                return LLMResponse(text="你好，我是骨科医生助手。你哪里不舒服？")
+            return LLMResponse(text="{}")
+
+        reply = self.make(chat).open()
+        self.assertEqual(reply.composer, "llm")
+        self.assertIn("你哪里不舒服？", reply.questions)
+
+    def test_the_opening_does_not_triage_an_empty_narrative(self):
+        """No run happens: screening nothing would be theatre, and a risk
+        judgement about no information at all is worse than none."""
+        convo = self.make()
+        convo.open()
+        self.assertIsNone(convo.state)
+        self.assertEqual(convo.narrative, [])
+
+    def test_the_opening_is_recorded_as_an_agent_turn(self):
+        convo = self.make()
+        opening = convo.open()
+        self.assertEqual([t.role for t in convo.turns], ["agent"])
+        convo.send("腰痛3个月")
+        self.assertEqual([t.role for t in convo.turns], ["agent", "user", "agent"])
+        self.assertIn(opening.questions[0], convo.asked,
+                      "the opening question must not be asked again")
+
+    def test_opening_twice_is_a_request_error(self):
+        convo = self.make()
+        convo.open()
+        with self.assertRaises(ValueError):
+            convo.open()
+
+    def test_a_failed_opening_still_produces_one(self):
+        def chat(messages):
+            raise RuntimeError("upstream 502")
+
+        reply = self.make(chat).open()
+        self.assertTrue(reply.message)
+        self.assertEqual(reply.composer, "template")
+
+
+class TriageIsAClinicalJudgementTests(unittest.TestCase):
+    """The reported bug: 「我腰痛1个月，乏力」 was answered with 拨打120.
+
+    A keyword screen matched a constitutional-symptom pattern for infection or
+    tumour, and the harness treated that match as the triage decision. One month
+    of back pain with fatigue is a clinic appointment. An emergency instruction
+    that fires on routine presentations teaches people to ignore it.
+    """
+
+    def triager(self, level, reason="", disputed=()):
+        class Stub:
+            name, model, available = "stub", "stub", True
+
+            def chat(self, messages, **kwargs):
+                if "急诊分诊" in messages[0]["content"]:
+                    return LLMResponse(text=json.dumps({
+                        "triage": level, "triage_reason": reason, "signals": [],
+                        "rule_hits_you_disagree_with": list(disputed),
+                    }, ensure_ascii=False))
+                return LLMResponse(text="{}")
+
+        return Stub()
+
+    CAUDA = "去年做过腰椎手术，今天突然不能排尿、会阴麻木，双腿越来越无力"
+
+    def test_the_model_may_decide_a_flagged_case_is_routine(self):
+        convo = session("patient", llm=self.triager("routine", "1个月病程，无红旗，门诊评估即可"))
+        reply = convo.send("我腰痛1个月，乏力")
+        self.assertEqual(reply.risk_mode, "routine")
+        screening = convo.state.outputs["intake"]["screening"]
+        self.assertEqual(screening["triage_by"], "llm")
+        self.assertEqual(screening["triage_level"], "routine")
+
+    def test_a_real_emergency_is_still_an_emergency(self):
+        convo = session("patient", llm=self.triager("emergency", "典型马尾综合征"))
+        self.assertEqual(convo.send(self.CAUDA).risk_mode, "urgent")
+
+    def test_with_no_model_the_rule_screen_decides(self):
+        """The deterministic path is unchanged: rules still escalate on their own."""
+        convo = session("patient")
+        self.assertEqual(convo.send(self.CAUDA).risk_mode, "urgent")
+        self.assertEqual(convo.state.outputs["intake"]["screening"]["triage_by"], "rule")
+
+    def test_a_disagreement_is_recorded_in_both_directions(self):
+        """Rules advise, the model decides — so the disagreement is the record.
+
+        This is the cost of the design: a model that wrongly downgrades a real
+        cauda equina now determines the outcome. It cannot do so silently.
+        """
+        convo = session("patient", llm=self.triager(
+            "routine", "我认为不急", disputed=[{"signal": "cauda_equina", "why": "本例我判断为功能性"}]))
+        reply = convo.send(self.CAUDA)
+        screening = convo.state.outputs["intake"]["screening"]
+        self.assertEqual(reply.risk_mode, "routine", "the model's judgement is adopted")
+        self.assertIn("cauda_equina", [h["signal"] for h in screening["hits"]])
+        self.assertEqual(screening["disputed_rule_hits"][0]["signal"], "cauda_equina")
+        self.assertTrue(any("规则关键词筛查倾向 urgent" in n for n in convo.state.notes))
+
+    def test_a_model_signal_is_not_a_rule_hit(self):
+        """A clinical inference and a keyword match must not share a bucket."""
+        class Stub:
+            name, model, available = "stub", "stub", True
+
+            def chat(self, messages, **kwargs):
+                if "急诊分诊" in messages[0]["content"]:
+                    return LLMResponse(text=json.dumps({
+                        "triage": "routine", "triage_reason": "线索薄弱",
+                        "signals": [{"signal": "infection_or_tumor", "term": "乏力",
+                                     "certainty": "cannot_exclude"}],
+                        "rule_hits_you_disagree_with": [],
+                    }, ensure_ascii=False))
+                return LLMResponse(text="{}")
+
+        convo = session("patient", llm=Stub())
+        reply = convo.send("我腰痛1个月，乏力")
+        screening = convo.state.outputs["intake"]["screening"]
+        self.assertEqual(reply.risk_mode, "routine",
+                         "a 'cannot exclude' thought is not an emergency")
+        self.assertEqual(screening["hits"], [])
+        self.assertEqual(screening["model_signals"][0]["signal"], "infection_or_tumor")
+
+
 class ConversationLlmContainmentTests(unittest.TestCase):
     def make(self, chat_fn, role="patient"):
         class Stub:
@@ -239,43 +390,72 @@ class ConversationLlmContainmentTests(unittest.TestCase):
         def chat(messages):
             if "信息抽取器" in messages[0]["content"]:
                 return LLMResponse(text="{}")
-            if "对话表达层" in messages[0]["content"]:
-                return LLMResponse(text="建议独活 9克、桑寄生 15克煎服。")
+            if "正在直接和" in messages[0]["content"]:
+                return LLMResponse(text="考虑气滞血瘀，可以用独活 9克、桑寄生 15克煎服。")
             return LLMResponse(text="{}")
 
         convo = self.make(chat)
         reply = convo.send("腰痛3个月")
-        self.assertEqual(reply.composer, "template")
+        # The reply is the model's, minus the grams. Discarding the whole reply
+        # over a number would throw away reasoning the patient should see; a
+        # signature is required for the dose, not for the sentence around it.
+        self.assertEqual(reply.composer, "llm")
+        self.assertIn("气滞血瘀", reply.message)
         self.assertNotIn("9克", reply.message)
-        self.assertTrue(any("剂量数值" in w for w in convo.state.warnings))
+        self.assertNotIn("15克", reply.message)
+        self.assertTrue(any("剂量" in n for n in convo.state.notes))
 
-    def test_a_clean_rephrase_is_used_and_keeps_the_disclaimer(self):
+    def test_the_model_writes_the_reply_and_the_disclaimer_is_appended(self):
         def chat(messages):
             if "信息抽取器" in messages[0]["content"]:
                 return LLMResponse(text="{}")
-            if "对话表达层" in messages[0]["content"]:
+            if "正在直接和" in messages[0]["content"]:
                 return LLMResponse(text="我需要再了解一些情况才能判断。")
             return LLMResponse(text="{}")
 
         convo = self.make(chat)
         reply = convo.send("腰痛3个月")
-        self.assertEqual(reply.composer, "llm_rephrase")
+        self.assertEqual(reply.composer, "llm")
+        self.assertIn("我需要再了解一些情况", reply.message)
         self.assertIn("不构成诊断或处方", reply.message)
 
-    def test_the_urgent_script_is_never_rephrased(self):
-        calls = []
+    def test_the_model_writes_the_urgent_reply_too(self):
+        """The fixed emergency script was the bug, not the safeguard.
+
+        It could not tell a suspected cauda equina from a month of fatigue, so it
+        shouted at both. The model writes this now; the immediate action is
+        *appended* if it left it out, which adds without replacing.
+        """
+        seen = []
 
         def chat(messages):
-            calls.append(messages[0]["content"][:20])
+            seen.append(messages[0]["content"][:24])
             if "信息抽取器" in messages[0]["content"]:
                 return LLMResponse(text="{}")
-            return LLMResponse(text="随便改写的急症话术")
+            if "正在直接和" in messages[0]["content"]:
+                return LLMResponse(text="你描述的排尿困难加会阴麻木需要今天就处理，这是脊髓/马尾受压的表现。")
+            return LLMResponse(text="{}")
 
         convo = self.make(chat)
         reply = convo.send("突然不能排尿、会阴麻木")
-        self.assertEqual(reply.composer, "template")
-        self.assertIn("120", reply.message)
-        self.assertFalse(any("对话表达层" in c for c in calls))
+        self.assertEqual(reply.risk_mode, "urgent")
+        self.assertEqual(reply.composer, "llm")
+        self.assertIn("马尾", reply.message, "the model's own wording survives")
+        self.assertTrue(any("正在直接和" in c for c in seen),
+                        "the model must be asked to write the urgent reply")
+
+    def test_an_urgent_reply_that_omits_the_action_gets_it_appended(self):
+        def chat(messages):
+            if "信息抽取器" in messages[0]["content"]:
+                return LLMResponse(text="{}")
+            if "正在直接和" in messages[0]["content"]:
+                return LLMResponse(text="这个情况不太好。")
+            return LLMResponse(text="{}")
+
+        convo = self.make(chat)
+        reply = convo.send("突然不能排尿、会阴麻木")
+        self.assertIn("这个情况不太好", reply.message, "nothing the model wrote is removed")
+        self.assertIn("急诊", reply.message, "and the instruction still reaches the patient")
 
     def test_extractor_failure_falls_back_to_rules(self):
         def chat(messages):

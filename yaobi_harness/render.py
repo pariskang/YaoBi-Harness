@@ -226,6 +226,10 @@ def console_payload(state: ClinicalRunState, role: str | None = None) -> dict[st
             "safety_audit": state.outputs.get("safety_audit", {}),
             "safety_issues": state.safety_issues,
             "warnings": state.warnings,
+            # Informational remarks, kept out of ``warnings`` so a routine case
+            # does not read as alarming. This is where a triage disagreement lands:
+            # "the keyword screen said infection, the model said no, here is why".
+            "notes": list(getattr(state, "notes", [])),
             "citations": citation_bundle(state),
             "medication_safety": state.outputs.get("medication_safety", {}),
             "dose_safety": state.outputs.get("dose_safety", {}),

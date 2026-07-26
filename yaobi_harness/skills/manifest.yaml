@@ -53,6 +53,28 @@ skills:
   - uncertainty
   output_schema: UrgentCarePlan
   output_key: urgent_action_plan
+  autonomous: true
+  instructions: '先用 emergency_resource_lookup 取当地急救电话，必要时用 clinical_guideline_search
+    取要点，然后**由你写这份行动计划**。
+
+
+    这份计划会被直接读给患者，所以写法很重要：
+
+
+    1. 先说要立刻做什么，再说为什么。不要先讲一段免责。
+
+    2. 紧急程度要与本例相称。疑似马尾、骨筋膜室、PE/ACS 才写"拨打急救电话"；
+    只是需要尽快线下评估的，就写"今天或明天去骨科/急诊门诊"——对慢性腰痛喊救护车，
+    下一次真的急症他就不会信你了。
+
+    3. immediate_action、transport_advice、uncertainty 三项必填，因为它们是患者唯一
+    会照着做的部分。
+
+    4. do_not 写本例真正要避免的事（推拿正骨、自行加量止痛药、因线上建议延迟就诊），
+    不要写通用套话。
+
+    5. 不要写任何药名剂量。'
+
 - skill_id: yaobi.biomedical_differential
   version: 3.2.0
   description: 西医鉴别诊断

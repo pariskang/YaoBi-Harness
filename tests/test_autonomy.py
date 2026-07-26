@@ -413,10 +413,19 @@ class AutonomousAgentTests(unittest.TestCase):
         self.assertTrue(any("配伍禁忌" in i for i in out.safety_issues), out.safety_issues)
 
     def test_dose_generation_is_never_delegated_to_the_model(self):
+        """Two skills stay deterministic, and only two.
+
+        Dose generation is a legal boundary — a gram count needs a signature, not
+        a model. The safety critic is deliberately adversarial to whatever the
+        model produced, so having the model write it would defeat it. Everything
+        else, including the emergency plan, is the model's to write: a fixed
+        emergency template is what told a chronic-back-pain patient to call an
+        ambulance, and an alarm that fires on routine cases stops being read.
+        """
         skills = SkillRegistry.from_file(MANIFEST)
         self.assertFalse(skills.specs["yaobi.dose_generation"].autonomous)
-        self.assertFalse(skills.specs["yaobi.urgent_triage"].autonomous)
         self.assertFalse(skills.specs["yaobi.safety_critic"].autonomous)
+        self.assertTrue(skills.specs["yaobi.urgent_triage"].autonomous)
 
     def test_autonomous_run_still_produces_a_deterministic_dose_draft(self):
         registry = ToolRegistry(records=corpus(), deid_key=TEST_KEY,

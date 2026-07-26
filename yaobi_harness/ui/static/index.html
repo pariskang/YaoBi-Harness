@@ -1229,8 +1229,8 @@ function tabIntake(d, audit, meta) {
           ${q.why ? `<div class="hint">为什么问：${esc(q.why)}</div>` : ""}
         </div>`).join("")}</div>`);
     }
-    if ((iv.rejected || []).length) {
-      out.push(listSec("被拦下的提问（含剂量/夹带建议/重复/未知轴）", iv.rejected));
+    if ((iv.notes || []).length) {
+      out.push(listSec("提问记录（模型的提问一律照原文问出；此处只记录调整）", iv.notes));
     }
 
     // Coverage by tier, both answered and open, so a gap is visible as a gap.
@@ -1730,9 +1730,9 @@ async function chatSend(text) {
     $("#chatTurns").textContent = `${data.turn_count} 条消息`;
     renderInterview({ ...(data.interview || {}), ...(reply.interview || {}),
                       coverage: (data.interview || {}).coverage || {} });
-    if ((reply.interview || {}).rejected?.length) {
+    if ((reply.interview || {}).notes?.length) {
       pendingBubble.appendChild(el(
-        `<div class="learned">提问已被拦下：${esc(reply.interview.rejected.join("；"))}</div>`));
+        `<div class="learned">提问记录：${esc(reply.interview.notes.join("；"))}</div>`));
     }
 
     // Clicking a suggested question drops it into the box so the user can edit
@@ -1767,6 +1767,49 @@ async function chatSend(text) {
   }
 }
 
+/* The agent speaks first. A blank box is the worst history-taking prompt there
+   is: it collects 「腰」 where an opening question collects 「腰痛一个月，还乏力」. */
+async function chatOpen() {
+  const log = $("#chatLog");
+  if (CHAT.sessionId) return;
+  const pending = chatBubble("agent", "正在接入问诊智能体…");
+  log.replaceChildren(pending);
+  const bubble = log.querySelector(".bubble");
+  try {
+    const data = await api("/api/chat/open", {
+      role: chatRole(), use_llm: $("#chatUseLlm").checked,
+      allow_prescription: $("#chatAllowRx").checked,
+    });
+    CHAT.sessionId = data.session_id;
+    CHAT.turns = data.turn_count;
+    bubble.innerHTML = replyMeta(data.reply) + esc(data.reply.message);
+    $("#chatTurns").textContent = `${data.turn_count} 条消息`;
+    renderOpeningChips(data.reply);
+  } catch (e) {
+    // An opening that fails must not block the conversation — the patient can
+    // still type first, which is what the old behaviour forced on everyone.
+    log.replaceChildren(el(`<div class="chat-empty"><div class="big">◌</div>
+      <h3>说说你的情况</h3><p>例如「腰痛3个月，久坐加重」。</p></div>`));
+  } finally {
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+function renderOpeningChips(reply) {
+  const asked = (reply.structured_questions || []);
+  $("#chatQuestions").replaceChildren(...asked.map(item => {
+    const chip = document.createElement("button");
+    chip.className = "chip"; chip.type = "button";
+    chip.textContent = item.question;
+    chip.addEventListener("click", () => {
+      const input = $("#chatInput");
+      input.placeholder = item.question;
+      input.focus();
+    });
+    return chip;
+  }));
+}
+
 $("#chatSend").addEventListener("click", () => chatSend());
 $("#chatInput").addEventListener("keydown", e => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); chatSend(); }
@@ -1786,6 +1829,7 @@ $("#chatReset").addEventListener("click", async () => {
   $("#covMeta").innerHTML = `<b>尚未开始</b><small>发出第一条消息后，这里会显示已闭合与仍缺的问诊轴。</small>`;
   PENDING_IMAGES = [];
   renderImages();
+  chatOpen();
 });
 
 /* ═══════════════════ DRUG CHECK ═══════════════════ */
@@ -1931,7 +1975,9 @@ async function renderKnowledge() {
     </div>`));
 }
 
-boot();
+// The chat view is the default view, so the agent opens the consultation as
+// soon as the page is usable rather than waiting to be spoken to.
+boot().then(chatOpen);
 </script>
 </body>
 </html>

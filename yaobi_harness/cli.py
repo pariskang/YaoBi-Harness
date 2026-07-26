@@ -373,16 +373,24 @@ def _chat_command(args) -> int:
             )
             if interview.get("blocking"):
                 print(f"   ↳ 必答未闭合: {'、'.join(interview['blocking'])}")
-            for note in interview.get("rejected", [])[:2]:
-                print(f"   ↳ 提问被拦下: {note}")
+            for note in interview.get("notes", [])[:2]:
+                print(f"   ↳ 提问记录: {note}")
+        screening = ((reply.delivered or {}).get("intake") or {}).get("screening") or {}
+        if screening.get("triage_by") == "llm":
+            print(f"   ↳ 分诊: {screening.get('triage_level')}（模型判定）{screening.get('triage_reason', '')[:80]}")
+
+    # The agent opens. Waiting for the patient to recite a complaint into an
+    # empty prompt is both colder and worse at collecting a history.
+    opening = session.open()
+    print(f"\n🤖 {opening.message}")
 
     if args.message:
         for message in args.message:
             print(f"\n👤 {message}")
             show(session.send(message))
     else:
-        print(f"腰痹智能体对话（角色={args.role}，模型={describe_client(llm)['provider']}）")
-        print("直接输入症状开始；输入 /quit 结束，/facts 查看已知信息。\n")
+        print(f"\n（角色={args.role}，模型={describe_client(llm)['provider']}）")
+        print("输入 /quit 结束，/facts 查看已知信息。\n")
         while True:
             try:
                 message = input("👤 ").strip()

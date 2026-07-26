@@ -83,6 +83,12 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 日志**只存在内存里、从不落盘**，保留最近 20 次；理由和控制台不持久化聊天记录相同——
 都是临床内容。要落盘用 CLI 的 `--journal`。
 
+**对话问诊** — 页面一打开，**智能体先开口**：主动打招呼并问一个开放问题，不等操作者先输入。
+空输入框是最差的问诊提示——上报的真实转录里，患者的第一条消息就是「腰」。
+每一轮的回复由**模型撰写**（含急症回复），模型的提问一律照原文问出；
+「提问记录」只列出被调整的部分（隐去的剂量、未声明的轴、这一轮没覆盖的必答轴），
+不再有「提问已被拦下」。
+
 **用药速查** — 不跑完整病例，只做相互作用筛查。适合门诊快速核对。
 
 **知识库** — 知识库统计、来源目录与许可状态（哪些启用、哪些被禁用及原因）、内置规则包全文。
@@ -116,6 +122,7 @@ storage 被拦时，刷新只能靠它。
 | POST | `/api/run` | `{complaint, role, facts, allow_prescription, use_llm, enable_panel, panel_concurrency, record_journal, images}` → `{delivered, audit, meta, journal?}` |
 | POST | `/api/replay` | `{run_id, complaint?, facts?}` → `{fidelity, journal, delivered, audit, meta}` |
 | POST | `/api/interactions` | `{medications, conditions}` → 相互作用筛查结果 |
+| POST | `/api/chat/open` | `{role}` → `{session_id, reply, ...}`；智能体先开口，页面加载即调用 |
 | POST | `/api/chat` | `{message, role, session_id?}` → `{session_id, reply, audit, meta}` |
 | POST | `/api/chat/reset` | `{session_id}` → 清空该会话 |
 

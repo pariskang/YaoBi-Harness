@@ -170,6 +170,23 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 400)
 
     # ------------------------------------------------------------ interactions
+    def test_the_console_opens_the_conversation_itself(self):
+        status, body = post(f"{self.base}/api/chat/open", {"role": "patient"})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["session_id"])
+        self.assertTrue(body["reply"]["message"])
+        self.assertTrue(body["reply"]["questions"], "an opening with no question is not an opening")
+        self.assertEqual(body["turn_count"], 1)
+
+    def test_the_opened_session_continues_normally(self):
+        _, opened = post(f"{self.base}/api/chat/open", {"role": "patient"})
+        status, turn = post(f"{self.base}/api/chat", {
+            "message": "腰痛3个月，久坐加重", "role": "patient",
+            "session_id": opened["session_id"]})
+        self.assertEqual(status, 200, turn)
+        self.assertEqual(turn["session_id"], opened["session_id"])
+        self.assertEqual(turn["turn_count"], 3, "opening + user + agent")
+
     def test_replay_route_is_reachable_over_http(self):
         status, recorded = post(f"{self.base}/api/run", {
             "complaint": "腰痛3月，久坐加重", "role": "physician", "record_journal": True})
@@ -518,6 +535,17 @@ class StaticAssetTests(unittest.TestCase):
         for marker in ('id="recordJournal"', 'id="panelConc"', 'id="replayBtn"',
                        '"/api/replay"', "function tabReplay", "function planNote"):
             self.assertIn(marker, page, marker)
+
+    def test_the_page_lets_the_agent_speak_first(self):
+        page = STATIC.read_text(encoding="utf-8")
+        self.assertIn('"/api/chat/open"', page)
+        self.assertIn("boot().then(chatOpen)", page)
+
+    def test_the_page_no_longer_claims_questions_were_blocked(self):
+        """The model's questions are always asked, so the copy must not say otherwise."""
+        page = STATIC.read_text(encoding="utf-8")
+        self.assertNotIn("提问已被拦下", page)
+        self.assertNotIn("被拦下的提问", page)
 
     def test_the_page_never_reuses_the_run_payload_for_a_replay(self):
         """REPLAY is separate state; overwriting LAST would erase the comparison."""

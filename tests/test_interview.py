@@ -7,6 +7,7 @@ question, emit a dose, or declare itself finished while a red-flag axis is open.
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from yaobi_harness.conversation import ConversationSession, rule_extract
@@ -270,34 +271,57 @@ class InterviewLoopTests(unittest.TestCase):
         self.assertIn("这几天小便还顺畅吗？", [q.question for q in result.questions])
         self.assertEqual([q.origin for q in result.questions][0], "llm")
 
-    def test_a_question_carrying_a_dose_is_rejected(self):
+    def test_a_dose_inside_a_question_is_redacted_not_dropped(self):
+        """Removing the number costs nothing; dropping the question costs the answer."""
         llm = FakeLLM([ask_call([
-            {"axis_id": "cauda_equina", "question": "要不要先吃布洛芬 0.3g？"},
+            {"axis_id": "medication_history", "question": "你现在吃的布洛芬是 0.3g 一次吗？"},
         ])])
         result = InterviewLoop(llm, judge=AdequacyJudge()).next_round({}, "腰痛", budget=Budget())
-        self.assertTrue(any("剂量" in r for r in result.rejected))
-        self.assertNotIn("要不要先吃布洛芬 0.3g？", [q.question for q in result.questions])
+        asked = [q.question for q in result.questions]
+        self.assertEqual(len(asked), 1, asked)
+        self.assertIn("布洛芬", asked[0])
+        self.assertNotIn("0.3g", asked[0])
+        self.assertTrue(any("剂量" in n for n in result.notes))
 
-    def test_a_question_carrying_treatment_advice_is_rejected(self):
-        llm = FakeLLM([ask_call([
-            {"axis_id": "cauda_equina", "question": "建议你服用止痛药，能接受吗？"},
-        ])])
+    def test_a_question_that_states_a_hypothesis_is_still_asked(self):
+        """Clinicians reason aloud while asking. Forbidding it bought no safety."""
+        text = "我在排除腰椎间盘突出。建议你服用止痛药之前先告诉我：腿有没有发麻？"
+        llm = FakeLLM([ask_call([{"axis_id": "radiation_dermatome", "question": text}])])
         result = InterviewLoop(llm, judge=AdequacyJudge()).next_round({}, "腰痛", budget=Budget())
-        self.assertTrue(any("建议" in r for r in result.rejected))
+        self.assertIn(text, [q.question for q in result.questions])
+        self.assertTrue(any("推断或建议" in n for n in result.notes),
+                        "it should be recorded for the audit, just not removed")
 
-    def test_an_unknown_axis_is_rejected(self):
-        llm = FakeLLM([ask_call([{"axis_id": "astrology", "question": "你什么星座？"}])])
+    def test_an_unknown_axis_still_gets_asked(self):
+        """A question the model composed is always asked, labelled or not."""
+        llm = FakeLLM([ask_call([{"axis_id": "astrology", "question": "你平时是什么作息？"}])])
         result = InterviewLoop(llm, judge=AdequacyJudge()).next_round({}, "腰痛", budget=Budget())
-        self.assertTrue(any("未知问诊轴" in r for r in result.rejected))
-        self.assertNotIn("你什么星座？", [q.question for q in result.questions])
+        self.assertIn("你平时是什么作息？", [q.question for q in result.questions])
+        self.assertEqual([q.axis_id for q in result.questions], [""])
+        self.assertTrue(any("不在轴表中" in n for n in result.notes))
 
-    def test_a_skipped_required_axis_is_added_back_from_the_probe_bank(self):
-        """The model chooses wording; the rules choose scope."""
+    def test_a_skipped_required_axis_is_advised_not_substituted(self):
+        """The old behaviour replaced the model's question with a canned probe and
+        told the user 「提问已被拦下」. Scope is now advice, and it is advice given to
+        the model — the consequence lives in the adequacy verdict instead."""
         llm = FakeLLM([ask_call([{"axis_id": "sleep", "question": "睡得好吗？"}])])
-        result = InterviewLoop(llm, judge=AdequacyJudge()).next_round({}, "腰痛", budget=Budget())
-        asked = {q.axis_id for q in result.questions}
-        self.assertIn("cauda_equina", asked)
-        self.assertTrue(any("必答轴被模型遗漏" in r for r in result.rejected))
+        loop = InterviewLoop(llm, judge=AdequacyJudge())
+        result = loop.next_round({}, "腰痛", budget=Budget())
+        self.assertEqual([q.question for q in result.questions], ["睡得好吗？"])
+        self.assertNotIn("cauda_equina", {q.axis_id for q in result.questions})
+        self.assertIn("cauda_equina", loop.advisory_open_axes)
+        self.assertIn("cauda_equina", result.verdict.blocking_axes)
+
+    def test_the_skipped_axes_are_handed_back_to_the_model_next_round(self):
+        llm = FakeLLM([
+            ask_call([{"axis_id": "sleep", "question": "睡得好吗？"}]),
+            ask_call([{"axis_id": "cauda_equina", "question": "小便顺畅吗？"}]),
+        ])
+        loop = InterviewLoop(llm, judge=AdequacyJudge())
+        loop.next_round({}, "腰痛", budget=Budget())
+        loop.next_round({}, "腰痛", budget=Budget())
+        advice = json.loads(llm.calls[-1][1]["content"])["you_skipped_these_required_axes_last_round"]
+        self.assertIn("cauda_equina", [a["axis_id"] for a in advice])
 
     def test_model_claiming_completion_does_not_end_the_interview(self):
         llm = FakeLLM([ask_call([{"axis_id": "cauda_equina", "question": "小便正常吗？"}], complete=True)])
@@ -317,8 +341,29 @@ class InterviewLoopTests(unittest.TestCase):
         result = InterviewLoop(llm, judge=AdequacyJudge()).next_round({}, "腰痛", budget=Budget())
         self.assertEqual(result.composer, "llm")
 
-    def test_free_prose_is_not_accepted_as_a_round(self):
-        llm = FakeLLM([LLMResponse(text="我觉得应该问问他睡得好不好。")])
+    def test_questions_written_as_prose_are_still_the_models_questions(self):
+        """Dropping a round because it arrived as prose throws away real enquiry."""
+        llm = FakeLLM([LLMResponse(text="想先了解两件事：\n1. 你晚上睡得好吗？\n2. 走路久了会麻吗？")])
+        result = InterviewLoop(llm, judge=AdequacyJudge()).next_round({}, "腰痛", budget=Budget())
+        self.assertEqual(result.composer, "llm")
+        self.assertEqual([q.question for q in result.questions],
+                         ["你晚上睡得好吗？", "走路久了会麻吗？"])
+
+    def test_an_all_duplicate_round_says_why_it_used_the_bank(self):
+        """The bank supplying questions is fine when the model offered nothing new.
+        Doing it silently is what made 「提问来源=probe_bank」 inexplicable."""
+        llm = FakeLLM([
+            ask_call([{"axis_id": "sleep", "question": "睡得好吗？"}]),
+            ask_call([{"axis_id": "sleep", "question": "睡得好吗？"}]),
+        ])
+        loop = InterviewLoop(llm, judge=AdequacyJudge())
+        loop.next_round({}, "腰痛", budget=Budget())
+        second = loop.next_round({}, "腰痛", budget=Budget())
+        self.assertEqual(second.composer, "probe_bank")
+        self.assertTrue(any("没有给出新问题" in n for n in second.notes))
+
+    def test_a_reply_with_no_question_in_it_falls_back_to_the_bank(self):
+        llm = FakeLLM([LLMResponse(text="我觉得病史已经很清楚了。")])
         result = InterviewLoop(llm, judge=AdequacyJudge()).next_round({}, "腰痛", budget=Budget())
         self.assertEqual(result.composer, "probe_bank")
 

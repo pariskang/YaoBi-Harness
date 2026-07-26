@@ -115,8 +115,11 @@ class Budget:
     max_loops: int = 3
     max_tool_calls: int = 24
     max_questions: int = 8
-    max_llm_calls: int = 12
-    max_llm_tokens: int = 120_000
+    # Sized for model-driven execution: each autonomous agent may take several
+    # tool-calling turns, on top of the planner and the advisory calls. Too low
+    # a ceiling silently starves the later agents into their rule fallbacks.
+    max_llm_calls: int = 40
+    max_llm_tokens: int = 250_000
     used_tool_calls: int = 0
     used_llm_calls: int = 0
     used_llm_tokens: int = 0

@@ -23,6 +23,7 @@ except ImportError as exc:  # pragma: no cover
 _ALLOWED_KEYS = {
     "skill_id", "version", "description", "allowed_roles", "allowed_tools",
     "forbidden_tools", "hard_requirements", "output_schema", "output_key", "max_tool_calls",
+    "instructions", "autonomous",
 }
 
 
@@ -42,6 +43,11 @@ class SkillSpec:
     output_schema: str = ""
     output_key: str = ""
     max_tool_calls: int | None = None
+    #: Procedure text loaded into the agent's system prompt. This is what makes
+    #: a skill something the model *follows*, not just an allowlist it is bound by.
+    instructions: str = ""
+    #: Whether this skill may be executed as a model-driven tool-calling loop.
+    autonomous: bool = False
 
 
 @dataclass
@@ -89,6 +95,8 @@ class SkillRegistry:
                 output_schema=str(entry.get("output_schema", "")),
                 output_key=str(entry.get("output_key", "")),
                 max_tool_calls=entry.get("max_tool_calls"),
+                instructions=str(entry.get("instructions", "") or ""),
+                autonomous=bool(entry.get("autonomous", False)),
             )
         if not specs:
             raise SkillManifestError(f"skill manifest {source} declares no skills")
@@ -125,6 +133,30 @@ class SkillRegistry:
         # a missing key is a broken contract.
         missing = [key for key in spec.hard_requirements if key not in output or output[key] is None]
         return (not missing), ([f"{skill_id}: missing required output fields {missing}"] if missing else [])
+
+    def catalog(self, role: str | None = None) -> list[dict[str, Any]]:
+        """What each skill does, for a planner model to choose between.
+
+        Only name, purpose and tool surface are exposed — never the full
+        instruction text, which can be long and is loaded per agent instead.
+        """
+        return [
+            {
+                "skill_id": spec.skill_id,
+                "description": spec.description,
+                "tools": list(spec.allowed_tools),
+                "autonomous": spec.autonomous,
+                "roles": list(spec.allowed_roles) or ["patient", "physician", "researcher"],
+            }
+            for spec in self.specs.values()
+            if not role or not spec.allowed_roles or role in spec.allowed_roles
+        ]
+
+    def merge(self, other: "SkillRegistry") -> "SkillRegistry":
+        """Overlay another registry (e.g. a generated expert skill) onto this one."""
+        merged = dict(self.specs)
+        merged.update(other.specs)
+        return SkillRegistry(merged)
 
     def output_key_for(self, skill_id: str) -> str:
         spec = self.specs.get(skill_id)

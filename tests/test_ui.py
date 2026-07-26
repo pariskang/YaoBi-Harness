@@ -214,6 +214,91 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertTrue(all(r == ["openfda"] for r in results))
 
 
+class AccessTokenTests(unittest.TestCase):
+    """A public tunnel is only acceptable with a token gate in front of it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.service = ConsoleService(access_token="s3cret")
+        cls.httpd = create_server(cls.service, "127.0.0.1", 0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _get(self, path, headers=None):
+        request = urllib.request.Request(self.base + path, headers=headers or {})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_requests_without_a_token_are_rejected(self):
+        self.assertEqual(self._get("/api/bootstrap"), 401)
+        self.assertEqual(self._get("/"), 401)
+
+    def test_wrong_token_is_rejected(self):
+        self.assertEqual(self._get("/api/bootstrap", {"X-Yaobi-Token": "nope"}), 401)
+        self.assertEqual(self._get("/api/bootstrap?t=nope"), 401)
+
+    def test_token_accepted_from_header_query_and_cookie(self):
+        self.assertEqual(self._get("/api/bootstrap", {"X-Yaobi-Token": "s3cret"}), 200)
+        self.assertEqual(self._get("/api/bootstrap", {"Authorization": "Bearer s3cret"}), 200)
+        self.assertEqual(self._get("/api/bootstrap?t=s3cret"), 200)
+        self.assertEqual(self._get("/api/bootstrap", {"Cookie": "yaobi_token=s3cret"}), 200)
+
+    def test_posting_without_a_token_is_rejected(self):
+        status, _ = post(self.base + "/api/interactions", {"medications": ["布洛芬"]})
+        self.assertEqual(status, 401)
+
+    def test_bootstrap_tells_the_page_auth_is_on(self):
+        request = urllib.request.Request(self.base + "/api/bootstrap", headers={"X-Yaobi-Token": "s3cret"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            self.assertTrue(json.loads(response.read().decode())["auth_required"])
+
+
+class TunnelTests(unittest.TestCase):
+    def test_a_tunnel_cannot_be_opened_without_a_token(self):
+        from yaobi_harness.ui.tunnel import TunnelError, open_ngrok
+
+        with self.assertRaises(TunnelError):
+            open_ngrok(8000, token="")
+
+    def test_missing_authtoken_is_reported_clearly(self):
+        import os as _os
+
+        from yaobi_harness.ui.tunnel import TunnelError, open_ngrok
+
+        saved = {k: _os.environ.pop(k, None) for k in ("NGROK_AUTHTOKEN", "NGROK_AUTH_TOKEN")}
+        try:
+            with self.assertRaises(TunnelError) as ctx:
+                open_ngrok(8000, token="abc")
+            self.assertTrue("pyngrok" in str(ctx.exception) or "authtoken" in str(ctx.exception))
+        finally:
+            for key, value in saved.items():
+                if value is not None:
+                    _os.environ[key] = value
+
+    def test_tokens_are_long_and_unique(self):
+        from yaobi_harness.ui.tunnel import new_token
+
+        tokens = {new_token() for _ in range(20)}
+        self.assertEqual(len(tokens), 20)
+        self.assertTrue(all(len(t) >= 40 for t in tokens))
+
+    def test_banner_warns_before_sharing(self):
+        from yaobi_harness.ui.tunnel import Tunnel, banner
+
+        text = banner(Tunnel("https://x.ngrok.app", "ngrok", "tok"), local_url="http://127.0.0.1:8000/")
+        self.assertIn("不是临床部署", text)
+        self.assertIn("真实患者可识别信息", text)
+        self.assertIn("https://x.ngrok.app/?t=tok", text)
+
+
 class ConsolePayloadTests(unittest.TestCase):
     def test_console_payload_separates_delivery_from_audit(self):
         from yaobi_harness.graph import YaobiGraphRunner
@@ -225,6 +310,13 @@ class ConsolePayloadTests(unittest.TestCase):
         self.assertNotIn("evidence_ledger", payload["delivered"])
         self.assertIn("safety_audit", payload["audit"])
         self.assertIn("planner_mode", payload["meta"])
+
+    def test_console_payload_carries_the_autonomy_trace(self):
+        from yaobi_harness.graph import YaobiGraphRunner
+        from yaobi_harness.state import ClinicalRunState
+
+        out = YaobiGraphRunner().run(ClinicalRunState("腰痛3月，久坐加重", role="physician"))
+        self.assertIn("autonomy", console_payload(out, "physician")["audit"])
 
     def test_console_payload_is_json_serialisable(self):
         from yaobi_harness.graph import YaobiGraphRunner

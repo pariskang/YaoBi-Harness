@@ -36,15 +36,24 @@ SCHEMAS: dict[str, dict[str, tuple[bool, tuple[type, ...]]]] = {
     "BiomedicalAssessment": {
         "differentials": (True, (list,)),
         "exam_advice": (True, (list,)),
+        "reasoning": (False, (str,)),
+        "evidence_note": (False, (str,)),
     },
     "PatternAssessment": {
         "primary_pattern": (True, (str,)),
         "candidate_patterns": (True, (list,)),
+        "evidence_for": (False, (list,)),
+        "counter_evidence_needed": (False, (list,)),
+        "reasoning": (False, (str,)),
     },
     "ExpertCaseEvidence": {
         "similar": (True, (list,)),
         "counterexamples": (True, (list,)),
         "limitation": (True, (str,)),
+        # Present when the corpus-mined expert skill is active: the synthesis of
+        # what this expert habitually does, rather than raw look-alike cases.
+        "expert_practice": (False, (str, dict, list)),
+        "reasoning": (False, (str,)),
     },
     "MedicationSafety": {
         "findings": (True, (list,)),
@@ -55,6 +64,8 @@ SCHEMAS: dict[str, dict[str, tuple[bool, tuple[type, ...]]]] = {
         "formula_name": (True, (str,)),
         "herbs": (True, (list,)),
         "treatment_principle": (True, (list,)),
+        "rationale": (False, (str,)),
+        "combination_check": (False, (str,)),
     },
     "PrescriptionDraft": {
         "formula_name": (True, (str,)),

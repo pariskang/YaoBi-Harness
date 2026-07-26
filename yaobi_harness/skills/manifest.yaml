@@ -1,107 +1,200 @@
 # Skill policy for the Yaobi harness.
 #
-# This file is enforced, not documentation: `allowed_tools` is the complete set
-# of tools a skill may call, an empty list means "no tools", and an agent whose
-# skill is absent here gets no tool rights at all (fail-closed).
+# This file is enforced *and* read by the model: `allowed_tools` is the complete
+# set of tools a skill may call (empty list means none, absent skill means no
+# rights at all), while `instructions` is the procedure the agent follows when
+# `autonomous: true` lets it run as a model-driven tool loop.
 skills:
-  - skill_id: yaobi.timeline
-    version: 3.0.0
-    description: 标准化病历与患者时间线
-    allowed_tools: [patient_timeline_search]
-    output_schema: PatientEventGraph
-    output_key: timeline
-    hard_requirements: [events]
+- skill_id: yaobi.timeline
+  version: 3.0.0
+  description: 标准化病历与患者时间线
+  allowed_tools:
+  - patient_timeline_search
+  output_schema: PatientEventGraph
+  output_key: timeline
+  hard_requirements:
+  - events
+- skill_id: yaobi.intake
+  version: 3.0.0
+  description: 红旗筛查与信息缺口识别
+  allowed_tools:
+  - red_flag_evidence_search
+  output_schema: IntakeSummary
+  output_key: intake
+  hard_requirements:
+  - risk_mode
+  - screening
+- skill_id: yaobi.planning
+  version: 3.0.0
+  description: 任务图规划（规则或 LLM 提案，均经校验后执行）
+  allowed_tools: []
+  output_schema: TaskPlan
+  output_key: plan
+  hard_requirements:
+  - tasks
+  - planner_mode
+- skill_id: yaobi.urgent_triage
+  version: 3.0.0
+  description: 急症分诊与即时行动
+  allowed_roles:
+  - patient
+  - physician
+  allowed_tools:
+  - red_flag_evidence_search
+  - emergency_resource_lookup
+  - clinical_guideline_search
+  forbidden_tools:
+  - formula_composition_search
+  - herb_dose_distribution
+  - physician_review_submit
+  hard_requirements:
+  - immediate_action
+  - transport_advice
+  - uncertainty
+  output_schema: UrgentCarePlan
+  output_key: urgent_action_plan
+- skill_id: yaobi.biomedical_differential
+  version: 3.2.0
+  description: 西医鉴别诊断
+  allowed_tools:
+  - clinical_guideline_search
+  - drug_label_lookup
+  output_schema: BiomedicalAssessment
+  output_key: biomedical
+  hard_requirements:
+  - differentials
+  - exam_advice
+  instructions: '先用 clinical_guideline_search 检索与本例主诉相关的指南要点，再给出鉴别诊断。
 
-  - skill_id: yaobi.intake
-    version: 3.0.0
-    description: 红旗筛查与信息缺口识别
-    allowed_tools: [red_flag_evidence_search]
-    output_schema: IntakeSummary
-    output_key: intake
-    hard_requirements: [risk_mode, screening]
 
-  - skill_id: yaobi.planning
-    version: 3.0.0
-    description: 任务图规划（规则或 LLM 提案，均经校验后执行）
-    allowed_tools: []
-    output_schema: TaskPlan
-    output_key: plan
-    hard_requirements: [tasks, planner_mode]
+    要求：
 
-  - skill_id: yaobi.urgent_triage
-    version: 3.0.0
-    description: 急症分诊与即时行动
-    allowed_roles: [patient, physician]
-    allowed_tools: [red_flag_evidence_search, emergency_resource_lookup, clinical_guideline_search]
-    forbidden_tools: [formula_composition_search, herb_dose_distribution, physician_review_submit]
-    hard_requirements: [immediate_action, transport_advice, uncertainty]
-    output_schema: UrgentCarePlan
-    output_key: urgent_action_plan
+    1. 鉴别诊断按"先排除危险、再考虑常见"的顺序排列，每条都要能对应到症状、体征或指南要点。
 
-  - skill_id: yaobi.biomedical_differential
-    version: 3.0.0
-    description: 西医鉴别诊断
-    allowed_tools: [clinical_guideline_search]
-    output_schema: BiomedicalAssessment
-    output_key: biomedical
-    hard_requirements: [differentials, exam_advice]
+    2. exam_advice 要具体到可执行：查什么体征、按什么适应证开什么影像、随访用什么量表。
 
-  - skill_id: yaobi.tcm_pattern
-    version: 3.0.0
-    description: 中医辨证
-    allowed_tools: [tcm_pattern_knowledge_search]
-    output_schema: PatternAssessment
-    output_key: tcm_pattern
-    hard_requirements: [primary_pattern, candidate_patterns]
+    3. 若指南来源是占位数据（evidence_level 为 stub_not_for_clinical_use），必须在 evidence_note 里写明"未获授权指南背书"。
 
-  - skill_id: yaobi.expert_case_reasoning
-    version: 3.0.0
-    description: 相似病例与反例检索
-    allowed_tools: [similar_case_search, counterexample_case_search]
-    output_schema: ExpertCaseEvidence
-    output_key: expert_cases
-    hard_requirements: [similar, limitation]
+    4. 不要输出治疗药物剂量。'
+  autonomous: true
+- skill_id: yaobi.tcm_pattern
+  version: 3.2.0
+  description: 中医辨证
+  allowed_tools:
+  - tcm_pattern_knowledge_search
+  output_schema: PatternAssessment
+  output_key: tcm_pattern
+  hard_requirements:
+  - primary_pattern
+  - candidate_patterns
+  instructions: '基于主诉与已知四诊信息辨证。
 
-  - skill_id: yaobi.medication_safety
-    version: 3.1.0
-    description: 现有西药相互作用、禁忌与围术期风险筛查
-    allowed_tools: [drug_interaction_check, drug_label_lookup, drug_normalize]
-    forbidden_tools: [formula_composition_search, herb_dose_distribution, physician_review_submit]
-    output_schema: MedicationSafety
-    output_key: medication_safety
-    hard_requirements: [findings, medications_reviewed, reviewed]
 
-  - skill_id: yaobi.formula_design
-    version: 3.0.0
-    description: 候选治法与方剂设计
-    allowed_roles: [physician]
-    allowed_tools: [formula_composition_search]
-    output_schema: FormulaCandidate
-    output_key: formula
-    hard_requirements: [formula_name, herbs, treatment_principle]
+    要求：
 
-  - skill_id: yaobi.dose_generation
-    version: 3.0.0
-    description: 逐味剂量生成与放行前安全校验
-    allowed_roles: [physician]
-    allowed_tools: [herb_dose_distribution, pharmacopeia_check, interaction_check, special_population_check]
-    output_schema: PrescriptionDraft
-    output_key: prescription_draft
-    hard_requirements: [herbs, requires_physician_approval, dose_safety]
+    1. primary_pattern 只给一个；candidate_patterns 列出需要鉴别的其它证型。
 
-  - skill_id: yaobi.physician_review
-    version: 3.0.0
-    description: 医师逐味审核与签名放行
-    allowed_roles: [physician]
-    allowed_tools: [physician_review_submit]
-    output_schema: PhysicianReview
-    output_key: physician_review
-    hard_requirements: [approved, problems_checked]
+    2. evidence_for 逐条写明支持主证型的具体表现（原文片段），不要泛泛而谈。
 
-  - skill_id: yaobi.safety_critic
-    version: 3.0.0
-    description: 安全审查与引用校验（终结节点，不调用工具）
-    allowed_tools: []
-    output_schema: SafetyAudit
-    output_key: safety_audit
-    hard_requirements: [checks_run]
+    3. counter_evidence_needed 写明还缺哪些四诊信息才能提高把握——这是下一轮问诊的依据。
+
+    4. 信息不足时 primary_pattern 写"待辨证"，不要硬凑。'
+  autonomous: true
+- skill_id: yaobi.expert_case_reasoning
+  version: 3.2.0
+  description: 相似病例与反例检索
+  allowed_tools:
+  - similar_case_search
+  - counterexample_case_search
+  - expert_practice_profile
+  - patient_timeline_search
+  output_schema: ExpertCaseEvidence
+  output_key: expert_cases
+  hard_requirements:
+  - similar
+  - limitation
+  autonomous: true
+  instructions: '尚未从授权专家病例库生成经验画像。运行 `python -m yaobi_harness skill build-expert --xlsx <授权文件> --merge`
+    后，本技能的 instructions 会被语料挖掘出的专家经验替换。
+
+
+    在此之前：先调用 expert_practice_profile 查看语料概览，再检索相似病例与反例，如实说明经验强度；例数不足时必须明说。不要输出克数。'
+- skill_id: yaobi.medication_safety
+  version: 3.1.0
+  description: 现有西药相互作用、禁忌与围术期风险筛查
+  allowed_tools:
+  - drug_interaction_check
+  - drug_label_lookup
+  - drug_normalize
+  forbidden_tools:
+  - formula_composition_search
+  - herb_dose_distribution
+  - physician_review_submit
+  output_schema: MedicationSafety
+  output_key: medication_safety
+  hard_requirements:
+  - findings
+  - medications_reviewed
+  - reviewed
+- skill_id: yaobi.formula_design
+  version: 3.2.0
+  description: 候选治法与方剂设计
+  allowed_roles:
+  - physician
+  allowed_tools:
+  - formula_composition_search
+  output_schema: FormulaCandidate
+  output_key: formula
+  hard_requirements:
+  - formula_name
+  - herbs
+  - treatment_principle
+  instructions: '先用 formula_composition_search 取候选方，再结合证型与专家经验决定加减。
+
+
+    要求：
+
+    1. herbs 只列药名字符串数组，**绝对不要出现克数或剂量单位**——剂量由独立链路处理。
+
+    2. treatment_principle 用治法术语（如补益肝肾、活血通络）。
+
+    3. rationale 说明君臣佐使思路与加减理由。
+
+    4. 不要使用十八反/十九畏中相反相畏的药对；系统会再次校验并直接阻断。'
+  autonomous: true
+- skill_id: yaobi.dose_generation
+  version: 3.0.0
+  description: 逐味剂量生成与放行前安全校验
+  allowed_roles:
+  - physician
+  allowed_tools:
+  - herb_dose_distribution
+  - pharmacopeia_check
+  - interaction_check
+  - special_population_check
+  output_schema: PrescriptionDraft
+  output_key: prescription_draft
+  hard_requirements:
+  - herbs
+  - requires_physician_approval
+  - dose_safety
+- skill_id: yaobi.physician_review
+  version: 3.0.0
+  description: 医师逐味审核与签名放行
+  allowed_roles:
+  - physician
+  allowed_tools:
+  - physician_review_submit
+  output_schema: PhysicianReview
+  output_key: physician_review
+  hard_requirements:
+  - approved
+  - problems_checked
+- skill_id: yaobi.safety_critic
+  version: 3.0.0
+  description: 安全审查与引用校验（终结节点，不调用工具）
+  allowed_tools: []
+  output_schema: SafetyAudit
+  output_key: safety_audit
+  hard_requirements:
+  - checks_run

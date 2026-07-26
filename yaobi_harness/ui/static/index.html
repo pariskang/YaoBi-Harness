@@ -850,7 +850,35 @@ function tabPlan(d, audit, meta) {
       </div></div>`;
   }).join("");
 
-  return `<div class="sec">
+  const autonomy = Object.entries(audit.autonomy || {});
+  const autonomyBlock = autonomy.length ? `<div class="sec">
+      <h3>自主执行（模型自选工具）</h3>
+      <p class="hint" style="margin-bottom:12px">
+        模型只能看到该技能授权的工具；每次调用仍经能力经纪校验，参数错误可自我纠正且不计入失败证据。</p>
+      ${autonomy.map(([agent, info]) => `
+        <div class="finding">
+          <div class="finding-head">
+            ${badge(info.mode === "llm_tool_loop" ? "模型自主" : "回退规则",
+                    info.mode === "llm_tool_loop" ? "ok" : "warn")}
+            <strong>${esc(agent)}</strong>
+            <span class="badge mono">${esc(info.mode)}</span>
+          </div>
+          <div class="finding-body">
+            ${(info.steps || []).map(st => `<div style="display:flex;gap:8px;align-items:flex-start">
+              <span class="badge mono" style="flex:none">${st.step}</span>
+              <div style="min-width:0">
+                ${st.tool ? `<span class="mono">${esc(st.tool)}(${esc(JSON.stringify(st.arguments || {}))})</span>`
+                          : "<b>作答</b>"}
+                ${st.ok ? badge("成功","ok") : badge("需重试","warn")}
+                ${st.evidence_id ? `<span class="badge mono">${esc(st.evidence_id)}</span>` : ""}
+                ${st.summary ? `<div class="hint">${esc(st.summary)}</div>` : ""}
+              </div></div>`).join("")}
+            ${info.error ? `<div class="hint">回退原因: ${esc(info.error)}</div>` : ""}
+          </div>
+        </div>`).join("")}
+    </div>` : "";
+
+  return `${autonomyBlock}<div class="sec">
       <h3>规划来源</h3>
       <div class="note ${meta.planner_mode === "llm" ? "n-info" : "n-mute"}"><span class="ico">◎</span><div>
         ${meta.planner_mode === "llm"
@@ -1071,6 +1099,48 @@ async function renderKnowledge() {
           <td>${s.commercial_ok ? badge("可","ok") : badge("否","warn")}</td>
           <td>${s.enabled ? badge("启用","ok") : `${badge("禁用","mute")}<br><span class="hint mono">${esc(s.reason)}</span>`}</td>
         </tr>`).join("")}</tbody></table></div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:24px">
+      <div class="card-head"><h2>技能</h2>
+        <span class="sub">既是能力授权，也是模型执行的规程</span></div>
+      <div class="card-body"><div class="tbl-wrap"><table>
+        <thead><tr><th>技能</th><th>用途</th><th>授权工具</th><th>执行方式</th></tr></thead>
+        <tbody>${(BOOT.skills || []).map(sk => `<tr>
+          <td class="mono">${esc(sk.skill_id)}</td>
+          <td>${esc(sk.description)}</td>
+          <td>${(sk.tools || []).map(t => `<span class="badge mono">${esc(t)}</span>`).join(" ") ||
+               "<span class='hint'>无（不得调用任何工具）</span>"}</td>
+          <td>${sk.autonomous ? badge("模型自主","accent") : badge("确定性","mute")}</td>
+        </tr>`).join("")}</tbody></table></div>
+        <p class="hint" style="margin-top:12px">
+          标记为「模型自主」的技能会以工具调用循环执行：模型只看得到该技能授权的工具，
+          输出必须通过 schema 校验，且禁止出现任何剂量数值——违反即整体回退确定性逻辑。</p>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:24px">
+      <div class="card-head"><h2>专家经验语料</h2>
+        <span class="sub">${BOOT.expert?.total_cases || 0} 例</span></div>
+      <div class="card-body">
+        ${(BOOT.expert?.total_cases || 0) === 0
+          ? `<div class="note n-warn"><span class="ico">▲</span><div>
+              <b>未加载专家病例库。</b>启动时加 <span class="mono">--xlsx &lt;授权文件&gt;</span>；
+              再运行 <span class="mono">python -m yaobi_harness skill build-expert --xlsx &lt;文件&gt; --merge</span>
+              可把语料挖掘成技能，让专家经验进入模型推理。</div></div>`
+          : `<div class="tbl-wrap"><table>
+              <thead><tr><th>证型</th><th>例数</th><th>可靠性</th><th>核心药</th></tr></thead>
+              <tbody>${(BOOT.expert.patterns || []).map(pt => `<tr>
+                <td><b>${esc(pt.pattern)}</b></td>
+                <td class="mono">${pt.n_cases}</td>
+                <td>${pt.reliable ? badge("≥3例","ok") : badge("样本不足","warn")}</td>
+                <td>${(pt.core_herbs || []).join("、")}</td></tr>`).join("")}</tbody></table></div>
+             <p class="hint" style="margin-top:12px">
+               随访：${BOOT.expert.followup?.distinct_patients || 0} 名假名患者，
+               ${BOOT.expert.followup?.patients_with_followup || 0} 名有复诊。
+               ${esc(BOOT.expert.limitations || "")}<br>
+               剂量统计不进入推理提示，仅供确定性剂量链路使用。</p>`}
+      </div>
     </div>
 
     <div class="card">

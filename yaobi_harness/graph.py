@@ -63,7 +63,7 @@ class YaobiGraphRunner:
             "CriticAgent": CriticAgent(self.llm),
             # Registered for skill/output-contract lookup only; the planner is
             # not in AGENT_CATALOG so it can never be scheduled as a task.
-            "PlannerAgent": PlannerAgent(self.llm),
+            "PlannerAgent": PlannerAgent(self.llm, self.skill_registry),
         }
 
     # ----------------------------------------------------------------- plumbing
@@ -124,7 +124,7 @@ class YaobiGraphRunner:
         self._checkpoint(state, "IntakeAgent")
 
     def _plan(self, state: ClinicalRunState) -> None:
-        PlannerAgent(self.llm).run(state)
+        PlannerAgent(self.llm, self.skill_registry).run(state)
         self._validate_output(state, "PlannerAgent")
         self._checkpoint(state, "PlannerAgent")
 

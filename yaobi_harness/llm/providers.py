@@ -140,7 +140,7 @@ class OpenAICompatibleClient:
                     arguments = json.loads(arguments)
                 except ValueError:
                     arguments = {"_raw": arguments}
-            calls.append(ToolCall(str(function.get("name", "")), arguments or {}))
+            calls.append(ToolCall(str(function.get("name", "")), arguments or {}, str(call.get("id", ""))))
         usage = data.get("usage") or {}
         return LLMResponse(
             text=text,

@@ -39,9 +39,15 @@ AGENT_CATALOG: dict[str, AgentSpec] = {
         "UrgentCareAgent", "yaobi.urgent_triage", "急症鉴别、即时行动与转运建议",
         ("emergency_resource_lookup", "clinical_guideline_search"), risk_modes=("urgent",),
     ),
-    "BiomedicalAgent": AgentSpec("BiomedicalAgent", "yaobi.biomedical_differential", "西医鉴别诊断与查体/影像建议", ("clinical_guideline_search",)),
+    "BiomedicalAgent": AgentSpec(
+        "BiomedicalAgent", "yaobi.biomedical_differential", "西医鉴别诊断与查体/影像建议",
+        ("clinical_guideline_search", "drug_label_lookup"),
+    ),
     "TCMPatternAgent": AgentSpec("TCMPatternAgent", "yaobi.tcm_pattern", "中医辨证与反证需求", ("tcm_pattern_knowledge_search",)),
-    "ExpertCaseAgent": AgentSpec("ExpertCaseAgent", "yaobi.expert_case_reasoning", "相似病例与反例检索", ("similar_case_search", "counterexample_case_search")),
+    "ExpertCaseAgent": AgentSpec(
+        "ExpertCaseAgent", "yaobi.expert_case_reasoning", "专家经验画像、相似病例与反例的综合推理",
+        ("similar_case_search", "counterexample_case_search", "expert_practice_profile", "patient_timeline_search"),
+    ),
     "MedicationSafetyAgent": AgentSpec(
         "MedicationSafetyAgent", "yaobi.medication_safety", "现有西药相互作用、禁忌与围术期风险筛查",
         ("drug_interaction_check", "drug_label_lookup", "drug_normalize"),
@@ -168,7 +174,7 @@ PLANNER_SYSTEM_PROMPT = """你是骨科临床决策系统的规划器。你只�
 ]}}"""
 
 
-def build_planner_prompt(state: ClinicalRunState) -> list[dict[str, str]]:
+def build_planner_prompt(state: ClinicalRunState, skill_registry: Any | None = None) -> list[dict[str, str]]:
     catalog = [
         {
             "agent": spec.name,
@@ -190,6 +196,9 @@ def build_planner_prompt(state: ClinicalRunState) -> list[dict[str, str]]:
         "missing_information": state.missing_information,
         "known_facts": {k: v for k, v in state.facts.items() if k != "raw"},
         "agent_catalog": catalog,
+        # What each skill is for, so the planner reasons about capabilities
+        # rather than guessing from agent names alone.
+        "skill_catalog": skill_registry.catalog(state.role) if skill_registry is not None else [],
         "loop_index": state.loop_index,
     }
     import json
@@ -230,8 +239,9 @@ class PlannerAgent:
     name = "PlannerAgent"
     skill_id = "yaobi.planning"
 
-    def __init__(self, llm: Any | None = None) -> None:
+    def __init__(self, llm: Any | None = None, skill_registry: Any | None = None) -> None:
         self.llm = llm
+        self.skill_registry = skill_registry
 
     def run(self, state: ClinicalRunState) -> ClinicalRunState:
         fallback = rule_plan(state)
@@ -269,7 +279,8 @@ class PlannerAgent:
         if not state.budget.reserve_llm():
             return [], "llm_budget_exhausted"
         try:
-            response = self.llm.chat(build_planner_prompt(state), temperature=0.0, max_tokens=1200, response_format_json=True)
+            response = self.llm.chat(build_planner_prompt(state, self.skill_registry),
+                                     temperature=0.0, max_tokens=1200, response_format_json=True)
         except (LLMError, Exception) as exc:  # noqa: BLE001 - a failed planner must never fail the run
             state.warn(f"LLM 规划调用失败，已回退默认计划: {exc!r}")
             return [], f"llm_error:{type(exc).__name__}"

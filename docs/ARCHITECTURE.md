@@ -8,8 +8,8 @@
    └───────────────────────────┬────────────────────────────┘
                 cognition (replaceable, advisory)
    ┌────────────────────────────────────────────────────────┐
-   │ PlannerAgent(LLM)  semantic red-flag screen            │
-   │ follow-up questions  adversarial critic                │
+   │ PlannerAgent(LLM)   ReAct tool loop per autonomous skill│
+   │ semantic red-flag screen  questions  adversarial critic │
    └───────────────────────────┬────────────────────────────┘
                                │  proposals only
    ┌───────────────────────────▼────────────────────────────┐
@@ -68,7 +68,13 @@
 | Red flags | add signals | clear or downgrade a rule-based hit |
 | Questions | rewrite/reorder | exceed `Budget.max_questions` |
 | Critique | add issues (`block`/`warn`) | clear an existing safety issue or change release status directly |
+| Tool use | choose tools and arguments from its skill's set, self-correct | see or reach a tool outside the skill; skip the broker |
+| Outputs | any shape the skill's schema allows | violate the schema; emit a gram value |
 | Doses | nothing | anything |
+
+Execution autonomy is documented in [AUTONOMY.md](AUTONOMY.md); a skill's
+`autonomous: true` flag is what enables it, so the decision lives in the
+reviewed policy file rather than in code.
 
 Any invalid proposal is discarded wholesale and the deterministic path is used;
 the rejection is recorded in `state.warnings` and `outputs.plan.note`. Provider

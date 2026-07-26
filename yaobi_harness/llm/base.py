@@ -37,6 +37,8 @@ class ToolSpec:
 class ToolCall:
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
+    #: Provider-assigned id; echoed back on the matching ``role: "tool"`` message.
+    id: str = ""
 
 
 @dataclass

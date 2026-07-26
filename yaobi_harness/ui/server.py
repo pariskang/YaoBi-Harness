@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,10 +52,15 @@ class ConsoleService:
         llm_provider: str | None = None,
         llm_model: str | None = None,
         checkpoint_dir: str | Path | None = None,
+        skill_manifest: str | Path | None = None,
+        access_token: str | None = None,
     ) -> None:
         self.knowledge_store_path = str(knowledge_store_path) if knowledge_store_path else None
         self.xlsx_path = str(xlsx_path) if xlsx_path else None
         self.checkpoint_dir = str(checkpoint_dir) if checkpoint_dir else None
+        self.skill_manifest = str(skill_manifest) if skill_manifest else None
+        #: When set, every request must present it. Required for public tunnels.
+        self.access_token = access_token or None
         self.llm_error: str | None = None
         self._lock = threading.Lock()
 
@@ -88,8 +94,20 @@ class ConsoleService:
         except LicenseError as exc:  # pragma: no cover - misconfiguration path
             sources, policy_info, policy_error = [], {}, str(exc)
 
+        skills = []
+        try:
+            from ..skills.loader import SkillRegistry
+
+            manifest = self.skill_manifest or (Path(__file__).parent.parent / "skills" / "manifest.yaml")
+            skills = SkillRegistry.from_file(manifest).catalog()
+        except Exception as exc:  # noqa: BLE001 - chrome must render even on a bad manifest
+            logger.warning("skill catalog unavailable: %s", exc)
+
         return {
             "llm": {**describe_client(self.llm), "error": self.llm_error},
+            "skills": skills,
+            "expert": self.expert_summary(),
+            "auth_required": bool(self.access_token),
             "knowledge": {
                 "configured": self.knowledge is not None,
                 "path": self.knowledge_store_path,
@@ -118,13 +136,14 @@ class ConsoleService:
         state.budget = Budget(
             max_loops=int(payload.get("max_loops", 3)),
             max_tool_calls=int(payload.get("max_tool_calls", 24)),
-            max_llm_calls=int(payload.get("max_llm_calls", 12)),
+            max_llm_calls=int(payload.get("max_llm_calls", 40)),
         )
 
         use_llm = bool(payload.get("use_llm", True))
         runner = YaobiGraphRunner(
             self.tools,
             checkpoint_dir=self.checkpoint_dir,
+            skill_manifest=self.skill_manifest,
             llm=self.llm if use_llm else NullLLMClient(),
         )
         # One run at a time: the shared ToolRegistry and circuit breaker are not
@@ -139,6 +158,23 @@ class ConsoleService:
         if not medications:
             raise ValueError("请至少填写一种药物")
         return self.tools.drug_interaction_check(medications, conditions).data
+
+    def expert_summary(self) -> dict[str, Any]:
+        """What the loaded expert corpus actually contains."""
+        try:
+            profile = self.tools.expert_profile()
+        except Exception as exc:  # noqa: BLE001
+            return {"total_cases": 0, "error": str(exc)}
+        return {
+            "total_cases": profile.total_cases,
+            "patterns": [
+                {"pattern": p.pattern, "n_cases": p.n_cases, "reliable": p.reliable,
+                 "core_herbs": [h.herb for h in p.core_herbs[:8]]}
+                for p in sorted(profile.patterns.values(), key=lambda x: -x.n_cases)[:8]
+            ],
+            "followup": profile.followup,
+            "limitations": profile.limitations,
+        }
 
     def rules(self) -> dict[str, Any]:
         return {
@@ -201,6 +237,34 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         logger.debug("%s - %s", self.address_string(), fmt % args)
 
+    # ------------------------------------------------------------------- auth
+    def _authorized(self) -> bool:
+        """Check the access token when one is configured.
+
+        Accepted from a bearer header, an ``X-Yaobi-Token`` header, a ``?t=``
+        query parameter (so a shared link works in one click) or the cookie the
+        page sets from that parameter.
+        """
+        expected = getattr(self.service, "access_token", None)
+        if not expected:
+            return True
+        import urllib.parse
+
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer ") and secrets.compare_digest(header[7:].strip(), expected):
+            return True
+        if secrets.compare_digest((self.headers.get("X-Yaobi-Token") or "").strip(), expected):
+            return True
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if any(secrets.compare_digest(v, expected) for v in query.get("t", [])):
+            return True
+        cookie = self.headers.get("Cookie") or ""
+        for part in cookie.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "yaobi_token" and secrets.compare_digest(value, expected):
+                return True
+        return False
+
     # ------------------------------------------------------------------ helpers
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -234,6 +298,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     # -------------------------------------------------------------------- verbs
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
+        if not self._authorized():
+            return self._error(401, "缺少或错误的访问令牌；请使用启动时打印的带 ?t= 的链接")
         if path in ("/", "/index.html"):
             page = (STATIC_DIR / "index.html").read_bytes()
             return self._send(200, page, "text/html; charset=utf-8")
@@ -247,6 +313,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if not self._authorized():
+            return self._error(401, "缺少或错误的访问令牌")
         try:
             payload = self._read_json()
         except ValueError as exc:
@@ -283,15 +351,25 @@ def serve(
     llm_provider: str | None = None,
     llm_model: str | None = None,
     checkpoint_dir: str | Path | None = None,
+    skill_manifest: str | Path | None = None,
     open_browser: bool = False,
+    public: bool = False,
+    access_token: str | None = None,
+    ngrok_authtoken: str | None = None,
+    ngrok_region: str | None = None,
 ) -> None:
-    """Run the console until interrupted."""
+    """Run the console until interrupted, optionally behind a public tunnel."""
+    from .tunnel import TunnelError, banner, new_token, open_ngrok
+
+    token = access_token or (new_token() if public else None)
     service = ConsoleService(
         knowledge_store_path=knowledge_store,
         xlsx_path=xlsx,
         llm_provider=llm_provider,
         llm_model=llm_model,
         checkpoint_dir=checkpoint_dir,
+        skill_manifest=skill_manifest,
+        access_token=token,
     )
     httpd = create_server(service, host, port)
     url = f"http://{host}:{port}/"
@@ -299,13 +377,26 @@ def serve(
     print(f"  LLM      : {describe_client(service.llm)}")
     print(f"  知识库   : {service.knowledge_store_path or '未配置（指南/药典证据为占位数据）'}")
     print("  按 Ctrl+C 停止")
+    tunnel = None
+    if public:  # pragma: no cover - network path
+        try:
+            tunnel = open_ngrok(port, token=token, authtoken=ngrok_authtoken, region=ngrok_region)
+            print(banner(tunnel, local_url=url))
+        except TunnelError as exc:
+            print(f"公网隧道未开启: {exc}")
+            print("控制台仍在本地可用。")
+    elif token:
+        print(f"  访问令牌 : {token}\n  带令牌链接: {url}?t={token}")
+
     if open_browser:  # pragma: no cover - convenience path
         import webbrowser
 
-        webbrowser.open(url)
+        webbrowser.open(f"{url}?t={token}" if token else url)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:  # pragma: no cover
         print("\n已停止")
     finally:
+        if tunnel is not None:  # pragma: no cover
+            tunnel.close()
         httpd.server_close()

@@ -3,12 +3,15 @@
 Yaobi-Harness 是一个 **证据受控的骨科/腰痹多智能体临床决策支持骨架**。V0.1 在 V0.0 安全骨架的基础上补齐了
 自主规划层和 LLM 接入，同时保持"认知层可换、控制层不可绕过"的分层：
 
-* **认知层**：可由 LLM 驱动的规划、语义红旗补充、追问生成与对抗式安全审查。
+* **认知层**：LLM 驱动的**规划**与**执行**——鉴别诊断、辨证、专家经验综合、方剂组成均由模型
+  自主选择工具、自主决定参数、自我纠错并绑定证据（ReAct 工具调用循环）。
 * **控制层**：能力经纪（角色/风险/技能/熔断/预算）、证据台账与等级、逐断言引用校验、放行状态机、医师审核闭环。
 
-LLM 在本系统中是**只能加安全、不能减安全**的顾问角色：它可以提议计划、追加红旗、追加安全异议，但不能发明
-Agent、不能触及技能未授权的工具、不能清除规则层命中的风险信号、不能生成剂量。未配置模型时，系统以完全确定性的
-规则路径运行。
+LLM 在本系统中是**只能加安全、不能减安全**的执行者：它可以规划、选工具、下结论，但看不到技能未授权的工具、
+不能发明 Agent、不能清除规则层命中的风险信号、**永远不能生成剂量**。任何一步越界（越权/输出不合 schema/
+出现克数/预算或步数耗尽）都会**整体回退**到确定性逻辑，而不是带病放行。未配置模型时，全流程确定性运行。
+
+自主性的确切边界见 [docs/AUTONOMY.md](docs/AUTONOMY.md)。
 
 > 严禁把原始 Excel 身份数据提交、打包或直接返回给模型。病例检索只能使用脱敏 ETL 后的结构化字段；含剂量方剂只能以
 > `draft_for_physician` 作为医师草案，未逐味审核签名不得发布为最终处方。
@@ -27,7 +30,16 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 三个视图：**诊疗运行**（完整病例）、**用药速查**（只做相互作用筛查）、
 **知识库**（来源目录、许可状态、规则包全文）。后端是普通 JSON API，可被其他前端复用。
 
-> ⚠️ 控制台**没有身份认证**，默认只监听 `127.0.0.1`；不要在没有自有认证代理的情况下暴露到共享网络。
+需要分享给同事评审时可映射成公开链接（会**强制**生成访问令牌并拼进 URL）：
+
+```bash
+export NGROK_AUTHTOKEN=...        # https://dashboard.ngrok.com/get-started/your-authtoken
+pip install pyngrok
+python -m yaobi_harness ui --public --knowledge-store ./knowledge.db
+```
+
+> ⚠️ 公网链接是**演示/评审链接，不是临床部署**：令牌只是演示级门禁，没有逐用户身份、没有访问审计、
+> 没有院内网络边界。**不要在公开实例里输入任何真实患者可识别信息。** 默认仍只监听 `127.0.0.1`。
 
 **Colab**：`notebooks/Yaobi_Harness_Colab.ipynb` 是完整走查（安装自检 → 确定性运行 → 骨科规则包 →
 实时构建知识库 → 授权药典如何改变放行 → 接入 LLM → 内嵌控制台），可直接在 Colab 打开运行。
@@ -82,6 +94,23 @@ python -m yaobi_harness run --llm-provider poe --llm-model Claude-Sonnet-4.5 --c
 未设置 `YAOBI_LLM_PROVIDER` 时使用 `NullLLMClient`，全流程确定性运行；显式指定了 provider 但凭据不全会**直接报错**，
 避免配置错误伪装成"正常的规则输出"。
 
+## 把专家 xlsx 变成技能
+
+专家病例不该只用于"检索相似病例"。`skill build-expert` 把语料挖掘成**技能**——在本系统里技能同时是
+能力经纪强制执行的**权限授权**，和模型执行时读取的**规程说明**：
+
+```bash
+python -m yaobi_harness skill build-expert --xlsx ./authorized.xlsx --merge
+python -m yaobi_harness skill show yaobi.expert_case_reasoning
+python -m yaobi_harness run --skill-manifest yaobi_harness/skills/manifest.yaml --complaint "..."
+```
+
+按证型挖掘核心药（出现率 ≥60%）、随证加减、常用治法、合并西药、常做检查、合并症、反例例数与复诊轨迹。
+生成的技能直接**替换**内置的 `yaobi.expert_case_reasoning`，因此重新生成即升级已有 Agent。
+
+* 只输出聚合统计，绝不含个体自由文本；低于 `min_support` 的取值被抑制；生成前跑 PHI 自检。
+* **剂量不进入技能说明**——推理 Agent 禁止输出克数，剂量只经 `herb_dose_distribution` 走确定性链路。
+
 ## 接入授权知识库
 
 指南、药典与相互作用数据不随仓库分发——仓库只提供连接器和**在写入时强制执行的许可模型**。
@@ -125,12 +154,12 @@ python -m yaobi_harness run --role physician --knowledge-store ./knowledge.db --
 
 ## 仍未完成
 
-LangGraph 原生 interrupt/resume、医师审批 UI、多轮问诊状态机、中文指南的结构化推荐抽取、
+LangGraph 原生 interrupt/resume、医师审批 UI、**模型主动发起的多轮问诊**、中文指南的结构化推荐抽取、
 大规模对抗性安全评测与红旗召回率基线仍未实现。内置骨科规则包不能替代完整的相互作用数据库，
 且须经本机构药师/医师复核后启用。**本项目不能对外宣称为临床可用系统。**
 
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 148 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 200 个用例，无需 pytest 与网络
 ```

@@ -18,6 +18,7 @@ from ..safety import red_flags
 from ..state import NON_RELEASABLE_LEVELS, ClinicalRunState
 from ..tools import CapabilityBroker, ToolRegistry, ToolResult, herbs_in
 from . import cognition
+from .toolloop import ToolLoop
 
 #: Patient-facing names for the internal red-flag signal keys. Without these a
 #: raw Python list repr leaks into the text a patient reads.
@@ -71,12 +72,61 @@ class Agent(Protocol):
 class BaseAgent:
     name = "BaseAgent"
     skill_id = ""
+    #: Schema the model must satisfy when this agent runs autonomously.
+    output_schema = ""
+    #: Where this agent writes its result in ``state.outputs``.
+    output_key = ""
 
     def __init__(self, llm: Any | None = None) -> None:
         self.llm = llm
 
     def run(self, state: ClinicalRunState, tools: ToolRegistry, broker: CapabilityBroker) -> ClinicalRunState:
         raise NotImplementedError
+
+    # ------------------------------------------------------------- autonomy
+    def skill_spec(self, broker: CapabilityBroker) -> Any | None:
+        registry = getattr(broker, "skill_registry", None)
+        return registry.specs.get(self.skill_id) if registry else None
+
+    def autonomous(
+        self,
+        state: ClinicalRunState,
+        tools: ToolRegistry,
+        broker: CapabilityBroker,
+        objective: str,
+        context: dict[str, Any],
+    ) -> Any | None:
+        """Try the model-driven tool loop; return None to use the fallback.
+
+        The skill decides whether this is even attempted (``autonomous: true``),
+        which keeps the choice in the reviewed policy file rather than in code.
+        """
+        spec = self.skill_spec(broker)
+        if spec is None or not getattr(spec, "autonomous", False):
+            return None
+        loop = ToolLoop(
+            self.llm, tools, broker, state,
+            agent_name=self.name, skill_id=self.skill_id, skill_spec=spec,
+        )
+        if not loop.available:
+            return None
+        result = loop.run(objective, context, spec.output_schema or self.output_schema)
+        state.outputs.setdefault("autonomy", {})[self.name] = result.to_dict()
+        return result if result.ok else None
+
+    def bind_autonomous_output(self, state: ClinicalRunState, result: Any, kind: str) -> list[str]:
+        """Record the model's answer, citing the evidence it actually gathered."""
+        evidence_ids = result.citations or result.evidence_ids
+        output = dict(result.output or {})
+        output["_produced_by"] = "llm_tool_loop"
+        output["_evidence_ids"] = evidence_ids
+        state.outputs[self.output_key] = output
+        state.trace(
+            self.name, "autonomous_run",
+            output_summary=f"{len(result.steps)}步/{len(result.evidence_ids)}次取证",
+            evidence_ids=evidence_ids,
+        )
+        return evidence_ids
 
 
 def record_tool(state: ClinicalRunState, result: ToolResult) -> str:
@@ -249,10 +299,18 @@ class UrgentCareAgent(BaseAgent):
 # -------------------------------------------------------------------- routine
 
 class BiomedicalAgent(BaseAgent):
+    """Western differential diagnosis.
+
+    Runs as a model-driven tool loop when its skill is marked autonomous; the
+    hardcoded list below is the fallback, not the product.
+    """
+
     name = "BiomedicalAgent"
     skill_id = "yaobi.biomedical_differential"
+    output_schema = "BiomedicalAssessment"
+    output_key = "biomedical"
 
-    DIFFERENTIALS = [
+    FALLBACK_DIFFERENTIALS = [
         "非特异性腰痛/腰肌劳损",
         "腰椎间盘突出伴神经根病",
         "腰椎管狭窄",
@@ -263,20 +321,37 @@ class BiomedicalAgent(BaseAgent):
     ]
 
     def run(self, state, tools, broker):
-        result = tools.call(broker, "clinical_guideline_search", topic="low back pain differential")
-        evidence_id = record_tool(state, result)
-        if not require_ok(state, result, "biomedical_guideline"):
+        result = self.autonomous(
+            state, tools, broker,
+            objective="对本例做西医鉴别诊断，并给出下一步查体与检查建议。先检索指南取证，再作答。",
+            context={
+                "chief_complaint": state.complaint,
+                "red_flag_screening": state.outputs.get("intake", {}).get("screening", {}),
+                "known_facts": {k: v for k, v in state.facts.items() if k != "physician_review"},
+                "missing_information": state.missing_information,
+            },
+        )
+        if result is not None:
+            evidence_ids = self.bind_autonomous_output(state, result, "differential")
+            for item in state.outputs[self.output_key].get("differentials", [])[:10]:
+                state.add_claim("differential", str(item), evidence_ids, confidence=0.5, origin="llm")
             return state
-        state.outputs["biomedical"] = {
-            "differentials": self.DIFFERENTIALS,
+
+        guideline = tools.call(broker, "clinical_guideline_search", topic="low back pain differential")
+        evidence_id = record_tool(state, guideline)
+        if not require_ok(state, guideline, "biomedical_guideline"):
+            return state
+        state.outputs[self.output_key] = {
+            "differentials": self.FALLBACK_DIFFERENTIALS,
             "exam_advice": [
                 "神经定位体检（肌力MRC分级、感觉平面、腱反射、直腿抬高/股神经牵拉）",
                 "红旗或持续神经根症状时线下影像（X线/MRI按适应证）",
                 "记录VAS疼痛评分与ODI功能评分作为随访基线",
             ],
-            "evidence_note": "当前指南源为占位数据，鉴别列表属模型/规则推理，未获授权指南背书",
+            "evidence_note": "规则回退路径：鉴别列表为固定清单，未经模型针对本例推理",
+            "_produced_by": "rule_fallback",
         }
-        for item in self.DIFFERENTIALS:
+        for item in self.FALLBACK_DIFFERENTIALS:
             state.add_claim("differential", item, [evidence_id], confidence=0.4)
         state.trace(self.name, "differential", evidence_ids=[evidence_id])
         return state
@@ -285,18 +360,36 @@ class BiomedicalAgent(BaseAgent):
 class TCMPatternAgent(BaseAgent):
     name = "TCMPatternAgent"
     skill_id = "yaobi.tcm_pattern"
+    output_schema = "PatternAssessment"
+    output_key = "tcm_pattern"
 
     def run(self, state, tools, broker):
-        result = tools.call(broker, "tcm_pattern_knowledge_search", text=state.complaint)
-        evidence_id = record_tool(state, result)
-        if not require_ok(state, result, "tcm_pattern"):
+        result = self.autonomous(
+            state, tools, broker,
+            objective="基于主诉与四诊信息辨证，给出主要证型、候选证型、支持证据与仍需补充的反证。",
+            context={
+                "chief_complaint": state.complaint,
+                "four_diagnoses": state.facts.get("中医四诊") or state.facts.get("four_diagnoses"),
+                "known_facts": {k: v for k, v in state.facts.items() if k != "physician_review"},
+            },
+        )
+        if result is not None:
+            evidence_ids = self.bind_autonomous_output(state, result, "pattern")
+            primary = state.outputs[self.output_key].get("primary_pattern", "")
+            state.add_claim("pattern", f"主要证型倾向: {primary}", evidence_ids, confidence=0.5, origin="llm")
             return state
-        patterns = result.data["patterns"]
-        state.outputs["tcm_pattern"] = {
+
+        knowledge = tools.call(broker, "tcm_pattern_knowledge_search", text=state.complaint)
+        evidence_id = record_tool(state, knowledge)
+        if not require_ok(state, knowledge, "tcm_pattern"):
+            return state
+        patterns = knowledge.data["patterns"]
+        state.outputs[self.output_key] = {
             "primary_pattern": patterns[0],
             "candidate_patterns": patterns,
             "counter_evidence_needed": ["寒热表现", "舌脉", "疼痛固定或游走", "乏力与夜痛"],
-            "confidence": 0.35 if patterns == ["待辨证"] else 0.5,
+            "reasoning": "规则回退路径：按关键词匹配，未经四诊合参推理",
+            "_produced_by": "rule_fallback",
         }
         state.add_claim("pattern", f"主要证型倾向: {patterns[0]}", [evidence_id], confidence=0.4)
         state.trace(self.name, "pattern", evidence_ids=[evidence_id])
@@ -304,20 +397,56 @@ class TCMPatternAgent(BaseAgent):
 
 
 class ExpertCaseAgent(BaseAgent):
+    """Reasons over the expert corpus instead of just retrieving from it.
+
+    When the corpus-mined skill is active this agent queries the practice
+    profile, similar cases and counterexamples, then synthesises what the expert
+    habitually does for this presentation — which is the part that actually
+    transfers expertise. Without a model it falls back to plain retrieval.
+    """
+
     name = "ExpertCaseAgent"
     skill_id = "yaobi.expert_case_reasoning"
+    output_schema = "ExpertCaseEvidence"
+    output_key = "expert_cases"
 
     def run(self, state, tools, broker):
+        pattern = state.outputs.get("tcm_pattern", {}).get("primary_pattern")
+        result = self.autonomous(
+            state, tools, broker,
+            objective=(
+                "结合专家经验画像、相似病例与反例，说明这位专家对本类病例的惯常处理倾向，"
+                "并明确指出经验的例数与局限。不要给出任何克数。"
+            ),
+            context={
+                "chief_complaint": state.complaint,
+                "tcm_pattern": pattern,
+                "biomedical_differentials": state.outputs.get("biomedical", {}).get("differentials", []),
+                "known_facts": {k: v for k, v in state.facts.items() if k != "physician_review"},
+            },
+        )
+        if result is not None:
+            evidence_ids = self.bind_autonomous_output(state, result, "expert_case")
+            output = state.outputs[self.output_key]
+            output.setdefault("limitation", "已脱敏的单一专家经验库，不代表因果疗效证据")
+            practice = output.get("expert_practice")
+            if practice:
+                state.add_claim("expert_practice", str(practice)[:200], evidence_ids, confidence=0.5, origin="llm")
+            return state
+
         similar = tools.call(broker, "similar_case_search", query=state.complaint)
         counter = tools.call(broker, "counterexample_case_search", query=state.complaint)
-        evidence_ids = [record_tool(state, similar), record_tool(state, counter)]
+        profile = tools.call(broker, "expert_practice_profile", pattern=pattern)
+        evidence_ids = [record_tool(state, similar), record_tool(state, counter), record_tool(state, profile)]
         if not (similar.ok and counter.ok):
             state.fail_closed("专家病例检索失败")
             return state
-        state.outputs["expert_cases"] = {
+        state.outputs[self.output_key] = {
             "similar": similar.data.get("cases", []),
             "counterexamples": counter.data.get("cases", []),
+            "expert_practice": profile.data if profile.ok else {},
             "limitation": "已脱敏的单一专家经验库，不代表因果疗效证据",
+            "_produced_by": "rule_fallback",
         }
         state.trace(self.name, "retrieve_cases", evidence_ids=evidence_ids)
         return state
@@ -385,33 +514,91 @@ class MedicationSafetyAgent(BaseAgent):
 
 
 class FormulaAgent(BaseAgent):
+    """Proposes a candidate formula. Never proposes a dose.
+
+    An autonomously chosen herb list is still gated by 十八反/十九畏 here and by
+    the dose pipeline downstream: an invented herb has no expert-case dose
+    support and no authorised range, so it can never reach a dosed draft.
+    """
+
     name = "FormulaAgent"
     skill_id = "yaobi.formula_design"
+    output_schema = "FormulaCandidate"
+    output_key = "formula"
 
     def run(self, state, tools, broker):
         pattern = state.outputs.get("tcm_pattern", {}).get("primary_pattern", "气血痹阻证")
-        result = tools.call(broker, "formula_composition_search", pattern=pattern)
-        evidence_id = record_tool(state, result)
-        if not require_ok(state, result, "formula_search"):
-            return state
-        herbs = result.data["herbs"]
+        result = self.autonomous(
+            state, tools, broker,
+            objective=(
+                f"针对证型「{pattern}」给出候选治法与方剂组成（只列药名，绝对不要给克数），"
+                "并说明配伍思路。先检索候选方组成再作答。"
+            ),
+            context={
+                "tcm_pattern": state.outputs.get("tcm_pattern", {}),
+                "expert_cases": _trim_expert_cases(state.outputs.get("expert_cases", {})),
+                "chief_complaint": state.complaint,
+            },
+        )
+        herbs: list[str] = []
+        evidence_ids: list[str] = []
+        if result is not None:
+            herbs = herbs_in(result.output.get("herbs", []))
+            evidence_ids = result.citations or result.evidence_ids
+        else:
+            search = tools.call(broker, "formula_composition_search", pattern=pattern)
+            evidence_ids = [record_tool(state, search)]
+            if not require_ok(state, search, "formula_search"):
+                return state
+            herbs = herbs_in(search.data["herbs"])
 
-        # 十八反/十九畏 are absolute: a violating candidate never reaches dosing.
         violations = incompat.check_combination(herbs)
         if violations:
             state.safety_issues += [f"候选方配伍禁忌: {v['detail']}" for v in violations]
             state.release_status = "treatment_advice_only"
-            state.trace(self.name, "formula_blocked", evidence_ids=[evidence_id], output_summary="配伍禁忌")
+            state.trace(self.name, "formula_blocked", evidence_ids=evidence_ids, output_summary="配伍禁忌")
+            return state
+        if not herbs:
+            state.safety_issues.append("候选方为空，无法进入剂量环节")
+            state.release_status = "insufficient_evidence"
             return state
 
-        state.outputs["formula"] = {
-            "formula_name": result.data["formula_name"],
-            "treatment_principle": ["补益肝肾", "活血通络", "祛风除湿"],
-            "herbs": herbs,
-            "combination_check": "十八反/十九畏通过",
-        }
-        state.trace(self.name, "formula_candidates", evidence_ids=[evidence_id])
+        if result is not None:
+            self.bind_autonomous_output(state, result, "formula")
+            output = state.outputs[self.output_key]
+            output["herbs"] = herbs
+            output["combination_check"] = "十八反/十九畏通过"
+            output["unseen_in_expert_corpus"] = _unseen_herbs(tools, herbs)
+        else:
+            state.outputs[self.output_key] = {
+                "formula_name": "独活寄生汤加减候选",
+                "treatment_principle": ["补益肝肾", "活血通络", "祛风除湿"],
+                "herbs": herbs,
+                "combination_check": "十八反/十九畏通过",
+                "_produced_by": "rule_fallback",
+            }
+            state.trace(self.name, "formula_candidates", evidence_ids=evidence_ids)
         return state
+
+
+def _trim_expert_cases(expert_cases: dict[str, Any]) -> dict[str, Any]:
+    """Keep the synthesis, drop the bulky raw case list, before prompting."""
+    return {
+        "expert_practice": expert_cases.get("expert_practice"),
+        "similar_count": len(expert_cases.get("similar", [])),
+        "counterexample_count": len(expert_cases.get("counterexamples", [])),
+        "limitation": expert_cases.get("limitation", ""),
+    }
+
+
+def _unseen_herbs(tools: ToolRegistry, herbs: list[str]) -> list[str]:
+    """Herbs the expert corpus has never used — a flag, not a block."""
+    try:
+        known = {u["herb"] for p in tools.expert_profile().patterns.values()
+                 for u in [h.to_dict() for h in p.core_herbs + p.adjunct_herbs]}
+    except Exception:  # noqa: BLE001 - a profiling failure must not block the run
+        return []
+    return sorted(h for h in herbs if known and h not in known)
 
 
 class DoseAgent(BaseAgent):

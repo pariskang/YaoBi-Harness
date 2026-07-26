@@ -208,6 +208,9 @@ def console_payload(state: ClinicalRunState, role: str | None = None) -> dict[st
                  "evidence_ids": c.evidence_ids, "confidence": c.confidence, "origin": c.origin}
                 for c in state.claims
             ],
+            # Per-agent record of the model-driven tool loop: which tools it
+            # chose, with what arguments, and whether it fell back.
+            "autonomy": state.outputs.get("autonomy", {}),
             "safety_audit": state.outputs.get("safety_audit", {}),
             "safety_issues": state.safety_issues,
             "warnings": state.warnings,

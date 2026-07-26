@@ -91,6 +91,11 @@ class ToolResult:
     is_stub: bool = False
     #: True for transport-style failures that are worth retrying.
     retryable: bool = False
+    #: True when the *caller* got the call wrong (bad or missing arguments,
+    #: unknown tool name). A model can correct these on its next turn, so they
+    #: must not be recorded as tool failures, must not trip the circuit breaker,
+    #: and must not block the run.
+    recoverable: bool = False
 
     def resolved_level(self) -> str:
         if not self.ok:
@@ -225,7 +230,9 @@ class ToolRegistry:
             "drug_interaction_check": self.drug_interaction_check,
             "drug_label_lookup": self.drug_label_lookup,
             "drug_normalize": self.drug_normalize,
+            "expert_practice_profile": self.expert_practice_profile,
         }
+        self._profile = None
 
     # ------------------------------------------------------------- dispatching
     def call(self, broker: CapabilityBroker, name: str, **kwargs: Any) -> ToolResult:
@@ -236,7 +243,7 @@ class ToolRegistry:
             # must not trip the circuit breaker or consume budget.
             return ToolResult(name, False, reason, {"denied_reason": reason}, error=reason)
         if name not in self.tools:
-            return ToolResult(name, False, "unknown_tool", error="unknown_tool")
+            return ToolResult(name, False, "unknown_tool", error="unknown_tool", recoverable=True)
 
         result: ToolResult | None = None
         for attempt in range(self.max_attempts):
@@ -246,12 +253,17 @@ class ToolRegistry:
             else:
                 try:
                     result = self.tools[name](**kwargs)
-                except TypeError as exc:  # bad arguments — never retryable
-                    result = ToolResult(name, False, "tool_bad_arguments", error=repr(exc))
+                except TypeError as exc:
+                    # A caller error, not a tool failure: hand it back so the
+                    # caller (often a model) can fix its arguments and retry.
+                    result = ToolResult(name, False, "tool_bad_arguments", error=repr(exc), recoverable=True)
                 except Exception as exc:  # noqa: BLE001 - surfaced as evidence, never swallowed
                     result = ToolResult(name, False, "tool_exception", error=repr(exc), retryable=True)
             if result.ok:
                 broker.health.record_success(name)
+                return result
+            if result.recoverable:
+                # The tool itself is fine; do not open its circuit.
                 return result
             broker.health.record_failure(name)
             if not result.retryable or attempt == self.max_attempts - 1:
@@ -375,6 +387,39 @@ class ToolRegistry:
             True,
             "假名化反例检索",
             {"cases": cases[:limit]},
+            evidence_level=EvidenceLevel.EXPERT_CASE.value,
+        )
+
+    def expert_profile(self):
+        """Lazily mine the expert practice profile from the loaded corpus."""
+        if self._profile is None:
+            from .expert.profile import build_profile
+
+            self._profile = build_profile(self.case_store.records)
+        return self._profile
+
+    def expert_practice_profile(self, pattern: str | None = None) -> ToolResult:
+        """Aggregate expert habits — core herbs, treatments, investigations.
+
+        This is what turns a case corpus into transferable experience: instead
+        of five raw look-alike cases, an agent gets "in N cases of this pattern
+        the expert used X in M of them, ordered Y, and Z cases worsened".
+        """
+        profile = self.expert_profile()
+        if not profile.total_cases:
+            return ToolResult(
+                "expert_practice_profile", True, "未加载专家病例库",
+                {"total_cases": 0, "patterns": [], "how_to_fix": "运行时传入 --xlsx 或 ToolRegistry(records=...)"},
+                is_stub=True,
+            )
+        brief = profile.brief(pattern)
+        matched = profile.pattern_for(pattern) if pattern else None
+        return ToolResult(
+            "expert_practice_profile",
+            True,
+            f"专家经验画像: {profile.total_cases}例/{len(profile.patterns)}证型"
+            + (f"; 命中证型 {matched.pattern}({matched.n_cases}例)" if matched else ""),
+            {**brief, "requested_pattern": pattern, "matched_pattern": matched.pattern if matched else None},
             evidence_level=EvidenceLevel.EXPERT_CASE.value,
         )
 
@@ -846,6 +891,8 @@ def tool_specs() -> list[ToolSpec]:
                  {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}),
         ToolSpec("patient_timeline_search", "按研究假名ID检索同一患者的历次就诊",
                  {"type": "object", "properties": {"research_patient_id": {"type": "string"}}, "required": ["research_patient_id"]}),
+        ToolSpec("expert_practice_profile", "查询该专家在某证型下的核心用药、治法、常做检查与随访倾向（聚合统计，不含个体文本）",
+                 {"type": "object", "properties": {"pattern": {"type": "string", "description": "证型名，留空则返回语料概览"}}}),
         ToolSpec("formula_composition_search", "按证型检索候选方组成（仅医师角色、非急症）",
                  {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}),
         ToolSpec("herb_dose_distribution", "按证型/年龄分层的专家剂量分布（仅医师角色、非急症）",

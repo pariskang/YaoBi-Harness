@@ -51,8 +51,14 @@ class YaobiGraphRunner:
         skill_dirs: list[str | Path] | None = None,
         interview_loop: Any | None = None,
         journal: Any | None = None,
+        panel_concurrency: int | None = None,
     ) -> None:
         self.tools = tools or ToolRegistry()
+        # Resolved here rather than inside the panel, because the journal's meta
+        # line records the effective value and a replay is only faithful against
+        # a matching one: an unresolved ``None`` in the meta would tell a future
+        # replayer nothing.
+        self.panel_concurrency = panel_concurrency if panel_concurrency else _panel_concurrency()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         manifest = Path(skill_manifest) if skill_manifest else Path(__file__).parent / "skills" / "manifest.yaml"
         # ``discover`` layers every ``SKILL.md`` over the manifest, so the rich
@@ -82,7 +88,7 @@ class YaobiGraphRunner:
                 "llm_model": getattr(base_llm, "model", "none"),
                 "llm_provider": getattr(base_llm, "name", "none"),
                 "llm_available": bool(getattr(base_llm, "available", False)),
-                "panel_concurrency": _panel_concurrency(),
+                "panel_concurrency": self.panel_concurrency,
             })
         self.health = ToolHealth()
         self.agents = {
@@ -93,7 +99,7 @@ class YaobiGraphRunner:
             # continuous rather than reset on each call.
             "InterviewAgent": InterviewAgent(self.llm, loop=interview_loop),
             "VisionAgent": VisionAgent(self.llm),
-            "ConsultPanelAgent": ConsultPanelAgent(self.llm),
+            "ConsultPanelAgent": ConsultPanelAgent(self.llm, concurrency=self.panel_concurrency),
             "OsteoporosisAgent": OsteoporosisAgent(self.llm),
             "UrgentPlannerAgent": UrgentPlannerAgent(self.llm),
             "UrgentCareAgent": UrgentCareAgent(self.llm),

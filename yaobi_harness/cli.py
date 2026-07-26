@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from typing import Any
 
@@ -74,6 +73,8 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--no-vision", action="store_true")
     chat.add_argument("--skill-dir", action="append")
     chat.add_argument("--journal", metavar="PATH", help="record every call for later offline replay")
+    chat.add_argument("--panel-concurrency", type=int, metavar="N",
+                      help="threads for the consult panel (default 4; 1 forces sequential)")
 
     inspect = sub.add_parser("inspect-xlsx", help="summarise a local authorized Excel without returning raw rows")
     inspect.add_argument("path")
@@ -97,6 +98,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ui.add_argument("--ngrok-region")
     ui.add_argument("--no-vision", action="store_true", help="disable the vision model even if configured")
     ui.add_argument("--skill-dir", action="append", help="extra SKILL.md root, highest precedence; repeatable")
+    ui.add_argument("--panel-concurrency", type=int, metavar="N",
+                    help="default consult-panel threads for the console (the page can override per run)")
 
     journal = sub.add_parser("journal", help="inspect a recorded call journal")
     journal.add_argument("path")
@@ -334,8 +337,18 @@ def _chat_command(args) -> int:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 2
 
+    # ``chat --journal`` accepted a path and then recorded nothing, because the
+    # journal was only ever built on the ``run`` path. A flag that silently does
+    # nothing is worse than no flag: the operator believes the dialogue is
+    # replayable.
+    try:
+        journal = _open_journal(args)
+    except Exception as exc:  # noqa: BLE001 - a bad journal path must not traceback
+        print(json.dumps({"error": f"日志打开失败: {exc}"}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
     runner = YaobiGraphRunner(tools, skill_manifest=args.skill_manifest, llm=llm,
-                              skill_dirs=getattr(args, "skill_dir", None))
+                              skill_dirs=getattr(args, "skill_dir", None), journal=journal,
+                              panel_concurrency=getattr(args, "panel_concurrency", None))
     session = ConversationSession(role=args.role, runner=runner,
                                   allow_prescription=args.allow_prescription)
     try:
@@ -562,6 +575,7 @@ def main(argv=None) -> int:
             open_browser=args.open, public=args.public, access_token=args.access_token,
             ngrok_authtoken=args.ngrok_authtoken, ngrok_region=args.ngrok_region,
             skill_dirs=getattr(args, "skill_dir", None), vision=not getattr(args, "no_vision", False),
+            panel_concurrency=getattr(args, "panel_concurrency", None),
         )
         return 0
 
@@ -624,9 +638,6 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001 - a bad journal path must not traceback
         print(json.dumps({"error": f"日志打开失败: {exc}"}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 2
-    if getattr(args, "panel_concurrency", None):
-        os.environ["YAOBI_PANEL_CONCURRENCY"] = str(args.panel_concurrency)
-
     state = ClinicalRunState(complaint=args.complaint, role=args.role)
     state.facts.update(_load_facts(args.facts, args.facts_file))
     state.enable_panel = bool(getattr(args, "panel", False))
@@ -642,7 +653,8 @@ def main(argv=None) -> int:
     )
     runner = YaobiGraphRunner(tools, checkpoint_dir=args.checkpoint_dir,
                               skill_manifest=args.skill_manifest, llm=llm,
-                              skill_dirs=getattr(args, "skill_dir", None), journal=journal)
+                              skill_dirs=getattr(args, "skill_dir", None), journal=journal,
+                              panel_concurrency=getattr(args, "panel_concurrency", None))
     out = runner.run(state, allow_prescription=args.allow_prescription)
     print(json.dumps(render(out, debug=args.debug_state), ensure_ascii=False, indent=2))
     # A diverged replay has not reproduced the recording, so it must not exit 0:

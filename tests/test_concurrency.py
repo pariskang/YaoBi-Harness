@@ -440,6 +440,30 @@ class ConcurrencyConfigTests(unittest.TestCase):
             else:
                 os.environ["YAOBI_PANEL_CONCURRENCY"] = original
 
+    def test_an_explicit_setting_reaches_the_panel_agent(self):
+        """Per-caller, not per-process: the console serves several operators."""
+        from yaobi_harness.graph import YaobiGraphRunner
+
+        runner = YaobiGraphRunner(panel_concurrency=2)
+        self.assertEqual(runner.panel_concurrency, 2)
+        self.assertEqual(runner.agents["ConsultPanelAgent"].concurrency, 2)
+
+    def test_the_journal_records_the_effective_setting_not_a_placeholder(self):
+        """A replay is only faithful against a matching concurrency, so the meta
+        line has to carry the number actually used — never an unresolved None."""
+        import tempfile
+
+        from yaobi_harness.graph import YaobiGraphRunner
+        from yaobi_harness.journal import Journal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Journal(Path(tmp) / "run.jsonl", mode="record")
+            YaobiGraphRunner(journal=journal, panel_concurrency=3)
+            self.assertEqual(journal.meta["panel_concurrency"], 3)
+            journal_default = Journal(Path(tmp) / "default.jsonl", mode="record")
+            YaobiGraphRunner(journal=journal_default)
+            self.assertIsInstance(journal_default.meta["panel_concurrency"], int)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -422,5 +422,38 @@ class EndToEndReplayTests(unittest.TestCase):
             self.assertIsNotNone(hint["panel_concurrency"])
 
 
+class CommandLineJournalTests(unittest.TestCase):
+    """`chat --journal` accepted a path and recorded nothing.
+
+    A flag that silently does nothing is the worst kind: the operator believes
+    the dialogue is replayable and only finds out when they try to replay it.
+    """
+
+    def _run(self, *args: str) -> None:
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "yaobi_harness", *args],
+            capture_output=True, text=True, timeout=180,
+            cwd=str(Path(__file__).resolve().parents[1]),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+
+    def test_chat_journal_actually_records(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "chat.jsonl"
+            self._run("chat", "--role", "patient", "--journal", str(path),
+                      "--message", "腰痛3月，久坐加重，无大小便异常")
+            self.assertTrue(path.is_file(), "chat --journal wrote no journal")
+            self.assertGreater(len(Journal.load(path).entries), 0)
+
+    def test_run_journal_records_and_replays(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.jsonl"
+            self._run("run", "--complaint", "腰痛3月，久坐加重", "--journal", str(path))
+            self._run("run", "--complaint", "腰痛3月，久坐加重", "--replay", str(path))
+
+
 if __name__ == "__main__":
     unittest.main()

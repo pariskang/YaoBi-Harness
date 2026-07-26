@@ -170,6 +170,19 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 400)
 
     # ------------------------------------------------------------ interactions
+    def test_replay_route_is_reachable_over_http(self):
+        status, recorded = post(f"{self.base}/api/run", {
+            "complaint": "腰痛3月，久坐加重", "role": "physician", "record_journal": True})
+        self.assertEqual(status, 200, recorded)
+        status, replayed = post(f"{self.base}/api/replay", {"run_id": recorded["journal"]["run_id"]})
+        self.assertEqual(status, 200, replayed)
+        self.assertTrue(replayed["fidelity"]["reproduced"], replayed["fidelity"])
+
+    def test_replaying_an_unknown_run_is_a_400(self):
+        status, body = post(f"{self.base}/api/replay", {"run_id": "nope"})
+        self.assertEqual(status, 400)
+        self.assertIn("录制", body["error"])
+
     def test_interaction_endpoint(self):
         status, data = post(self.base + "/api/interactions", {"medications": ["秋水仙碱", "克拉霉素"]})
         self.assertEqual(status, 200)
@@ -373,6 +386,104 @@ class ConsolePayloadTests(unittest.TestCase):
         json.dumps(console_payload(out, "patient"), ensure_ascii=False)
 
 
+class ConsoleReplayTests(unittest.TestCase):
+    """The console's offline re-derivation surface.
+
+    Recording and replaying is only worth having if a replay that *did not*
+    reproduce the decision says so. These tests pin the loud-failure direction as
+    hard as the happy path.
+    """
+
+    CASE = {"complaint": "腰痛3月，久坐加重，右下肢麻木，无大小便异常", "role": "physician"}
+
+    def setUp(self):
+        self.service = ConsoleService()
+
+    def _recorded(self, **extra):
+        return self.service.run_case({**self.CASE, "record_journal": True, **extra})
+
+    def test_a_run_without_recording_offers_no_journal(self):
+        self.assertNotIn("journal", self.service.run_case(dict(self.CASE)))
+
+    def test_recording_reports_what_it_captured(self):
+        out = self._recorded()
+        journal = out["journal"]
+        self.assertEqual(journal["mode"], "record")
+        self.assertGreater(journal["entries"], 0)
+        self.assertIsNone(journal["path"], "a console recording must never touch disk")
+        self.assertIn("panel_concurrency", journal["replay_hint"])
+
+    def test_replaying_the_same_case_reproduces_the_decision(self):
+        out = self._recorded()
+        replay = self.service.replay_case({"run_id": out["journal"]["run_id"]})
+        fidelity = replay["fidelity"]
+        self.assertTrue(fidelity["reproduced"], fidelity)
+        self.assertEqual(fidelity["differences"], [])
+        self.assertEqual(fidelity["against"], "recording")
+        self.assertEqual(replay["journal"]["live_after_exhaustion"], 0,
+                         "every call must come from the journal, or it is not a replay")
+        self.assertEqual(replay["meta"]["release_status"], out["meta"]["release_status"])
+
+    def test_a_recording_can_be_replayed_more_than_once(self):
+        """Replaying advances a cursor; the stored recording must not be consumed."""
+        run_id = self._recorded()["journal"]["run_id"]
+        for _ in range(3):
+            self.assertTrue(self.service.replay_case({"run_id": run_id})["fidelity"]["reproduced"])
+
+    def test_replaying_against_a_changed_case_fails_loudly(self):
+        run_id = self._recorded()["journal"]["run_id"]
+        replay = self.service.replay_case({
+            "run_id": run_id,
+            "complaint": "去年做过腰椎手术，今天突然不能排尿、会阴麻木，双腿越来越无力",
+        })
+        fidelity = replay["fidelity"]
+        self.assertFalse(fidelity["reproduced"])
+        self.assertEqual(fidelity["against"], "modified")
+        self.assertTrue(fidelity["divergences"], "a content-addressed miss must be recorded")
+        self.assertEqual(fidelity["divergences"][0]["differs_by"], "arguments")
+
+    def test_an_unknown_run_id_is_a_request_error_not_a_crash(self):
+        with self.assertRaises(ValueError):
+            self.service.replay_case({"run_id": "no-such-run"})
+
+    def test_recordings_are_bounded(self):
+        from yaobi_harness.ui.server import MAX_RECORDINGS
+
+        for i in range(MAX_RECORDINGS + 3):
+            self.service.run_case({**self.CASE, "complaint": f"腰痛{i}月，久坐加重",
+                                   "record_journal": True})
+        self.assertLessEqual(len(self.service.recordings), MAX_RECORDINGS)
+
+    def test_the_audit_says_why_the_deterministic_plan_was_used(self):
+        """`planner_mode: rule` on its own is undiagnosable; the note is the fix."""
+        out = self.service.run_case(dict(self.CASE))
+        self.assertEqual(out["audit"]["plan"]["note"], "llm_not_configured")
+
+
+class ConsoleConcurrencyControlTests(unittest.TestCase):
+    def test_the_requested_concurrency_reaches_the_runner(self):
+        service = ConsoleService()
+        out = service.run_case({"complaint": "腰痛3月，久坐加重", "role": "physician",
+                                "panel_concurrency": 3})
+        self.assertEqual(out["meta"]["panel_concurrency"], 3)
+
+    def test_an_absurd_value_is_clamped_rather_than_rejected(self):
+        from yaobi_harness.ui.server import _coerce_concurrency
+
+        self.assertEqual(_coerce_concurrency(99), 8)
+        self.assertEqual(_coerce_concurrency(-4), 1)
+        self.assertIsNone(_coerce_concurrency(None))
+        self.assertIsNone(_coerce_concurrency(0), "0 means 'unspecified', not 'no threads'")
+        with self.assertRaises(ValueError):
+            _coerce_concurrency("四")
+
+    def test_bootstrap_tells_the_page_the_default(self):
+        service = ConsoleService()
+        panel = service.bootstrap()["panel"]
+        self.assertGreaterEqual(panel["concurrency_default"], 1)
+        self.assertEqual(panel["concurrency_max"], 8)
+
+
 class StaticAssetTests(unittest.TestCase):
     def test_page_declares_both_themes_and_a_favicon_free_shell(self):
         page = STATIC.read_text(encoding="utf-8")
@@ -400,6 +511,19 @@ class StaticAssetTests(unittest.TestCase):
         page = STATIC.read_text(encoding="utf-8")
         self.assertIn("const esc =", page)
         self.assertIn("&quot;", page)
+
+    def test_the_page_exposes_the_replay_and_concurrency_controls(self):
+        """A backend feature with no control on the page is not shipped."""
+        page = STATIC.read_text(encoding="utf-8")
+        for marker in ('id="recordJournal"', 'id="panelConc"', 'id="replayBtn"',
+                       '"/api/replay"', "function tabReplay", "function planNote"):
+            self.assertIn(marker, page, marker)
+
+    def test_the_page_never_reuses_the_run_payload_for_a_replay(self):
+        """REPLAY is separate state; overwriting LAST would erase the comparison."""
+        page = STATIC.read_text(encoding="utf-8")
+        self.assertIn("let REPLAY = null;", page)
+        self.assertIn("REPLAY = await api(", page)
 
 
 if __name__ == "__main__":

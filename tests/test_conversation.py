@@ -19,12 +19,16 @@ from yaobi_harness.agent.agents import INFORMATION_GAPS, missing_information
 from yaobi_harness.conversation import (
     EXTRACTABLE_FACTS, ConversationSession, _extract_medications, coerce_facts, rule_extract,
 )
+from pathlib import Path
+
 from yaobi_harness.graph import YaobiGraphRunner
 from yaobi_harness.llm.base import LLMResponse
+from yaobi_harness.skills.loader import SkillRegistry
 from yaobi_harness.state import Budget
 from yaobi_harness.tools import ToolRegistry
 
 TEST_KEY = "unit-test-fixed-key"
+MANIFEST = Path(__file__).resolve().parents[1] / "yaobi_harness" / "skills" / "manifest.yaml"
 
 
 def session(role: str = "patient", *, llm=None, **kwargs) -> ConversationSession:
@@ -403,6 +407,66 @@ class TriageIsAClinicalJudgementTests(unittest.TestCase):
                          "a 'cannot exclude' thought is not an emergency")
         self.assertEqual(screening["hits"], [])
         self.assertEqual(screening["model_signals"][0]["signal"], "infection_or_tumor")
+
+
+class CriticDoesNotRelitigateTriageTests(unittest.TestCase):
+    """The reported case: 「我跌倒扭伤了腰，遇冷加重」 came back 未通过安全审查.
+
+    The keyword screen flags ``fracture`` on a fall. The model weighed that fall —
+    three months old, no progressive deficit — and triaged routine. The critic then
+    re-screened, found the same hit, and blocked. That is a rule overruling a
+    clinical decision that was made and recorded, in a place the earlier audit had
+    not looked.
+    """
+
+    def triager(self, level="routine"):
+        class Stub:
+            name, model, available = "stub", "stub", True
+
+            def chat(self, messages, tools=None, **kwargs):
+                if "急诊分诊" in messages[0]["content"]:
+                    return LLMResponse(text=json.dumps({
+                        "triage": level,
+                        "triage_reason": "3个月前跌倒，当时能负重，无进行性神经缺损",
+                        "signals": [], "rule_hits_you_disagree_with": [],
+                    }, ensure_ascii=False))
+                return LLMResponse(text="{}")
+
+        return Stub()
+
+    def test_a_signal_triage_already_weighed_is_not_blocked_again(self):
+        convo = session("patient", llm=self.triager())
+        convo.send("我腰痛，3个月前")
+        reply = convo.send("我跌倒扭伤了腰，遇冷加重")
+        self.assertNotEqual(reply.release_status, "blocked")
+        self.assertFalse(any("未处理的红旗" in issue for issue in convo.state.safety_issues))
+        self.assertTrue(any("模型已权衡" in note for note in convo.state.notes),
+                        "the disagreement is recorded, just not blocking")
+
+    def test_with_no_model_nobody_weighed_it_so_it_still_blocks(self):
+        """The critic's job is catching what nobody looked at. Without a model, the
+        rule screen escalates on its own and the run goes urgent."""
+        convo = session("patient")
+        convo.send("我腰痛，3个月前")
+        reply = convo.send("我跌倒扭伤了腰，遇冷加重")
+        self.assertEqual(reply.risk_mode, "urgent")
+
+    def test_a_signal_that_appears_only_later_is_still_caught(self):
+        """A hit triage never saw is genuinely unhandled, and must still block."""
+        from yaobi_harness.agent.agents import CriticAgent
+        from yaobi_harness.state import ClinicalRunState
+        from yaobi_harness.tools import CapabilityBroker, ToolRegistry
+
+        state = ClinicalRunState("腰痛3个月", role="patient")
+        # Triage ran and saw nothing; the facts then grew a red flag.
+        state.outputs["intake"] = {"screening": {"hits": [], "triage_by": "llm",
+                                                 "triage_level": "routine"}}
+        state.facts["neuro_symptoms"] = "突然不能排尿，会阴麻木"
+        registry = SkillRegistry.from_file(MANIFEST)
+        broker = CapabilityBroker("patient", "routine", budget=state.budget,
+                                  skill_registry=registry, active_skill="yaobi.safety_critic")
+        CriticAgent().run(state, ToolRegistry(), broker)
+        self.assertTrue(any("未处理的红旗" in issue for issue in state.safety_issues))
 
 
 class ConversationLlmContainmentTests(unittest.TestCase):

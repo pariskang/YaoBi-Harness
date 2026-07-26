@@ -23,6 +23,7 @@ import json
 import logging
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 256 * 1024
 #: Live conversations kept in memory before the oldest is evicted.
 MAX_SESSIONS = 50
+#: Background chat turns retained before the oldest is evicted. Each holds one
+#: turn's result, so a small window is plenty.
+MAX_JOBS = 40
 #: Recorded journals kept for replay before the oldest is evicted. Journals hold
 #: tool payloads and model text — clinical content — so the console keeps a short
 #: window in memory and never writes one to disk.
@@ -80,9 +84,9 @@ class ConsoleService:
         self._sessions_lock = threading.Lock()
 
         try:
-            self.llm = build_client(llm_provider, **({"model": llm_model} if llm_model else {}))
+            self.llm = _CountingLLM(build_client(llm_provider, **({"model": llm_model} if llm_model else {})))
         except LLMError as exc:
-            self.llm = NullLLMClient()
+            self.llm = _CountingLLM(NullLLMClient())
             self.llm_error = str(exc)
 
         self.knowledge = self._open_knowledge()
@@ -94,6 +98,9 @@ class ConsoleService:
         #: Recorded runs available for offline re-derivation, keyed by run id.
         #: Also in-memory only, and for the same reason.
         self.recordings: dict[str, dict[str, Any]] = {}
+        #: Background chat turns, keyed by job id. A turn is far too slow to hold
+        #: an HTTP request open for; the page starts one and polls.
+        self.jobs: dict[str, dict[str, Any]] = {}
 
     def _open_knowledge(self):
         if not self.knowledge_store_path:
@@ -333,6 +340,62 @@ class ConsoleService:
             while len(self.recordings) > MAX_RECORDINGS:
                 self.recordings.pop(next(iter(self.recordings)))
 
+    def start_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Begin a turn in the background and return a job id to poll.
+
+        A turn is 13 sequential model calls. With a reasoning model at 15–30s each
+        that is three to seven minutes in one HTTP request, and the reported
+        symptom was exactly what that produces: 「出错了：Failed to fetch」 — the
+        browser's own message for a connection that died, not an error this server
+        ever sent. Colab's iframe proxy in particular will not hold a request open
+        that long.
+
+        Polling also buys the thing a multi-minute wait most needs: something to
+        look at. ``progress`` reports model calls completed and seconds elapsed, so
+        the operator can tell "still working" from "hung".
+        """
+        job_id = f"job_{secrets.token_hex(8)}"
+        with self._sessions_lock:
+            # Runs are serialised by ``self._lock``, so a delta on one shared
+            # counter is exactly this job's call count.
+            self.jobs[job_id] = {"status": "running", "started": time.monotonic(),
+                                 "calls_at_start": self.llm.calls, "result": None, "error": ""}
+            while len(self.jobs) > MAX_JOBS:
+                self.jobs.pop(next(iter(self.jobs)))
+
+        def work() -> None:
+            try:
+                result = self.chat(payload)
+                with self._sessions_lock:
+                    self.jobs[job_id].update(status="done", result=result,
+                                             calls_at_end=self.llm.calls)
+            except Exception as exc:  # noqa: BLE001 - a failed turn must not kill the thread
+                logger.exception("chat job failed")
+                with self._sessions_lock:
+                    self.jobs[job_id].update(status="error", error=f"{type(exc).__name__}: {exc}",
+                                             calls_at_end=self.llm.calls)
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"job_id": job_id, "status": "running"}
+
+    def poll_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Where a background turn has got to."""
+        job_id = str(payload.get("job_id") or "")
+        with self._sessions_lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise ValueError("没有这个任务；可能已超时被清理，请重新发送")
+            snapshot = dict(job)
+        elapsed = round(time.monotonic() - snapshot["started"], 1)
+        done = snapshot.get("calls_at_end", self.llm.calls) - snapshot["calls_at_start"]
+        out = {"status": snapshot["status"],
+               "progress": {"llm_calls": max(0, done), "elapsed_s": elapsed}}
+        if snapshot["status"] == "done":
+            out.update(snapshot["result"] or {})
+        elif snapshot["status"] == "error":
+            out["error"] = snapshot["error"]
+        return out
+
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """One conversation turn. Creates the session on the first message."""
         from ..conversation import ConversationSession
@@ -454,6 +517,35 @@ class ConsoleService:
             ],
             "classes": {name: list(members) for name, members in ortho_interactions.DRUG_CLASSES.items()},
         }
+
+
+class _CountingLLM:
+    """Counts completed model calls, so a multi-minute turn can show progress.
+
+    Installed **once**, around the service's own client, because that is the only
+    object every caller shares. Wrapping the session's client instead counted 1 of
+    13: the runner binds the client into each agent at construction, so eleven of
+    the calls never went through the session's reference at all.
+
+    A pass-through on every other attribute — the runner reads ``available``,
+    ``name`` and ``model`` off the client, and a wrapper that hid them would change
+    which path the run takes, which is the last thing a progress indicator should do.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._lock = threading.Lock()
+        self.calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def chat(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._inner.chat(*args, **kwargs)
+        finally:
+            with self._lock:
+                self.calls += 1
 
 
 def _env_concurrency() -> int:
@@ -677,6 +769,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return self._safely(lambda: self.service.check_interactions(payload))
         if path == "/api/chat":
             return self._safely(lambda: self.service.chat(payload))
+        if path == "/api/chat/start":
+            return self._safely(lambda: self.service.start_chat(payload))
+        if path == "/api/chat/poll":
+            return self._safely(lambda: self.service.poll_chat(payload))
         if path == "/api/chat/open":
             return self._safely(lambda: self.service.open_chat(payload))
         if path == "/api/chat/reset":

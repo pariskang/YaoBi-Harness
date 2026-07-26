@@ -403,6 +403,76 @@ class ConsolePayloadTests(unittest.TestCase):
         json.dumps(console_payload(out, "patient"), ensure_ascii=False)
 
 
+class LongTurnTests(unittest.TestCase):
+    """A turn is ~13 sequential model calls.
+
+    Holding an HTTP request open for that is what produced 「出错了：Failed to
+    fetch」 — the browser's own message for a connection that died, which reads as
+    a backend crash and is not one. Turns run in the background and the page polls.
+    """
+
+    def setUp(self):
+        self.service = ConsoleService()
+
+    def test_a_turn_starts_immediately_and_reports_a_job(self):
+        job = self.service.start_chat({"message": "腰痛3个月", "role": "patient"})
+        self.assertTrue(job["job_id"])
+        self.assertEqual(job["status"], "running")
+
+    def _drain(self, job_id: str, limit: int = 400) -> dict:
+        import time as _time
+
+        for _ in range(limit):
+            poll = self.service.poll_chat({"job_id": job_id})
+            if poll["status"] != "running":
+                return poll
+            _time.sleep(0.05)
+        raise AssertionError("job never finished")
+
+    def test_polling_returns_the_turn_when_it_finishes(self):
+        job = self.service.start_chat({"message": "腰痛3个月，久坐加重", "role": "patient"})
+        poll = self._drain(job["job_id"])
+        self.assertEqual(poll["status"], "done")
+        self.assertTrue(poll["reply"]["message"])
+        self.assertTrue(poll["session_id"])
+
+    def test_progress_counts_the_agents_calls_not_just_the_sessions(self):
+        """Wrapping the session's client counted 1 of 13: the runner binds the
+        client into each agent at construction, so most calls never pass through
+        the session's reference."""
+        class Counter:
+            name, model, available = "counter", "counter", True
+
+            def chat(self, messages, tools=None, **kwargs):
+                from yaobi_harness.llm.base import LLMResponse
+                return LLMResponse(text="{}")
+
+        from yaobi_harness.ui.server import _CountingLLM
+
+        self.service.llm = _CountingLLM(Counter())
+        job = self.service.start_chat({"message": "腰痛3个月", "role": "patient"})
+        poll = self._drain(job["job_id"])
+        self.assertGreater(poll["progress"]["llm_calls"], 5,
+                           "a turn is a dozen calls, not one")
+
+    def test_a_failed_turn_is_reported_rather_than_lost(self):
+        job = self.service.start_chat({"message": "", "role": "patient"})   # empty → ValueError
+        poll = self._drain(job["job_id"])
+        self.assertEqual(poll["status"], "error")
+        self.assertIn("消息不能为空", poll["error"])
+
+    def test_an_unknown_job_is_a_request_error(self):
+        with self.assertRaises(ValueError):
+            self.service.poll_chat({"job_id": "nope"})
+
+    def test_jobs_are_bounded(self):
+        from yaobi_harness.ui.server import MAX_JOBS
+
+        for i in range(MAX_JOBS + 5):
+            self.service.start_chat({"message": f"腰痛{i}个月", "role": "patient"})
+        self.assertLessEqual(len(self.service.jobs), MAX_JOBS + 1)
+
+
 class ConsoleReplayTests(unittest.TestCase):
     """The console's offline re-derivation surface.
 
@@ -535,6 +605,14 @@ class StaticAssetTests(unittest.TestCase):
         for marker in ('id="recordJournal"', 'id="panelConc"', 'id="replayBtn"',
                        '"/api/replay"', "function tabReplay", "function planNote"):
             self.assertIn(marker, page, marker)
+
+    def test_the_page_polls_instead_of_holding_a_long_request(self):
+        page = STATIC.read_text(encoding="utf-8")
+        self.assertIn('"/api/chat/start"', page)
+        self.assertIn('"/api/chat/poll"', page)
+        self.assertIn("AbortController", page)
+        self.assertIn("Failed to fetch", page,
+                      "the browser's own wording must be explained, not echoed blindly")
 
     def test_the_page_lets_the_agent_speak_first(self):
         page = STATIC.read_text(encoding="utf-8")

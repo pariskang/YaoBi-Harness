@@ -41,7 +41,7 @@ from .graph import YaobiGraphRunner
 from .interview.axes import AXES_BY_ID
 from .interview.loop import MAX_QUESTIONS_PER_ROUND, InterviewLoop
 from .knowledge.ortho_interactions import KNOWN_CONDITIONS
-from .llm.base import LLMError
+from .llm.base import LLMError, split_reasoning
 from .render import render
 from .safety import red_flags
 from .state import Budget, ClinicalRunState
@@ -694,8 +694,8 @@ class ConversationSession:
                 budget.charge_llm_tokens(response.total_tokens)
         except (LLMError, Exception):  # noqa: BLE001 - an opening must never fail a session
             return None
-        text = (response.text or "").strip()
-        return text or None
+        text, _ = split_reasoning(response.text or "")
+        return text.strip() or None
 
     def send(self, message: str) -> AgentReply:
         """Take one user message, run the graph, and return the agent's reply."""
@@ -1071,7 +1071,13 @@ class ConversationSession:
             self.state.warn("模型撰写回复失败，使用模板回复")
             return None
 
-        text = (response.text or "").strip()
+        # A reasoning model's scratch pad must not reach a patient. Providers
+        # already split it off; this covers a custom client that does not.
+        text, reasoning = split_reasoning(response.text or "")
+        text = text.strip()
+        if reasoning and not text:
+            self.state.warn("模型只返回了思考过程，没有正文，已使用模板回复")
+            return None
         if not text:
             return None
         return self._finalise(text, delivered)

@@ -142,6 +142,10 @@ class AdequacyJudge:
         self.max_rounds = max_rounds
         self.stall_threshold = stall_threshold
         self.history: list[frozenset[str]] = []
+        #: Fingerprint of the facts each history entry was judged against, so a
+        #: re-judgement of the *same* round replaces it instead of looking like a
+        #: second unproductive one.
+        self._fingerprints: list[str] = []
 
     # --------------------------------------------------------------- judging
     def judge(
@@ -177,8 +181,8 @@ class AdequacyJudge:
             blocking = [axis_id for axis_id in blocking if axis_id not in granted]
             judged_by = "llm"
 
+        self._record_round(frozenset(missing), facts, complaint)
         signature = frozenset(missing)
-        self.history.append(signature)
 
         # Blocking axes come first: nothing below can clear them.
         if blocking:
@@ -208,6 +212,36 @@ class AdequacyJudge:
                                rounds_used, judged_by, closed_by_model)
 
     # -------------------------------------------------------------- internals
+    def _record_round(self, signature: frozenset[str], facts: dict[str, Any], complaint: str) -> None:
+        """Append this round — unless it is the *same* round being judged again.
+
+        The graph re-runs its nodes on a repair loop, so a single patient message
+        could produce four calls here. Counting those as four unproductive
+        ask-rounds fired the stall detector and drove the run to ``blocked`` with
+        「反复追问后必答项仍未获答复」 — while the patient had been asked exactly
+        once and had not yet had a chance to answer. Declaring non-progress when
+        nobody was given the opportunity to progress is the wrong verdict for a
+        reason that has nothing to do with the patient.
+
+        A round therefore counts only when the input has changed. The fingerprint
+        is the narrative *and* the collected facts — the narrative because a
+        patient who answers 「我不知道」 adds no fact but has genuinely had their
+        turn, and a stall is precisely a sequence of those. Facts alone would make
+        the real stall undetectable while fixing the false one.
+        """
+        fingerprint = self._fingerprint(facts, complaint)
+        if self._fingerprints and self._fingerprints[-1] == fingerprint:
+            self.history[-1] = signature
+            return
+        self.history.append(signature)
+        self._fingerprints.append(fingerprint)
+
+    @staticmethod
+    def _fingerprint(facts: dict[str, Any], complaint: str) -> str:
+        """A stable key for "what we have been told so far"."""
+        return json.dumps([complaint, _redact(facts)], sort_keys=True,
+                          ensure_ascii=False, default=str)
+
     def _stalled(self, signature: frozenset[str]) -> bool:
         """True when the last ``stall_threshold`` rounds had identical gaps.
 

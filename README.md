@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-614%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-635%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -57,6 +57,22 @@ Yaobi-Harness 是一个 **证据受控的骨科/腰痹多智能体临床决策�
 
 一轮最多 6 个问题，这是"患者读不完"的限制，不是对问题内容的判断——超出的**顺延到下一轮**
 并说明，不静默丢弃。
+
+### 推理模型：思考过程既不展示也不解析
+
+推理型模型（`<think>…</think>`）暴露了两个缺陷，其中一个远比另一个严重。
+
+**展示层面**：开场白里印出了模型对着系统提示词自言自语的一整段。
+
+**解析层面要命得多**：思考过程里几乎必然出现示例 JSON（"我应该输出 `{"age": 99}`"），
+而抽取器取的是**第一个**找到的对象——于是一个**凭空捏造的年龄被写进了临床事实**。
+编造出来的事实，比难看的输出严重得多。
+
+现在在**每个 provider 都会经过的那一个边界**上分离：`<think>` / `<thinking>` /
+`<reasoning>` 等写法，以及 DeepSeek 式的 `reasoning_content` 旁路字段，
+都进 `LLMResponse.reasoning`（保留在台账里），`text` 只留真正的回答。
+截断在思考中途 → 没有回答，返回空而不是把半截思考当答案。
+`extract_json` 与对话层各自再挡一次，因为自定义客户端不走 provider 适配器。
 
 ### JSON 修复：让模型真实写出的输出能被用上
 
@@ -286,6 +302,14 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 「规划与执行」页现在还会说明**为什么**用了确定性计划，而不只是显示「规则」。
 控制台的日志只存在内存里、不落盘——它和聊天记录一样是临床内容。
 
+**对话轮次在后台跑，页面轮询。** 一轮问诊是十余次串行模型调用；推理型模型下这是几分钟，
+把 HTTP 请求挂那么久正是「出错了：Failed to fetch」的成因——那是**浏览器**对连接中断的
+用词，不是本服务发出的错误，Colab 的 iframe 代理尤其不会让请求开那么久。
+现在 `POST /api/chat/start` 立刻返回任务号，页面每 1.5 秒轮询一次
+`/api/chat/poll`，并显示**已完成的模型调用数与已用秒数**——多分钟的等待里，
+最需要的就是能分辨"还在算"和"已经挂了"。所有请求都带超时、一次静默重试，
+以及说明问题的错误文案，而不是把浏览器的原话直接抛给用户。
+
 需要分享给同事评审时可映射成公开链接（会**强制**生成访问令牌并拼进 URL）：
 
 ```bash
@@ -472,5 +496,5 @@ LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 614 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 635 个用例，无需 pytest 与网络
 ```

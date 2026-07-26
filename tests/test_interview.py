@@ -157,10 +157,27 @@ class AdequacyJudgeTests(unittest.TestCase):
         # release, but no progress is being made either.
         judge._ask_model = lambda *a, **k: (["tongue_pulse"], "还缺舌脉", [], [])  # type: ignore[method-assign]
         facts = {**RED_FLAGS_ANSWERED, **CORE_ANSWERED}
-        verdicts = [judge.judge(facts, "腰痛3个月", rounds_used=i).verdict for i in range(3)]
+        # A real stall is the patient *speaking* and adding nothing: the narrative
+        # grows, the gaps do not. Repeating the identical call is a recomputation,
+        # which is a different thing and is deliberately not counted.
+        said = ["腰痛3个月", "腰痛3个月。不知道", "腰痛3个月。不知道。说不清"]
+        verdicts = [judge.judge(facts, said[i], rounds_used=i).verdict for i in range(3)]
         self.assertEqual(verdicts[:2], [NOT_ACHIEVED, NOT_ACHIEVED])
         self.assertEqual(verdicts[2], STALLED)
-        self.assertTrue(judge.judge(facts, "腰痛3个月", rounds_used=3).may_proceed)
+        self.assertTrue(judge.judge(facts, "腰痛3个月。不知道。说不清。还是不知道",
+                                    rounds_used=3).may_proceed)
+
+    def test_the_same_round_recomputed_is_not_a_second_round(self):
+        """The graph re-runs its nodes on a repair loop. Counting those as
+        unproductive ask-rounds drove a three-turn conversation to ``blocked``
+        while the patient had been asked once and not yet answered."""
+        judge = AdequacyJudge(stall_threshold=2)
+        facts = {**RED_FLAGS_ANSWERED, **CORE_ANSWERED}
+        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "缺舌脉", [], [])  # type: ignore[method-assign]
+        for _ in range(5):
+            verdict = judge.judge(facts, "腰痛3个月")
+        self.assertEqual(len(judge.history), 1, "five recomputations are one round")
+        self.assertEqual(verdict.verdict, NOT_ACHIEVED)
 
     def test_two_identical_rounds_are_not_yet_a_stall(self):
         """Patients answer one thing at a time; two rounds is one bad exchange."""
@@ -171,8 +188,8 @@ class AdequacyJudgeTests(unittest.TestCase):
 
     def test_repeated_rounds_with_open_required_axes_end_in_blocked(self):
         judge = AdequacyJudge()
-        for _ in range(3):
-            verdict = judge.judge({}, "腰痛3个月")
+        for said in ("腰痛3个月", "腰痛3个月。不知道", "腰痛3个月。不知道。说不清"):
+            verdict = judge.judge({}, said)
         self.assertEqual(verdict.verdict, BLOCKED)
         self.assertFalse(verdict.may_proceed)
         self.assertTrue(verdict.blocking_axes)
@@ -607,8 +624,8 @@ class InterviewNodeTests(unittest.TestCase):
 
         loop = InterviewLoop()
         runner = YaobiGraphRunner(interview_loop=loop)
-        for _ in range(3):
-            state = ClinicalRunState(complaint="腰痛3个月", role="patient")
+        for said in ("腰痛3个月", "腰痛3个月。不知道", "腰痛3个月。不知道。说不清"):
+            state = ClinicalRunState(complaint=said, role="patient")
             out = runner.run(state)
         self.assertEqual(out.outputs["interview"]["verdict"]["verdict"], BLOCKED)
         self.assertTrue(any("blocked" in issue for issue in out.safety_issues))

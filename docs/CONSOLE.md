@@ -129,12 +129,29 @@ storage 被拦时，刷新只能靠它。
 | POST | `/api/replay` | `{run_id, complaint?, facts?}` → `{fidelity, journal, delivered, audit, meta}` |
 | POST | `/api/interactions` | `{medications, conditions}` → 相互作用筛查结果 |
 | POST | `/api/chat/open` | `{role}` → `{session_id, reply, ...}`；智能体先开口，页面加载即调用 |
+| POST | `/api/chat/start` | `{message, role, session_id?}` → `{job_id, status}`；后台跑一轮 |
+| POST | `/api/chat/poll` | `{job_id}` → `{status, progress:{llm_calls, elapsed_s}, ...}` |
 | POST | `/api/chat` | `{message, role, session_id?}` → `{session_id, reply, audit, meta}` |
 | POST | `/api/chat/reset` | `{session_id}` → 清空该会话 |
 
 `/api/run` 的返回结构固定为三段：`delivered`（角色化答复）、`audit`（推理记录，仅操作者）、
 `meta`（放行状态、规划来源、预算、会诊并发、知识库与许可模式）；
 `record_journal` 时多一段 `journal`（`run_id`、条目数、重放提示）。
+
+### 为什么对话要轮询
+
+一轮问诊是**十余次串行模型调用**。推理型模型下这是几分钟，把一个 HTTP 请求挂那么久
+正是「出错了：Failed to fetch」的成因——那是**浏览器**对连接中断的用词，
+不是本服务发出的错误，所以它会把人引到错误的方向去查。Colab 的 iframe 代理
+尤其不会让请求开那么久。
+
+`/api/chat/start` 立刻返回任务号，页面每 1.5 秒轮询一次。`progress` 报告
+**已完成的模型调用数**与**已用秒数**——多分钟的等待里最需要的就是能分辨
+"还在算"和"已经挂了"。计数器装在 service 自己的客户端上，因为那是所有调用方
+唯一共用的对象：装在会话的客户端上只数到 13 次里的 1 次，
+runner 在构造时就把客户端绑进了每个 Agent。
+
+`/api/chat` 仍然保留同步版本，脚本与回归测试用它。
 
 `/api/replay` 的 `fidelity` 先给结论：`reproduced`、`against`（`recording` / `modified`）、
 `differences`、`before` / `after` 指纹、`divergences`、`live_after_exhaustion`。

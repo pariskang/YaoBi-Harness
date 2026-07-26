@@ -794,22 +794,47 @@ let TOKEN = "";
 })();
 
 /* ─── API ──────────────────────────────────────────────────── */
-async function api(path, body) {
+async function api(path, body, { timeoutMs = 60000, retries = 1 } = {}) {
   const headers = {};
   if (TOKEN) headers["X-Yaobi-Token"] = TOKEN;
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  const res = await fetch(path, body === undefined
-    ? { headers }
-    : { method:"POST", headers, body:JSON.stringify(body) });
-  const data = await res.json().catch(() => ({ error:`HTTP ${res.status}` }));
-  if (!res.ok) {
-    // 401 with no token in hand is a setup problem, not a backend fault; say which.
-    if (res.status === 401 && !TOKEN) {
-      throw new Error("需要访问令牌：请使用启动时打印的带 ?t=… 的完整链接打开本页");
+
+  for (let attempt = 0; ; attempt++) {
+    // A hung request must fail with a message that says what happened. Plain
+    // fetch() reports "Failed to fetch" for a dropped connection, which reads as
+    // a backend crash and sends people looking in the wrong place.
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), timeoutMs);
+    try {
+      const res = await fetch(path, {
+        headers, signal: abort.signal,
+        ...(body === undefined ? {} : { method:"POST", body:JSON.stringify(body) }),
+      });
+      const data = await res.json().catch(() => ({ error:`HTTP ${res.status}` }));
+      if (!res.ok) {
+        // 401 with no token in hand is a setup problem, not a backend fault.
+        if (res.status === 401 && !TOKEN) {
+          throw new Error("需要访问令牌：请使用启动时打印的带 ?t=… 的完整链接打开本页");
+        }
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      return data;
+    } catch (e) {
+      const networkLevel = e.name === "AbortError" || e instanceof TypeError;
+      if (networkLevel && attempt < retries) continue;   // one silent retry
+      if (e.name === "AbortError") {
+        throw new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒没有响应。`
+          + "推理型模型一轮需要十几次调用，可能仍在计算；也可能是网络或代理中断。");
+      }
+      if (e instanceof TypeError) {
+        throw new Error("连接中断（浏览器报 Failed to fetch）。"
+          + "常见原因：Colab 代理超时、控制台进程已退出、或 ngrok 链接失效。");
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
     }
-    throw new Error(data.error || `HTTP ${res.status}`);
   }
-  return data;
 }
 
 /* ─── bootstrap ────────────────────────────────────────────── */
@@ -1755,6 +1780,29 @@ function replyMeta(reply) {
   </div>`;
 }
 
+/* One turn is ~13 sequential model calls. Holding an HTTP request open for that
+   is what produced 「出错了：Failed to fetch」 — the browser's own message for a
+   connection that died, which reads as a backend crash and is not one. The turn
+   runs in the background and the page polls, which also gives the operator
+   something to look at during a multi-minute wait. */
+const CHAT_POLL_MS = 1500;
+const CHAT_MAX_WAIT_MS = 15 * 60 * 1000;
+
+async function runChatTurn(payload, bubble) {
+  const { job_id } = await api("/api/chat/start", payload);
+  const started = Date.now();
+  while (Date.now() - started < CHAT_MAX_WAIT_MS) {
+    await new Promise(r => setTimeout(r, CHAT_POLL_MS));
+    const poll = await api("/api/chat/poll", { job_id }, { timeoutMs: 20000, retries: 3 });
+    if (poll.status === "done") return poll;
+    if (poll.status === "error") throw new Error(poll.error || "本轮运行失败");
+    const p = poll.progress || {};
+    bubble.textContent = `正在检索证据并推理…（已完成 ${p.llm_calls || 0} 次模型调用，`
+      + `${Math.round(p.elapsed_s || 0)} 秒）`;
+  }
+  throw new Error("本轮超过 15 分钟仍未完成，已停止等待；模型可能仍在后台计算。");
+}
+
 async function chatSend(text) {
   const input = $("#chatInput");
   const message = (text ?? input.value).trim();
@@ -1766,7 +1814,7 @@ async function chatSend(text) {
   input.value = "";
   $("#chatQuestions").replaceChildren();
 
-  const pending = chatBubble("agent", "正在检索证据并推理…");
+  const pending = chatBubble("agent", "正在检索证据并推理…（推理型模型一轮需要十余次调用）");
   log.appendChild(pending);
   const bubbles = () => log.querySelectorAll(".msg:not(.me) .bubble");
   const pendingBubble = bubbles()[bubbles().length - 1];
@@ -1777,11 +1825,11 @@ async function chatSend(text) {
   btn.innerHTML = '<span class="spinner"></span>';
 
   try {
-    const data = await api("/api/chat", {
+    const data = await runChatTurn({
       message, role: chatRole(), session_id: CHAT.sessionId,
       allow_prescription: $("#chatAllowRx").checked, use_llm: $("#chatUseLlm").checked,
       images: PENDING_IMAGES.map(i => ({ kind:i.kind, ref:i.ref, deidentified:true })),
-    });
+    }, pendingBubble);
     // Sent images belong to the session now; clearing keeps the next turn from
     // re-reading them and re-charging the vision budget.
     PENDING_IMAGES = [];

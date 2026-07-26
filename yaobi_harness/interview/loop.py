@@ -55,7 +55,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..llm.base import LLMError, ToolSpec
+from ..llm.base import LLMError, ToolSpec, split_reasoning
 from .adequacy import AdequacyJudge, AdequacyVerdict
 from .axes import AXES_BY_ID, coverage, plan_next
 
@@ -80,8 +80,14 @@ _PROSE_QUESTION_RE = re.compile(r"^[\s\-*·\d.、)）]*(.{4,120}[？?])\s*$", re
 
 
 def _questions_from_prose(text: str) -> dict[str, Any] | None:
-    """Pull interrogative lines out of a prose reply."""
-    found = [m.group(1).strip() for m in _PROSE_QUESTION_RE.finditer(text or "")]
+    """Pull interrogative lines out of a prose reply.
+
+    Reasoning is stripped first: a scratch pad is full of interrogatives the model
+    was asking *itself* ("should I ask about bowel function?"), and mining those
+    would put the model's deliberation to the patient as questions.
+    """
+    answer, _ = split_reasoning(text or "")
+    found = [m.group(1).strip() for m in _PROSE_QUESTION_RE.finditer(answer)]
     return {"questions": found} if found else None
 
 
@@ -317,6 +323,8 @@ class InterviewLoop:
         self.attached_image_kinds: list[str] = []
         #: Image requests from the most recent composed round.
         self.last_image_requests: list[ImageRequest] = []
+        #: Facts the last round was composed against, to recognise a recomputation.
+        self._last_fingerprint = ""
         #: Kinds requested at any point, so a request is not repeated every round.
         self.requested_image_kinds: list[str] = []
 
@@ -345,6 +353,13 @@ class InterviewLoop:
         prompt as advice; **the model ending the enquiry is the model returning no
         questions.**
         """
+        # The graph re-runs its nodes on a repair loop, so one patient message can
+        # reach this several times. Those are the *same* round being recomputed —
+        # counting them inflated ``rounds_used`` to 5 after two messages and then
+        # fired 「已达最大追问轮次」 on a conversation three turns old.
+        rerun = self._same_round_as_last(facts, complaint)
+        if rerun:
+            self.rounds.pop()
         verdict = self.judge.judge(
             facts, complaint, role=role, risk_mode=risk_mode,
             prescriptive=prescriptive, rounds_used=self.rounds_used, budget=budget,
@@ -440,6 +455,18 @@ class InterviewLoop:
         }
 
     # --------------------------------------------------------------- internals
+    def _same_round_as_last(self, facts: dict[str, Any], complaint: str) -> bool:
+        """Whether this call is the previous round being recomputed.
+
+        Narrative *and* facts: a patient who answers 「我不知道」 changes no fact but
+        has had their turn, and that is exactly what a stall is made of.
+        """
+        fingerprint = json.dumps([complaint, facts], sort_keys=True,
+                                 ensure_ascii=False, default=str)
+        same = bool(self.rounds) and fingerprint == self._last_fingerprint
+        self._last_fingerprint = fingerprint
+        return same
+
     def _from_probe_bank(self, plan: Any) -> list[InterviewQuestion]:
         """Deterministic fallback: the axis's own probes, skipping repeats."""
         questions: list[InterviewQuestion] = []

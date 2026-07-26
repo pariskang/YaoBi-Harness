@@ -14,6 +14,7 @@ not silently drop the whole model-driven path to its deterministic fallback.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -47,9 +48,53 @@ class ToolCall:
     id: str = ""
 
 
+#: How reasoning models delimit their scratch pad. Every one of these has been
+#: seen in the wild from an OpenAI-compatible endpoint.
+_REASONING_TAGS = ("think", "thinking", "reason", "reasoning", "scratchpad", "antml:thinking")
+_REASONING_RE = re.compile(
+    r"<(" + "|".join(_REASONING_TAGS) + r")\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+#: An *unclosed* opening tag: the response was cut off inside the reasoning, so
+#: everything from the tag onward is scratch and there is no answer after it.
+_OPEN_REASONING_RE = re.compile(
+    r"<(" + "|".join(_REASONING_TAGS) + r")\b[^>]*>.*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def split_reasoning(text: str) -> tuple[str, str]:
+    """Separate a reasoning model's scratch pad from its actual answer.
+
+    Returns ``(answer, reasoning)``. This is not cosmetic on either side:
+
+    * **Displayed**, a scratch pad reaches the patient. The reported transcript
+      opened with a paragraph of the model talking to itself about the system
+      prompt.
+    * **Parsed**, it is worse. Reasoning traces routinely contain example JSON
+      ("I should output {\"age\": 99}"), and the extractor takes the first object
+      it finds — so the harness wrote an invented age into the clinical facts. A
+      fabricated fact is a much bigger problem than an ugly one.
+    """
+    if not text or "<" not in text:
+        return text, ""
+    reasoning = " ".join(m.group(0) for m in _REASONING_RE.finditer(text))
+    answer = _REASONING_RE.sub("", text)
+    truncated = _OPEN_REASONING_RE.search(answer)
+    if truncated:
+        # Cut off inside the reasoning: there is no answer, and returning the
+        # partial trace as one would be worse than returning nothing.
+        reasoning = f"{reasoning} {truncated.group(0)}".strip()
+        answer = answer[: truncated.start()]
+    return answer.strip(), reasoning.strip()
+
+
 @dataclass
 class LLMResponse:
     text: str = ""
+    #: The model's own scratch pad, if it emitted one. Kept for the audit trail
+    #: and never shown to a patient or parsed for content.
+    reasoning: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -124,7 +169,17 @@ def extract_json_with_repairs(text: str, default: Any = None) -> tuple[Any, list
     """
     if not text:
         return default, []
+    # Belt and braces: providers already split this off, but a caller may hand us
+    # raw text from a custom client, and parsing a scratch pad is how a fabricated
+    # age reached the clinical facts.
+    answer, reasoning = split_reasoning(text)
+    if reasoning:
+        text = answer
+    if not text:
+        return default, ["reasoning_only"]
     value, repairs = jsonrepair.loads_with_repairs(text)
+    if reasoning:
+        repairs = ["stripped_reasoning", *repairs]
     if value is None:
         # ``ast.literal_eval`` as a final resort: it parses Python literals and
         # evaluates nothing, so it cannot execute a model response. Kept because

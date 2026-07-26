@@ -1236,7 +1236,23 @@ class CriticAgent(BaseAgent):
         checks_run.append("red_flag_recheck")
         if state.risk_mode == "routine":
             rescreen = red_flags.screen(" ".join([state.complaint, json.dumps(state.facts, ensure_ascii=False)]))
-            if rescreen.hits:
+            screening = (state.outputs.get("intake") or {}).get("screening") or {}
+            already_weighed = {h.get("signal") for h in screening.get("hits") or []}
+            # A signal triage already looked at is not an unhandled one. Blocking on
+            # it here re-litigates a clinical decision that was made and recorded —
+            # the exact pattern that sent 「跌倒扭伤3个月」 to 「未通过安全审查」 after
+            # the model had weighed the fall and called it routine.
+            fresh = [h.signal for h in rescreen.hits if h.signal not in already_weighed]
+            if fresh:
+                issues.append(f"复核阶段发现未处理的红旗信号: {fresh[:3]}")
+                repair_requests.append({"agent": "IntakeAgent", "reason": "late_red_flag_detected"})
+            elif rescreen.hits and screening.get("triage_by") == "llm":
+                state.note(
+                    f"复核：规则关键词仍命中 {sorted(already_weighed)[:3]}，"
+                    f"分诊时模型已权衡并判为 {screening.get('triage_level', 'routine')}"
+                    f"（{screening.get('triage_reason', '')[:60]}）")
+            elif rescreen.hits:
+                # No model weighed them, so nobody did. Still a block.
                 issues.append(f"复核阶段发现未处理的红旗信号: {[h.signal for h in rescreen.hits][:3]}")
                 repair_requests.append({"agent": "IntakeAgent", "reason": "late_red_flag_detected"})
 

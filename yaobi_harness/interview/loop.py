@@ -85,6 +85,31 @@ def _questions_from_prose(text: str) -> dict[str, Any] | None:
     return {"questions": found} if found else None
 
 
+#: Image kinds the model may ask for, mirroring ``vision.client.IMAGE_KINDS``.
+#: Duplicated as a literal rather than imported so this module stays importable
+#: without the vision stack, which is optional.
+REQUESTABLE_IMAGE_KINDS = (
+    "radiograph", "mri_ct", "tongue", "posture_gait", "limb_surface",
+    "report_document", "other",
+)
+
+IMAGE_TOOL = ToolSpec(
+    "request_image",
+    "请对方上传一张图片。会在对话界面打开上传模块并预选好类型。**只在这张图会改变你的处置"
+    "判断时才请求**——为了完整而收集影像，对患者是负担而不是帮助。对方仍须自行确认已去标识化，"
+    "这一步不能由你代替。",
+    {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": list(REQUESTABLE_IMAGE_KINDS),
+                     "description": "图片类型，决定判读边界与提示词"},
+            "why": {"type": "string", "description": "一句话说明这张图会改变什么判断（会展示给对方）"},
+            "axis_id": {"type": "string", "description": "这张图要帮助闭合的问诊轴，可留空"},
+        },
+        "required": ["kind", "why"],
+    },
+)
+
 ASK_TOOL = ToolSpec(
     "ask_patient",
     "向患者/医师提出追问。你问出的问题会原样送达，系统不会替换或改写。axis_id 尽量填对应的"
@@ -118,6 +143,14 @@ ASK_TOOL = ToolSpec(
                 "description": "认为病史已充分、无需再问时置 true。该判断会被独立审核，不会直接采纳。",
             },
             "reasoning": {"type": "string", "description": "本轮为什么选这些轴（供审计）"},
+            # Also accepted here, because many gateways only surface one tool call
+            # per turn and a model that wants to ask *and* request an image should
+            # not have to choose.
+            "image_requests": {
+                "type": "array",
+                "items": IMAGE_TOOL.parameters,
+                "description": "同时请求上传的图片；等价于调用 request_image",
+            },
         },
         "required": ["questions"],
     },
@@ -159,7 +192,14 @@ INTERVIEW_SYSTEM_PROMPT = """你是骨科门诊的**问诊智能体**。你的�
    那只是参考——它认为该停而你还想追一句，就继续追；它认为没问够而你判断可以收，
    返回空列表就结束。未闭合的必答轴只影响能不能进入含剂量环节。
 9. 一轮最多 {max_questions} 个问题，这是"患者读不完"的限制，不是对问题内容的判断；
-   超出的会自动留到下一轮，不会丢。"""
+   超出的会自动留到下一轮，不会丢。
+10. **需要看图时你可以主动要**：调用 `request_image`，或在 `ask_patient` 里带上
+    `image_requests`。界面会打开上传模块并预选好类型。
+    什么时候值得要：舌象决定辨证、患肢外观提示血管或骨筋膜室问题、体态步态区分机械性与
+    炎症性、报告单/影像翻拍能把"患者转述"换成"看得见的原始记录"。
+    什么时候不要：为了完整而收集影像。对患者是负担而不是帮助。
+    `vision_available` 为 false 时不要请求——没有配置视觉模型，图上传了也读不了。
+    去标识化由对方自行确认，你不能代替，也不要声称已经确认。"""
 
 
 @dataclass
@@ -190,11 +230,31 @@ class InterviewQuestion:
 
 
 @dataclass
+class ImageRequest:
+    """A request for an image, made by the model when it judges one decisive.
+
+    ``deidentified`` is deliberately absent: the attestation is the uploader's,
+    and a model asserting it about a file it has not seen would make the
+    attestation meaningless. The request opens the upload module; a person still
+    has to confirm they masked the identifiers.
+    """
+
+    kind: str
+    why: str = ""
+    axis_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "why": self.why, "axis_id": self.axis_id}
+
+
+@dataclass
 class InterviewRound:
     """One ask-round, kept whole for the audit trail."""
 
     round_index: int
     questions: list[InterviewQuestion] = field(default_factory=list)
+    #: Images the model asked for this round.
+    image_requests: list[ImageRequest] = field(default_factory=list)
     verdict: AdequacyVerdict | None = None
     model_claimed_complete: bool = False
     reasoning: str = ""
@@ -208,6 +268,7 @@ class InterviewRound:
         return {
             "round": self.round_index,
             "questions": [q.to_dict() for q in self.questions],
+            "image_requests": [r.to_dict() for r in self.image_requests],
             "verdict": self.verdict.to_dict() if self.verdict else None,
             "model_claimed_complete": self.model_claimed_complete,
             "reasoning": self.reasoning,
@@ -248,6 +309,16 @@ class InterviewLoop:
         #: means it chose to stop; non-zero with nothing accepted means every
         #: question was a repeat, which is a very different thing.
         self.last_proposal_size = 0
+        #: Whether a vision model is configured. Told to the model so it does not
+        #: ask for an upload nothing can read; set by the caller that knows.
+        self.vision_available = False
+        #: Image kinds already attached to this conversation, so the model can see
+        #: it has the tongue photo and ask for the radiograph instead.
+        self.attached_image_kinds: list[str] = []
+        #: Image requests from the most recent composed round.
+        self.last_image_requests: list[ImageRequest] = []
+        #: Kinds requested at any point, so a request is not repeated every round.
+        self.requested_image_kinds: list[str] = []
 
     # ------------------------------------------------------------------ public
     @property
@@ -302,7 +373,23 @@ class InterviewLoop:
             questions, claimed, reasoning, notes = [], False, "", []
             result.composer = "probe_bank"
 
+        result.image_requests = list(self.last_image_requests)
+        for request in result.image_requests:
+            if request.kind not in self.requested_image_kinds:
+                self.requested_image_kinds.append(request.kind)
+
         if not questions:
+            # A round that only requests an image is a complete action, not a
+            # decision to stop asking.
+            if result.image_requests:
+                result.composer = "llm" if result.composer == "llm" else result.composer
+                notes.append("本轮只请求了图片，未提出新问题")
+                result.questions = []
+                result.model_claimed_complete = False
+                result.reasoning = reasoning
+                result.notes = notes
+                self.rounds.append(result)
+                return result
             # "Chose to stop" and "everything it offered was a duplicate" are not
             # the same event, and conflating them would end an interview because of
             # a dedupe accident. Only an empty proposal is a decision to stop.
@@ -347,6 +434,8 @@ class InterviewLoop:
             "asked_axes": list(self.asked_axes),
             "verdict": last.verdict.to_dict() if last and last.verdict else None,
             "composer": last.composer if last else "not_run",
+            "image_requests": [r.to_dict() for r in (last.image_requests if last else [])],
+            "requested_image_kinds": list(self.requested_image_kinds),
             "rounds": self.transcript(),
         }
 
@@ -405,6 +494,8 @@ class InterviewLoop:
             "suggested_probes": plan.suggested_probes,
             "already_asked": self.asked_questions[-12:],
             "round": self.rounds_used + 1,
+            "vision_available": self.vision_available,
+            "images_already_attached": list(self.attached_image_kinds),
             # Advice, not an instruction. Nothing checks that the model acts on
             # it; an axis it keeps declining stays in the adequacy verdict, which
             # is where the consequence lives.
@@ -430,7 +521,7 @@ class InterviewLoop:
                         skill_instructions=getattr(self.skill_spec, "instructions", "") or "")},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
-                tools=[ASK_TOOL], temperature=0.3, max_tokens=1200,
+                tools=[ASK_TOOL, IMAGE_TOOL], temperature=0.3, max_tokens=1200,
             )
             if budget is not None:
                 budget.charge_llm_tokens(response.total_tokens)
@@ -441,6 +532,35 @@ class InterviewLoop:
         if arguments is None:
             return None
         return self._validate(arguments, plan)
+
+    def _read_image_requests(self, arguments: dict[str, Any], notes: list[str]) -> list[ImageRequest]:
+        """Accept image requests from ``image_requests`` or a ``request_image`` call.
+
+        An unknown kind becomes ``other`` rather than dropping the request: the
+        model wanted to see something, and the kind only selects the reading
+        prompt. Asking when no vision model is configured is recorded and dropped,
+        because an upload nothing can read is worse than no request at all.
+        """
+        raw = arguments.get("image_requests") or []
+        if isinstance(raw, dict):
+            raw = [raw]
+        requests: list[ImageRequest] = []
+        for item in raw if isinstance(raw, list) else []:
+            if isinstance(item, str):
+                item = {"kind": item}
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "other").strip()
+            if kind not in REQUESTABLE_IMAGE_KINDS:
+                notes.append(f"图片类型 {kind} 不在支持列表中，已按 other 处理")
+                kind = "other"
+            if not self.vision_available:
+                notes.append(f"模型请求了 {kind} 图片，但未配置视觉模型，已不向对方展示上传模块")
+                continue
+            requests.append(ImageRequest(
+                kind, why=str(item.get("why") or "")[:200],
+                axis_id=str(item.get("axis_id") or "").strip()))
+        return requests[:3]
 
     @staticmethod
     def _ask_arguments(response: Any) -> dict[str, Any] | None:
@@ -453,9 +573,19 @@ class InterviewLoop:
         away questions the model actually composed — so prose is mined for
         interrogatives as a last resort.
         """
+        merged: dict[str, Any] = {}
         for call in getattr(response, "tool_calls", None) or []:
-            if call.name == ASK_TOOL.name and isinstance(call.arguments, dict):
-                return call.arguments
+            if not isinstance(call.arguments, dict):
+                continue
+            if call.name == ASK_TOOL.name:
+                merged.update(call.arguments)
+            elif call.name == IMAGE_TOOL.name:
+                # A round may be a request for an image and nothing else — that is
+                # a complete action, not an empty one.
+                merged.setdefault("questions", [])
+                merged.setdefault("image_requests", []).append(call.arguments)
+        if merged:
+            return merged
         payload = response.json(None) if hasattr(response, "json") else None
         if isinstance(payload, dict):
             for key in ("questions", "asks", "questions_for_patient"):
@@ -475,6 +605,7 @@ class InterviewLoop:
         """
         questions: list[InterviewQuestion] = []
         notes: list[str] = []
+        self.last_image_requests = self._read_image_requests(arguments, notes)
         proposed = arguments.get("questions") or []
         self.last_proposal_size = len(proposed) if isinstance(proposed, list) else 0
 

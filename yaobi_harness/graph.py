@@ -19,7 +19,7 @@ from . import schemas
 from .agent.agents import (
     BiomedicalAgent, ConsultPanelAgent, CriticAgent, DoseAgent, ExpertCaseAgent,
     FormulaAgent, IntakeAgent, InterviewAgent, MedicationSafetyAgent,
-    OsteoporosisAgent, PhysicianReviewAgent, TCMPatternAgent, TimelineAgent,
+    OsteoporosisAgent, PhysicianReviewAgent, SummaryAgent, TCMPatternAgent, TimelineAgent,
     UrgentCareAgent, UrgentPlannerAgent, VisionAgent,
 )
 from .agent.planner import AGENT_CATALOG, PlannerAgent
@@ -111,6 +111,7 @@ class YaobiGraphRunner:
             "DoseAgent": DoseAgent(self.llm),
             "PhysicianReviewAgent": PhysicianReviewAgent(self.llm),
             "CriticAgent": CriticAgent(self.llm),
+            "SummaryAgent": SummaryAgent(self.llm),
             # Registered for skill/output-contract lookup only; the planner is
             # not in AGENT_CATALOG so it can never be scheduled as a task.
             "PlannerAgent": PlannerAgent(self.llm, self.skill_registry),
@@ -265,6 +266,21 @@ class YaobiGraphRunner:
             "knowledge": self._knowledge_meta(),
             "journal": self.journal.summary() if self.journal is not None else {"mode": "off"},
         }
+        self._summarise(state)
+
+    def _summarise(self, state: ClinicalRunState) -> None:
+        """Write the clinical note, last of all.
+
+        Deliberately *after* the release status is settled above rather than as a
+        graph task: ``SummaryAgent`` skips a run that has not concluded, and a task
+        scheduled mid-graph would always see ``needs_more_information`` and skip
+        every time. Keeping it out of ``AGENT_CATALOG`` also means an LLM plan
+        cannot schedule it somewhere it would be useless.
+        """
+        try:
+            self.agents["SummaryAgent"].run(state, self.tools, self._broker(state, "SummaryAgent"))
+        except Exception as exc:  # noqa: BLE001 - a note is an artefact, never a gate
+            state.warn(f"病历摘要生成失败（不影响本次结论）: {type(exc).__name__}: {exc}")
 
     @staticmethod
     def _backfill_questions(state: ClinicalRunState) -> None:

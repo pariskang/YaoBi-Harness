@@ -17,7 +17,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from yaobi_harness import schemas
-from yaobi_harness.llm.base import LLMResponse
+from yaobi_harness.llm.base import LLMResponse, ToolCall
 from yaobi_harness.state import Budget, ClinicalRunState
 from yaobi_harness.tools import CapabilityBroker, ToolRegistry
 from yaobi_harness.vision.client import (
@@ -376,3 +376,121 @@ class ImageReadShapeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelRequestsAnImageTests(unittest.TestCase):
+    """The model decides when a picture would change its judgement, and asks.
+
+    Two things it may not do, and both are about the attestation rather than the
+    picture: it cannot tick 「已去标识化」 on the uploader's behalf (a model
+    asserting that about a file it has never seen would make the attestation
+    meaningless), and it cannot request an upload nothing can read.
+    """
+
+    def loop(self, calls, *, vision: bool = True):
+        from yaobi_harness.interview.adequacy import AdequacyJudge
+        from yaobi_harness.interview.loop import InterviewLoop
+
+        class Stub:
+            name, model, available = "stub", "stub", True
+
+            def chat(self, messages, tools=None, **kwargs):
+                self.saw_tools = [t.name for t in (tools or [])]
+                return LLMResponse(tool_calls=calls)
+
+        model = Stub()
+        loop = InterviewLoop(model, judge=AdequacyJudge())
+        loop.vision_available = vision
+        loop.model = model
+        return loop
+
+    def test_the_request_tool_is_offered_alongside_asking(self):
+        from yaobi_harness.interview.loop import ASK_TOOL, IMAGE_TOOL
+
+        loop = self.loop([ToolCall("ask_patient", {"questions": []}, "c1")])
+        loop.next_round({}, "腰痛", budget=Budget())
+        self.assertEqual(set(loop.model.saw_tools), {ASK_TOOL.name, IMAGE_TOOL.name})
+
+    def test_a_request_riding_along_with_questions(self):
+        """Many gateways surface one tool call per turn, so asking and requesting
+        must be possible in the same call."""
+        loop = self.loop([ToolCall("ask_patient", {
+            "questions": [{"axis_id": "four_diagnoses", "question": "方便拍张舌头照片吗？"}],
+            "image_requests": [{"kind": "tongue", "why": "舌象决定辨证方向"}]}, "c1")])
+        result = loop.next_round({}, "腰痛", budget=Budget())
+        self.assertEqual([q.question for q in result.questions], ["方便拍张舌头照片吗？"])
+        self.assertEqual(result.image_requests[0].kind, "tongue")
+        self.assertEqual(result.image_requests[0].why, "舌象决定辨证方向")
+
+    def test_a_standalone_request_is_a_complete_round(self):
+        """Asking for a picture and nothing else is an action, not an empty turn."""
+        loop = self.loop([ToolCall("request_image",
+                                   {"kind": "limb_surface", "why": "看小腿是否发紫肿胀"}, "c1")])
+        result = loop.next_round({}, "小腿肿胀2天", budget=Budget())
+        self.assertEqual(result.image_requests[0].kind, "limb_surface")
+        self.assertEqual(result.questions, [])
+        self.assertNotEqual(result.composer, "llm_complete",
+                            "requesting an image is not deciding to stop")
+        self.assertTrue(any("只请求了图片" in n for n in result.notes))
+
+    def test_an_unknown_kind_becomes_other_rather_than_being_dropped(self):
+        loop = self.loop([ToolCall("request_image", {"kind": "ultrasound", "why": "x"}, "c1")])
+        result = loop.next_round({}, "腰痛", budget=Budget())
+        self.assertEqual(result.image_requests[0].kind, "other")
+        self.assertTrue(any("不在支持列表" in n for n in result.notes))
+
+    def test_no_request_survives_when_no_vision_model_is_configured(self):
+        """An upload nothing will look at wastes the patient's effort and trust."""
+        loop = self.loop([ToolCall("request_image", {"kind": "tongue", "why": "x"}, "c1")],
+                         vision=False)
+        result = loop.next_round({}, "腰痛", budget=Budget())
+        self.assertEqual(result.image_requests, [])
+        self.assertTrue(any("未配置视觉模型" in n for n in result.notes))
+
+    def test_the_model_is_told_whether_vision_is_available(self):
+        import json as _json
+
+        loop = self.loop([ToolCall("ask_patient", {"questions": []}, "c1")], vision=False)
+        captured = []
+
+        original = loop.llm.chat
+
+        def spy(messages, **kwargs):
+            captured.append(messages[-1]["content"])
+            return original(messages, **kwargs)
+
+        loop.llm.chat = spy
+        loop.next_round({}, "腰痛", budget=Budget())
+        self.assertIs(_json.loads(captured[0])["vision_available"], False)
+
+    def test_an_attached_image_is_reported_back_to_the_model(self):
+        """So it can see it has the tongue photo and ask for the radiograph instead."""
+        import json as _json
+
+        from yaobi_harness.conversation import ConversationSession
+
+        convo = ConversationSession(role="patient")
+        convo.attach_image("data:image/png;base64,AAAA", kind="tongue", deidentified=True)
+        self.assertEqual(convo.interview.attached_image_kinds, ["tongue"])
+        _json.dumps(convo.interview.attached_image_kinds)
+
+    def test_the_request_reaches_the_reply(self):
+        from yaobi_harness.conversation import ConversationSession
+        from yaobi_harness.graph import YaobiGraphRunner
+
+        class Asker:
+            name, model, available = "asker", "asker", True
+
+            def chat(self, messages, tools=None, **kwargs):
+                if "问诊智能体" in messages[0]["content"]:
+                    return LLMResponse(tool_calls=[ToolCall("request_image", {
+                        "kind": "tongue", "why": "舌象决定辨证"}, "c1")])
+                return LLMResponse(text="{}")
+
+        runner = YaobiGraphRunner(llm=Asker())
+        convo = ConversationSession(role="patient", runner=runner)
+        convo.interview.vision_available = True
+        reply = convo.send("腰痛3个月，久坐加重")
+        self.assertEqual(reply.image_requests[0]["kind"], "tongue")
+        self.assertNotIn("deidentified", reply.image_requests[0],
+                         "the attestation is the uploader's, never the model's")

@@ -370,6 +370,11 @@ class ConsoleService:
             "session_id": session.session_id,
             "interview": session.interview.summary(session.facts, session.complaint, role=session.role),
             "reply": reply.to_dict(),
+            # Surfaced at the top level as well as inside ``reply``: the page opens
+            # its upload module from this, and a client that only reads the envelope
+            # should not have to know where the request came from.
+            "image_requests": reply.image_requests,
+            "clinical_note": reply.clinical_note,
             "audit": console_payload(session.state, session.role)["audit"] if session.state else {},
             "meta": console_payload(session.state, session.role)["meta"] if session.state else {},
             "turn_count": len(session.turns),

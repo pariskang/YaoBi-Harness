@@ -524,8 +524,9 @@ pre.json {
           <div class="tierbar" id="tierBar" title="按层级的覆盖率：红旗 / 核心 / 专科 / 中医四诊 / 背景"></div>
           <div id="axisPanel"></div>
         </div>
-        <div class="field">
+        <div class="field" id="imgField">
           <label class="lbl">图片 <em>影像翻拍 / 舌象 / 体态 / 患肢 / 报告单</em></label>
+          <div id="imgAsk"></div>
           <label class="check">
             <input type="checkbox" id="imgDeid">
             <div>已去标识化<small>已遮盖姓名、各类编号、日期、条码与人脸；勾选后才能上传</small></div>
@@ -954,7 +955,8 @@ function renderRun() {
     ["safety", "安全审查", blockers],
     ["raw",    "原始 JSON", null],
   ];
-  if (LAST.journal) tabs.splice(5, 0, ["replay", "离线复核", LAST.journal.entries || null]);
+  if (audit.clinical_note) tabs.splice(1, 0, ["note", "病历摘要", null]);
+  if (LAST.journal) tabs.splice(-2, 0, ["replay", "离线复核", LAST.journal.entries || null]);
 
   $("#result").replaceChildren(el(`
     <div class="hero t-${info.tone}">
@@ -1007,10 +1009,11 @@ const roleName = (r) => ({ patient:"患者", physician:"医师", researcher:"研
 function renderTab() {
   const body = $("#tabBody");
   const { delivered, audit, meta } = LAST;
-  const fns = { answer:tabAnswer, plan:tabPlan, intake:tabIntake, meds:tabMeds,
+  const fns = { answer:tabAnswer, note:tabNote, plan:tabPlan, intake:tabIntake, meds:tabMeds,
                 evidence:tabEvidence, safety:tabSafety, replay:tabReplay, raw:tabRaw };
   body.replaceChildren(el((fns[ACTIVE_TAB] || tabAnswer)(delivered, audit, meta)));
   if (ACTIVE_TAB === "replay") bindReplay();
+  if (ACTIVE_TAB === "note") bindNote();
 }
 
 /* ── tab: delivered answer ─────────────────────────────────── */
@@ -1435,6 +1438,63 @@ function tabSafety(d, audit) {
       <ul class="list">${audit.dose_safety.blockers.map(b => `<li>${esc(b)}</li>`).join("")}</ul></div>` : ""}`;
 }
 
+/* ── tab: the structured clinical note ─────────────────────────
+   The artefact a clinician actually needs at the end. Produced only once the
+   consultation concluded, and stamped with whether a physician has signed — the
+   stamp is part of the structure, so a surface cannot render the note and lose
+   the caveat. */
+function tabNote(d, audit, meta) {
+  const note = audit.clinical_note;
+  if (!note) return emptyBlock("本次运行尚未得出结论，暂不生成病历摘要");
+  const authored = note.composed_by === "llm";
+  return `<div class="sec">
+    <div class="hero-meta" style="margin-bottom:12px">
+      ${badge(note.status_label, note.release_status === "approved_by_physician" ? "ok" : "warn")}
+      ${badge(authored ? "模型撰写" : "确定性拼装", authored ? "accent" : "mute")}
+      ${badge("可放行证据 " + (note.evidence_ids || []).length, "mute")}
+      ${(note.citations || []).length ? badge("引用 " + note.citations.length + " 源", "mute") : ""}
+    </div>
+    <div class="note ${note.release_status === "approved_by_physician" ? "n-ok" : "n-warn"}">
+      <span class="ico">◎</span><div>${esc(note.disclaimer)}</div></div>
+    <div style="display:flex;gap:8px;margin:14px 0">
+      <button class="btn btn-ghost" id="noteCopy">复制病历文本</button>
+      <button class="btn btn-ghost" id="noteToggle">切换：分节 / 纯文本</button>
+    </div>
+    <div id="noteSections">${(note.sections || []).map(section => `
+      <div class="row"><div class="k">${esc(section.title)}</div>
+        <div class="v" style="white-space:pre-wrap">${esc(section.text)}</div></div>`).join("")}</div>
+    <pre class="json" id="noteText" hidden>${esc(note.text || "")}</pre>
+    ${(note.citations || []).length ? `<h3 style="margin-top:18px">引用来源</h3>
+      <ul class="list">${note.citations.map(c => `<li>${esc([c.source, c.version, c.license,
+        c.retrieved_at].filter(Boolean).join(" / "))}</li>`).join("")}</ul>` : ""}
+  </div>`;
+}
+
+function bindNote() {
+  const text = () => (LAST.audit.clinical_note || {}).text || "";
+  $("#noteToggle")?.addEventListener("click", () => {
+    const pre = $("#noteText"), sections = $("#noteSections");
+    pre.hidden = !pre.hidden;
+    sections.hidden = !pre.hidden;
+  });
+  $("#noteCopy")?.addEventListener("click", async () => {
+    const button = $("#noteCopy");
+    try {
+      // Clipboard access is blocked in a cross-origin iframe, which is exactly
+      // where this console usually runs, so the textarea path is the real one.
+      await navigator.clipboard.writeText(text());
+    } catch {
+      const area = document.createElement("textarea");
+      area.value = text();
+      document.body.appendChild(area);
+      area.select();
+      try { document.execCommand("copy"); } finally { area.remove(); }
+    }
+    button.textContent = "已复制";
+    setTimeout(() => { button.textContent = "复制病历文本"; }, 1500);
+  });
+}
+
 /* ── tab: offline replay ───────────────────────────────────────
    Checkpoints record what the state *was*. An audit asks a different question:
    was this decision derivable from what the system actually saw? The journal
@@ -1690,6 +1750,8 @@ function replyMeta(reply) {
     ${reply.escalated ? badge("本轮升级","danger") : ""}
     ${reply.composer === "llm" ? badge("模型撰写","accent") : badge("确定性模板","mute")}
     ${reply.awaiting_answer ? "" : badge("已达终态","mute")}
+    ${(reply.image_requests || []).length ? badge("请求上传图片","accent") : ""}
+    ${reply.clinical_note ? badge("已生成病历摘要","ok") : ""}
   </div>`;
 }
 
@@ -1742,6 +1804,7 @@ async function chatSend(text) {
     $("#chatTurns").textContent = `${data.turn_count} 条消息`;
     renderInterview({ ...(data.interview || {}), ...(reply.interview || {}),
                       coverage: (data.interview || {}).coverage || {} });
+    renderImageAsk(data.image_requests || reply.image_requests);
     if ((reply.interview || {}).notes?.length) {
       pendingBubble.appendChild(el(
         `<div class="learned">提问记录：${esc(reply.interview.notes.join("；"))}</div>`));
@@ -1770,6 +1833,10 @@ async function chatSend(text) {
 
     // Keep the run inspector in sync so the other tabs show this turn's audit.
     LAST = { delivered: reply.delivered, audit: data.audit, meta: data.meta };
+    if (reply.clinical_note) {
+      pendingBubble.appendChild(el(`<div class="learned">已生成病历摘要（${
+        esc(reply.clinical_note.status_label)}）——在「单次运行」页的「病历摘要」标签查看与复制。</div>`));
+    }
   } catch (e) {
     pendingBubble.textContent = "出错了：" + e.message;
   } finally {
@@ -1805,6 +1872,26 @@ async function chatOpen() {
   } finally {
     log.scrollTop = log.scrollHeight;
   }
+}
+
+/* The model asked to see something. Open the module and preselect the kind —
+   but never tick 「已去标识化」 for the operator: that attestation is theirs, and a
+   model asserting it about a file it has not seen would make it meaningless. */
+function renderImageAsk(requests) {
+  const box = $("#imgAsk");
+  if (!requests?.length) { box.replaceChildren(); return; }
+  const first = requests[0];
+  const select = $("#imgKind");
+  if ([...select.options].some(o => o.value === first.kind)) select.value = first.kind;
+  const label = [...select.options].find(o => o.value === first.kind)?.textContent || first.kind;
+  box.replaceChildren(el(`<div class="note n-info" style="margin:8px 0">
+    <span class="ico">◎</span><div>
+      <b>智能体请求上传${esc(label)}</b>
+      ${requests.map(r => `<br>· ${esc(r.why || "")}`).join("")}
+      <br><small>类型已预选。上传前请先遮盖姓名、各类编号、日期、条码与人脸，
+      然后勾选「已去标识化」——这一步只能由你确认。</small>
+    </div></div>`));
+  box.scrollIntoView({ block: "nearest" });
 }
 
 function renderOpeningChips(reply) {

@@ -342,6 +342,9 @@ class InterviewAgent(BaseAgent):
             "rounds_used": loop.rounds_used,
             "composer": round_result.composer,
             "notes": round_result.notes,
+            # Images the model asked for. A surface opens its upload module from
+            # this; the de-identification attestation stays with the uploader.
+            "image_requests": [r.to_dict() for r in round_result.image_requests],
             "model_claimed_complete": round_result.model_claimed_complete,
             "_produced_by": "llm_interview_loop" if round_result.composer == "llm" else "probe_bank",
         }
@@ -1281,3 +1284,80 @@ class CriticAgent(BaseAgent):
             if rng and dose is not None and not (rng[0] <= float(dose) <= rng[1]):
                 out.append(f"{herb.get('herb_name')}:{dose}g∉{rng}")
         return out
+
+
+# -------------------------------------------------------------------- summary
+
+class SummaryAgent(BaseAgent):
+    """Writes the structured clinical note, once the consultation has concluded.
+
+    Runs last and skips itself when the run has not concluded — a note over an
+    unfinished history is a misleading document, and producing one on every turn of
+    a dialogue would mean the note that matters is buried under five that do not.
+
+    The deterministic note is assembled first and handed to the model as material.
+    That ordering matters: it means the model is *editing a record built from the
+    run* rather than writing a record from a prompt, so a section it leaves out
+    falls back to what the run established instead of vanishing.
+    """
+
+    name = "SummaryAgent"
+    skill_id = "yaobi.clinical_summary"
+    output_schema = "ClinicalNoteSections"
+    output_key = "clinical_note"
+
+    def run(self, state, tools, broker):
+        from ..summary import build_note, is_concluded, redact_doses
+
+        if not is_concluded(state):
+            state.trace(self.name, "summary_skipped",
+                        output_summary=f"未结束（{state.release_status}），不生成病历摘要")
+            return state
+
+        note = build_note(state, narrative=state.outputs.get("_narrative"))
+        # The deterministic note is free and always produced. The *authored* one
+        # costs a model call, so in a dialogue it waits until the enquiry has
+        # actually stopped — otherwise a six-turn conversation pays for six notes
+        # and only the last is ever read. ``_narrative`` is present exactly when a
+        # conversation is driving the run, so a single-shot run (which has no next
+        # turn to wait for) is authored immediately.
+        mid_dialogue = state.outputs.get("_narrative") is not None and bool(state.open_questions)
+        if mid_dialogue:
+            state.outputs[self.output_key] = note.to_dict()
+            state.outputs[self.output_key]["text"] = note.to_text()
+            state.trace(self.name, "clinical_note_draft",
+                        output_summary="问诊仍在进行，先给确定性摘要；收尾时再由模型撰写")
+            return state
+
+        material = note.to_dict()
+        # ``run_id`` is bookkeeping the model has no use for, and putting it in a
+        # prompt makes the call unreplayable: request hashes cover content, so a
+        # per-run identifier means the same decision hashes differently every time.
+        # Same reasoning that kept the model name out of the request body.
+        material.pop("run_id", None)
+        result = self.autonomous(
+            state, tools, broker,
+            objective="把本次运行整理成结构化门诊病历摘要。逐节要求见技能说明。",
+            context={
+                "deterministic_note": material,
+                "release_status": state.release_status,
+                "risk_mode": state.risk_mode,
+                "role": state.role,
+            },
+        )
+        if result is not None and isinstance(result.output, dict):
+            # Section by section, and only where the model actually wrote something:
+            # an empty string from the model must not erase what the run knew.
+            for key, value in result.output.items():
+                if key in note.sections and isinstance(value, str) and value.strip():
+                    note.sections[key] = redact_doses(value.strip())
+            note.composed_by = "llm"
+
+        state.outputs[self.output_key] = note.to_dict()
+        state.outputs[self.output_key]["text"] = note.to_text()
+        state.trace(
+            self.name, "clinical_note",
+            output_summary=f"{note.composed_by} 撰写；{len(note.evidence_ids)} 条可放行证据",
+            evidence_ids=note.evidence_ids[:6],
+        )
+        return state

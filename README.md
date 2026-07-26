@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-577%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-614%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -89,7 +89,8 @@ Yaobi-Harness 是一个 **证据受控的骨科/腰痹多智能体临床决策�
 自主性的确切边界见 [docs/AUTONOMY.md](docs/AUTONOMY.md)；
 问诊追问见 [docs/INTERVIEW.md](docs/INTERVIEW.md)，
 会诊子体与技能库见 [docs/PANEL.md](docs/PANEL.md)，
-视觉判读见 [docs/VISION.md](docs/VISION.md)。
+视觉判读见 [docs/VISION.md](docs/VISION.md)，
+病历摘要见 [docs/SUMMARY.md](docs/SUMMARY.md)。
 
 > 严禁把原始 Excel 身份数据提交、打包或直接返回给模型。病例检索只能使用脱敏 ETL 后的结构化字段；含剂量方剂只能以
 > `draft_for_physician` 作为医师草案，未逐味审核签名不得发布为最终处方。
@@ -143,6 +144,44 @@ python -m yaobi_harness interview --complaint "68岁女性腰痛3月，走远了
 ```
 
 完整说明见 [docs/INTERVIEW.md](docs/INTERVIEW.md)。
+
+## 智能体自己调图，和最后的病历摘要
+
+**需要看图时，模型主动要。** 它调用 `request_image`（或在 `ask_patient` 里带
+`image_requests`），界面随即打开上传模块并**预选好类型**，同时把模型给的理由展示出来
+（"舌象能把气滞血瘀和寒湿分开，直接影响用药方向"）。什么时候值得要写在技能说明里：
+舌象决定辨证、患肢外观提示血管或骨筋膜室问题、报告单翻拍把"患者转述"换成原始记录。
+什么时候不要：为了完整而收集影像——那是负担不是帮助。
+
+两条边界，都不是对模型判断的限制：
+
+* **去标识化仍由人确认。** 模型不能替对方勾选「已去标识化」，也不能声称已确认——
+  它没看过那个文件，由它断言等于让这项声明失去意义。
+* **没配置视觉模型时请求会被拦下并记录**。上传了也读不了的图，只是白费对方的力气。
+
+**得出结论后自动生成结构化病历摘要**，按门诊病历的节次排列：主诉 / 现病史 / 既往史与用药 /
+中医四诊 / 查体与量表 / 辅助检查与影像 / 西医诊断（鉴别）/ 中医诊断与证型 / 风险评估与红旗 /
+用药安全 / 治疗计划 / 处方草案 / 医嘱 / 随访 / 不确定性与局限，附引用来源与证据台账。
+
+```bash
+python -m yaobi_harness run --complaint "..." --facts '{...}' --summary   # 直接打印病历文本
+python -m yaobi_harness chat --role patient        # 对话里输入 /note 查看
+```
+
+三条设计要点：
+
+* **不新增任何临床事实。** 每一节都来自 `state.outputs`、`state.facts` 与证据台账。
+  没有来源的节印成「未采集」而不是省略——一份悄悄漏掉既往史的病历，
+  读起来像"没有相关既往史"，那是完全不同的临床断言。
+* **有剂量当且仅当确定性链路产出了剂量。** 处方一节原样复现草案与逐味签名状态，
+  其余各节不含克数；模型写的叙述若出现克数会被隐去。
+* **它会说明自己是什么。** 未经医师签名的摘要带「草案」标记，标记是**结构的一部分**，
+  所以只渲染已知字段的前端也丢不掉这条。
+
+摘要由模型撰写（技能 `yaobi.clinical_summary`），确定性拼装版作为素材交给它——
+这个顺序意味着模型在**编辑一份由运行产生的记录**，而不是照提示词写一份记录，
+所以它漏掉的节会回落到运行已确立的内容，而不是凭空消失。多轮对话里，
+确定性版本每轮都有（免费），模型撰写的版本**只在问诊收尾时跑一次**。
 
 ## 多轮对话
 
@@ -433,5 +472,5 @@ LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 577 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 614 个用例，无需 pytest 与网络
 ```

@@ -174,6 +174,9 @@ REPLY_SYSTEM_PROMPT = """你是骨科智能体，正在直接和{role}对话。*
    如果不是急症，不要用急症口吻——对慢性腰痛说"立即拨打120"会让人不再相信你。
 4. **把要问的问题自然带进去。** 材料里的 `questions` 是你上一步自己拟的，
    照你的原话问，不要改写成别的问题。
+   材料里如果有 `image_requests`，说明你上一步请求了图片——在回复里自然地说明
+   要拍什么、为什么，并提醒对方**上传前先遮盖姓名、各类编号、日期、条码与人脸**。
+   界面会自动打开上传模块并预选类型。
 5. **不写具体药名剂量。** 处方必须走医师逐味审核签名的流程，这是法定环节，
    不是表达偏好。其余内容你怎么写都可以。
 6. 长度自便，通常 4–8 句最合适。
@@ -248,6 +251,13 @@ class AgentReply:
     interview: dict[str, Any] = field(default_factory=dict)
     #: Questions with their axis and tier, for a surface that wants to group them.
     structured_questions: list[dict[str, Any]] = field(default_factory=list)
+    #: Images the model asked for this turn. A surface should open its upload
+    #: module with ``kind`` preselected; the de-identification attestation stays
+    #: with the person uploading.
+    image_requests: list[dict[str, Any]] = field(default_factory=list)
+    #: The structured clinical note, once the consultation has concluded.
+    #: ``None`` on every earlier turn.
+    clinical_note: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -618,6 +628,11 @@ class ConversationSession:
             skill_spec=getattr(self.runner, "skill_registry", None)
             and self.runner.skill_registry.specs.get("yaobi.interview"),
         )
+        # The interview needs to know whether an image it asks for can be read.
+        # Asking for an upload that nothing will look at wastes the patient's
+        # effort and their trust.
+        vision = getattr(getattr(self.runner, "tools", None), "vision", None)
+        self.interview.vision_available = bool(getattr(vision, "available", False))
         interview_agent = getattr(self.runner, "agents", {}).get("InterviewAgent")
         if interview_agent is not None:
             interview_agent.loop = self.interview
@@ -778,17 +793,36 @@ class ConversationSession:
         run records who asserted de-identification. Bytes are not copied anywhere:
         ``ref`` is a path or a ``data:`` URI that the vision tool reads once.
         """
-        from .vision.client import IMAGE_KINDS
+        from .vision.client import IMAGE_KINDS  # noqa: PLC0415 - optional stack
 
         if kind not in IMAGE_KINDS:
             raise ValueError(f"未知图片类型 {kind!r}；支持 {list(IMAGE_KINDS)}")
         entry = {"kind": kind, "ref": ref, "deidentified": bool(deidentified)}
         self.images.append(entry)
+        # So the model can see it already has the tongue photo and ask for the
+        # radiograph instead of asking for the same thing again.
+        if kind not in self.interview.attached_image_kinds:
+            self.interview.attached_image_kinds.append(kind)
         return entry
+
+    def clinical_note(self) -> dict[str, Any] | None:
+        """The structured note for this conversation, or ``None`` if not concluded.
+
+        A convenience over ``state.outputs``: the note is produced by the run, so
+        this reads rather than recomputes. Recomputing would risk a second answer
+        that differs from the one already delivered.
+        """
+        return (self.state.outputs.get("clinical_note") if self.state else None)
+
+    def note_text(self) -> str:
+        note = self.clinical_note()
+        return (note or {}).get("text", "")
 
     def _run(self) -> ClinicalRunState:
         state = ClinicalRunState(complaint=self.complaint, role=self.role)
         state.facts.update(self.facts)
+        # The note wants the patient's own words per turn, not one fused string.
+        state.outputs["_narrative"] = list(self.narrative)
         state.images = [dict(i) for i in self.images]
         state.budget = self.budget_factory()
         return self.runner.run(state, allow_prescription=self.allow_prescription)
@@ -900,6 +934,8 @@ class ConversationSession:
             composer=composer,
             interview=self._interview_meta(record),
             structured_questions=structured,
+            image_requests=[dict(r) for r in record.get("image_requests") or []],
+            clinical_note=state.outputs.get("clinical_note"),
         )
 
     def _interview_meta(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -920,6 +956,7 @@ class ConversationSession:
             # the quote each rests on. Surfaced because closing one is what lets a
             # run reach a dose draft.
             "closed_by_reviewer": verdict.get("closed_by_reviewer", []),
+            "image_requests": record.get("image_requests", []),
             "still_missing_axes": verdict.get("missing_labels", []),
             "contradictions": verdict.get("contradictions", []),
             "coverage_ratio": coverage.get("ratio", 0.0),
@@ -1013,6 +1050,10 @@ class ConversationSession:
             "medication_findings": delivered.get("medication_warnings") or [],
             "urgent_plan": delivered.get("urgent") or {},
             "questions": [q["question"] for q in structured],
+            "image_requests": [
+                dict(r) for r in
+                ((self.state.outputs.get("interview") or {}).get("image_requests") or [])
+            ],
             "safety_notices": list(self.state.safety_issues),
             "notes": list(getattr(self.state, "notes", [])),
             "disclaimer": delivered.get("disclaimer", ""),

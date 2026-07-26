@@ -111,6 +111,25 @@ SCHEMAS: dict[str, dict[str, tuple[bool, tuple[type, ...]]]] = {
         "suggest_exam": (False, (list,)),
         "caveat": (False, (str,)),
     },
+    # The narrative sections of the clinical note. Only the sections a model adds
+    # value to are required; the structured ones (prescription, evidence,
+    # citations) are assembled deterministically and are not the model's to write.
+    "ClinicalNoteSections": {
+        "chief_complaint": (True, (str,)),
+        "present_illness": (True, (str,)),
+        "western_diagnosis": (True, (str,)),
+        "tcm_diagnosis": (False, (str,)),
+        "risk_assessment": (False, (str,)),
+        "treatment_plan": (True, (str,)),
+        "advice": (False, (str,)),
+        "followup": (False, (str,)),
+        "uncertainty": (True, (str,)),
+        "past_history": (False, (str,)),
+        "four_diagnoses": (False, (str,)),
+        "examination": (False, (str,)),
+        "investigations": (False, (str,)),
+        "medication_safety": (False, (str,)),
+    },
 }
 
 #: Image kinds whose findings may never claim to stand in for a formal report.

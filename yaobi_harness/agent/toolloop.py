@@ -215,8 +215,13 @@ class ToolLoop:
         if not self.available:
             result.mode, result.error = "llm_unavailable", "no model configured"
             return result
-        if not specs:
-            result.mode, result.error = "no_tools_for_skill", f"{self.skill_id} grants no tools"
+        # A skill with no tools is not a skill that cannot run. Some work is pure
+        # composition over material already gathered — writing the clinical note is
+        # exactly that — and refusing to run the model there conflates "may call a
+        # tool" with "may think". A skill that *needs* a tool it was not granted
+        # fails on the broker, which is where a permission failure belongs.
+        if not specs and self.skill_spec is None:
+            result.mode, result.error = "no_skill", f"{self.skill_id} is not registered"
             return result
 
         messages = [
@@ -230,7 +235,7 @@ class ToolLoop:
                 result.mode, result.error = "llm_budget_exhausted", "LLM 预算耗尽"
                 return self._finish(result)
             try:
-                response = self.llm.chat(messages, tools=specs, temperature=0.0, max_tokens=1600)
+                response = self.llm.chat(messages, tools=specs or None, temperature=0.0, max_tokens=1600)
             except (LLMError, Exception) as exc:  # noqa: BLE001 - never break the run
                 result.steps.append(LoopStep(step, "error", summary=f"{type(exc).__name__}: {exc}"[:200], ok=False))
                 result.mode, result.error = "llm_error", f"{type(exc).__name__}"

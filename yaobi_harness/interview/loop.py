@@ -35,7 +35,16 @@ its output:
   removing "9克" costs the patient nothing, discarding the question costs them
   the enquiry.
 
-What still bounds the loop: questions per round, rounds per interview, and a
+* **Stopping is the model's decision.** It used to be skipped entirely whenever
+  the reviewer said ``achieved`` / ``stalled`` / ``cap_reached`` — a rule decided
+  the consultation was over without asking the clinician in the room. The
+  reviewer's opinion is now in the prompt as ``reviewer_opinion``, and the model
+  ends the enquiry by returning an empty question list.
+* **The per-round limit defers, it does not drop.** Six questions is what a person
+  will read in one message; anything beyond that is reported and carried, not
+  silently cut.
+
+What still bounds the loop: a readability limit per round, the LLM budget, and a
 deterministic probe-bank fallback for when there is no model at all.
 """
 
@@ -50,8 +59,10 @@ from ..llm.base import LLMError, ToolSpec
 from .adequacy import AdequacyJudge, AdequacyVerdict
 from .axes import AXES_BY_ID, coverage, plan_next
 
-#: Questions one round may contain. More than this and a patient stops reading.
-MAX_QUESTIONS_PER_ROUND = 4
+#: Questions one round may contain. Not a policy about what the model may think
+#: about — a limit on what a person will actually read and answer in one message.
+#: Exceeding it is reported rather than silently truncated.
+MAX_QUESTIONS_PER_ROUND = 6
 
 #: Phrasings that mean the model has started advising instead of asking.
 ADVICE_PATTERNS = (
@@ -143,8 +154,12 @@ INTERVIEW_SYSTEM_PROMPT = """你是骨科门诊的**问诊智能体**。你的�
    对方更愿意配合。唯一的例外是**不要写出具体药名剂量**（会被隐去），
    因为处方必须走医师签名流程。
 7. `axis_id` 尽量填对应的轴，填不上就留空——留空的问题照样会问出去。
-8. 如果你认为病史确实已经足够，把 `interview_complete` 置 true——但仍要给出你认为
-   最后值得确认的问题；这个判断会被独立审核者复核。"""
+8. **结束问诊是你的决定：返回空的 `questions` 列表即可。** `reviewer_opinion` 里是一个
+   独立审核者的看法（`achieved` = 它认为已充分，`stalled` = 它认为连续几轮没有新信息）,
+   那只是参考——它认为该停而你还想追一句，就继续追；它认为没问够而你判断可以收，
+   返回空列表就结束。未闭合的必答轴只影响能不能进入含剂量环节。
+9. 一轮最多 {max_questions} 个问题，这是"患者读不完"的限制，不是对问题内容的判断；
+   超出的会自动留到下一轮，不会丢。"""
 
 
 @dataclass
@@ -227,6 +242,12 @@ class InterviewLoop:
         #: Required axes the model chose not to raise last round. Handed back as
         #: advice on the next prompt instead of being substituted into the round.
         self.advisory_open_axes: list[str] = []
+        #: Questions past the per-round readability limit. Reported, not discarded.
+        self.deferred_questions: list[str] = []
+        #: How many questions the model *proposed* last round, before dedupe. Zero
+        #: means it chose to stop; non-zero with nothing accepted means every
+        #: question was a repeat, which is a very different thing.
+        self.last_proposal_size = 0
 
     # ------------------------------------------------------------------ public
     @property
@@ -243,17 +264,23 @@ class InterviewLoop:
         prescriptive: bool = False,
         budget: Any | None = None,
     ) -> InterviewRound:
-        """Produce the next set of questions plus the adequacy verdict."""
+        """Produce the next set of questions plus the adequacy verdict.
+
+        The model is consulted on **every** round, including rounds the judge
+        thinks are over. It used to be skipped whenever the verdict was
+        ``achieved`` / ``stalled`` / ``cap_reached``, which meant a rule decided
+        the consultation was finished without the clinician in the room being
+        asked — and "问够了" is a clinical judgement. The verdict now goes into the
+        prompt as advice; **the model ending the enquiry is the model returning no
+        questions.**
+        """
         verdict = self.judge.judge(
             facts, complaint, role=role, risk_mode=risk_mode,
             prescriptive=prescriptive, rounds_used=self.rounds_used, budget=budget,
         )
         round_index = self.rounds_used + 1
         result = InterviewRound(round_index, verdict=verdict)
-
-        if verdict.verdict in ("achieved", "stalled", "cap_reached"):
-            self.rounds.append(result)
-            return result
+        settled = verdict.verdict in ("achieved", "stalled", "cap_reached")
 
         plan = plan_next(
             facts, complaint, role=role, risk_mode=risk_mode,
@@ -266,24 +293,36 @@ class InterviewLoop:
                 plan.axis_ids.append(axis_id)
                 plan.suggested_probes.setdefault(axis_id, list(AXES_BY_ID[axis_id].probes))
 
-        composed = self._compose(plan, facts, complaint, role=role, risk_mode=risk_mode, budget=budget)
+        composed = self._compose(plan, facts, complaint, role=role, risk_mode=risk_mode,
+                                 budget=budget, verdict=verdict)
         if composed is not None:
             questions, claimed, reasoning, notes = composed
             result.composer = "llm"
         else:
-            questions, claimed, reasoning, notes = self._from_probe_bank(plan), False, "", []
+            questions, claimed, reasoning, notes = [], False, "", []
             result.composer = "probe_bank"
 
         if not questions:
-            # No new question came back — either the model was not asked, or
-            # everything it offered had already been asked. This is the one place
-            # the bank still supplies questions, and it is not a substitution:
-            # there was nothing of the model's to substitute for. Say so, because
-            # a silent swap is how "提问来源=probe_bank" became inexplicable.
-            questions = self._from_probe_bank(plan)
+            # "Chose to stop" and "everything it offered was a duplicate" are not
+            # the same event, and conflating them would end an interview because of
+            # a dedupe accident. Only an empty proposal is a decision to stop.
+            if result.composer == "llm" and not self.last_proposal_size:
+                result.composer = "llm_complete"
+                notes.append("模型本轮选择不再提问" + ("（审核者也判定问诊已充分）" if settled else ""))
+                result.questions = []
+                result.model_claimed_complete = claimed or settled
+                result.reasoning = reasoning
+                result.notes = notes
+                self.rounds.append(result)
+                return result
+            if result.composer == "probe_bank" and settled:
+                # No model, and the rules are satisfied: nothing to ask.
+                self.rounds.append(result)
+                return result
             if result.composer == "llm":
-                notes.append("模型本轮没有给出新问题（全部与此前重复），已改用题库继续推进")
-            result.composer = "probe_bank"
+                notes.append("模型本轮的问题全部与此前重复，已改用题库继续推进")
+                result.composer = "probe_bank"
+            questions = self._from_probe_bank(plan)
 
         result.questions = questions
         result.model_claimed_complete = claimed
@@ -320,10 +359,15 @@ class InterviewLoop:
             if axis is None:
                 continue
             fresh = next((p for p in axis.probes if p not in self.asked_questions), None)
+            if fresh is None:
+                # Every probe for this axis has been asked. Re-asking the first one
+                # — which is what this used to do — is the "system isn't listening"
+                # failure in its purest form: the patient answered, and the same
+                # words come back. Skip the axis; it stays in the coverage report,
+                # which is the honest place for "asked, still not closed".
+                continue
             questions.append(InterviewQuestion(
-                axis_id, fresh or (axis.probes[0] if axis.probes else axis.label),
-                why=axis.rationale, origin="probe_bank",
-            ))
+                axis_id, fresh, why=axis.rationale, origin="probe_bank"))
             if len(questions) >= self.max_questions:
                 break
         return questions
@@ -337,6 +381,7 @@ class InterviewLoop:
         role: str,
         risk_mode: str,
         budget: Any | None,
+        verdict: Any | None = None,
     ) -> tuple[list[InterviewQuestion], bool, str, list[str]] | None:
         """Ask the model to compose the round. ``None`` means it did not run."""
         if self.llm is None or not getattr(self.llm, "available", False):
@@ -368,6 +413,14 @@ class InterviewLoop:
                  "why": AXES_BY_ID[axis_id].rationale}
                 for axis_id in self.advisory_open_axes if axis_id in AXES_BY_ID
             ],
+            # What the independent reviewer currently thinks, as advice. When it
+            # says the history is adequate the model is still asked — stopping is
+            # its call, made by returning an empty question list.
+            "reviewer_opinion": {
+                "verdict": getattr(verdict, "verdict", ""),
+                "reason": getattr(verdict, "reason", ""),
+                "you_may_stop_by_returning_no_questions": True,
+            } if verdict is not None else {},
         }
         try:
             response = self.llm.chat(
@@ -422,8 +475,10 @@ class InterviewLoop:
         """
         questions: list[InterviewQuestion] = []
         notes: list[str] = []
+        proposed = arguments.get("questions") or []
+        self.last_proposal_size = len(proposed) if isinstance(proposed, list) else 0
 
-        for item in arguments.get("questions") or []:
+        for item in proposed:
             if not isinstance(item, dict):
                 # A bare string is a perfectly clear question; only a shape with
                 # no text in it anywhere is unusable.
@@ -458,8 +513,18 @@ class InterviewLoop:
             options = [str(o).strip() for o in (item.get("options") or []) if str(o).strip()][:6]
             questions.append(InterviewQuestion(
                 axis_id, text, why=str(item.get("why") or "")[:200], options=options, origin="llm"))
-            if len(questions) >= self.max_questions:
-                break
+
+        if len(questions) > self.max_questions:
+            # Truncation is a readability limit, not a judgement about the
+            # questions. Saying so keeps it from looking like a rejection.
+            dropped = [q.question for q in questions[self.max_questions:]]
+            questions = questions[: self.max_questions]
+            notes.append(
+                f"一轮最多问 {self.max_questions} 个（患者读不完更多），本轮其余问题留到下一轮: "
+                + "；".join(d[:24] for d in dropped[:3]))
+            self.deferred_questions = dropped
+        else:
+            self.deferred_questions = []
 
         # Coverage is reported, never enforced by substitution. The unclosed
         # required axes go back to the model next round as advice, and stay in the

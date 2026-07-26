@@ -1129,6 +1129,8 @@ function tabPlan(d, audit, meta) {
             <strong>${esc(agent)}</strong>
             <span class="badge mono">${esc(info.mode)}</span>
             ${info.repairs ? badge("格式重提 " + info.repairs + " 次", "mute") : ""}
+            ${(info.json_repairs || []).length
+              ? badge("JSON 修复 " + info.json_repairs.join("/"), "mute") : ""}
           </div>
           <div class="finding-body">
             ${(info.steps || []).map(st => `<div style="display:flex;gap:8px;align-items:flex-start">
@@ -1156,6 +1158,7 @@ function tabPlan(d, audit, meta) {
         ${note ? `<br><span class="badge mono">${esc(note)}</span>` : ""}
       </div></div></div>
     <div class="sec"><h3>任务图</h3><div class="graph">${nodes || "<p class='hint'>无任务</p>"}</div></div>
+    ${(audit.notes || []).length ? listSec("运行记录（非告警：分诊分歧、JSON 修复、覆盖建议）", audit.notes) : ""}
     ${audit.missing_information?.length ? listSec("信息缺口", audit.missing_information) : ""}
     ${audit.open_questions?.length ? listSec("待追问", audit.open_questions) : ""}`;
 }
@@ -1228,6 +1231,15 @@ function tabIntake(d, audit, meta) {
           <div class="obj">${esc(q.question)}</div>
           ${q.why ? `<div class="hint">为什么问：${esc(q.why)}</div>` : ""}
         </div>`).join("")}</div>`);
+    }
+    if ((iv.verdict?.closed_by_reviewer || iv.closed_by_reviewer || []).length) {
+      const closed = iv.verdict?.closed_by_reviewer || iv.closed_by_reviewer;
+      out.push(`<div class="sec"><h3>审核者判定为已闭合的必答轴</h3>
+        <p class="hint" style="margin-bottom:10px">关键词筛查读不出口语否认时，审核者可以按病史原话
+          关闭必答轴——这决定能否进入含剂量环节，所以每一次都记录依据。</p>
+        <ul class="list">${closed.map(c =>
+          `<li><b>${esc(c.label || c.axis_id)}</b> ← <span class="mono">${esc(c.quote)}</span></li>`
+        ).join("")}</ul></div>`);
     }
     if ((iv.notes || []).length) {
       out.push(listSec("提问记录（模型的提问一律照原文问出；此处只记录调整）", iv.notes));

@@ -401,7 +401,18 @@ class PlannerAgent:
             return [], f"llm_error:{type(exc).__name__}", []
         state.budget.charge_llm_tokens(response.total_tokens)
         diagnostics: list[str] = []
-        payload = response.json({})
+        from ..llm.base import extract_json_with_repairs
+
+        payload, repairs = extract_json_with_repairs(response.text, {})
+        if repairs:
+            # Noted on the state, not just in the diagnostics, because a *successful*
+            # plan that needed repairing is the interesting case: "unclosed" almost
+            # always means the plan hit max_tokens, which is a configuration fix
+            # rather than a model failure, and the operator cannot infer that from a
+            # task list that came out looking fine.
+            message = "规划输出经 JSON 修复后才可解析: " + "、".join(repairs)
+            diagnostics.append(message)
+            state.note(message)
         tasks = parse_plan(payload, diagnostics)
         if not tasks and not diagnostics:
             diagnostics.append(f"响应不含可解析内容（前 120 字）: {(response.text or '')[:120]!r}")

@@ -64,13 +64,21 @@ VERIFIER_SYSTEM_PROMPT = """你是骨科门诊的**问诊充分性审核者**，
 4. 若下一步涉及中医处方，四诊是否有客观锚点（舌脉），而非仅凭主诉推测。
 5. 病史中是否存在**互相矛盾**之处需要澄清。
 
+`rule_required_open` 里是规则按关键词判定"仍未闭合"的必答轴。**关键词经常判错**——
+患者用口语否认（"大便一直很正常"、"晚上不会痛醒"）时，它可能读不出来。
+如果你在病史里读到了明确的答复（包括明确的否认），把该 axis_id 写进
+`already_answered_despite_rules` 并给出你读到的原话依据，它就会被视为已闭合。
+这条能力有分量：它决定能不能进入含剂量环节，所以只在你真的读到答复时才用，
+不要因为"大概没事"就填。
+
 只输出 JSON：
 {{"adequate": true/false,
   "missing_axes": ["axis_id", ...],
+  "already_answered_despite_rules": [{{"axis_id": "...", "quote": "病史原话"}}],
   "reason": "一句话说明依据",
   "contradictions": ["如有矛盾，逐条列出"]}}
 
-`missing_axes` 只能取自这些 axis_id：{axis_ids}
+`missing_axes` 与 `already_answered_despite_rules` 的 axis_id 只能取自：{axis_ids}
 不要输出诊断、治疗建议或任何剂量。"""
 
 
@@ -86,6 +94,10 @@ class AdequacyVerdict:
     #: ``rule`` when no model ran, ``llm`` when the verifier answered,
     #: ``llm_failed_open`` when it errored and the rule verdict stood in.
     judged_by: str = "rule"
+    #: Required axes the reviewer closed against the keyword screen, each with the
+    #: quote it relied on. Recorded because closing one is what lets the run reach
+    #: a dose draft — a decision that must be reviewable after the fact.
+    closed_by_reviewer: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def may_proceed(self) -> bool:
@@ -105,6 +117,10 @@ class AdequacyVerdict:
             "judged_by": self.judged_by,
             "missing_labels": [AXES_BY_ID[a].label for a in self.missing_axes if a in AXES_BY_ID],
             "blocking_labels": [AXES_BY_ID[a].label for a in self.blocking_axes if a in AXES_BY_ID],
+            "closed_by_reviewer": [
+                {**c, "label": AXES_BY_ID[c["axis_id"]].label}
+                for c in self.closed_by_reviewer if c.get("axis_id") in AXES_BY_ID
+            ],
         }
 
 
@@ -144,14 +160,21 @@ class AdequacyJudge:
             facts, complaint, role=role, risk_mode=risk_mode, prescriptive=prescriptive)]
 
         rule_missing = list(blocking)
-        verdict = self._ask_model(facts, complaint, role=role, budget=budget)
+        verdict = self._ask_model(facts, complaint, role=role, budget=budget,
+                                  rule_required_open=blocking)
+        closed_by_model: list[dict[str, str]] = []
         if verdict is None:
             missing, reason, contradictions, judged_by = rule_missing, "规则审核：按必答轴判定", [], "rule"
         else:
-            model_missing, reason, contradictions = verdict
-            # The model may *add* gaps, never remove a rule-required one. Same
-            # containment as red flags: cognition widens caution, never narrows it.
-            missing = sorted(set(rule_missing) | set(model_missing))
+            model_missing, reason, contradictions, closed_by_model = verdict
+            # The reviewer may add gaps *and* close a rule-required axis it can see
+            # was answered. Keyword matching routinely misses a colloquial denial
+            # ("大便一直很正常"), and an axis the rules cannot close is an axis the
+            # patient gets re-asked forever before being told 病史不足. Closing one
+            # requires an explicit quote, and every closure is recorded.
+            granted = {c["axis_id"] for c in closed_by_model}
+            missing = sorted((set(rule_missing) | set(model_missing)) - granted)
+            blocking = [axis_id for axis_id in blocking if axis_id not in granted]
             judged_by = "llm"
 
         signature = frozenset(missing)
@@ -162,24 +185,27 @@ class AdequacyJudge:
             if self._stalled(signature):
                 return AdequacyVerdict(
                     BLOCKED, "反复追问后必答项仍未获答复，不能进入含剂量或处方环节",
-                    missing, blocking, contradictions, rounds_used, judged_by)
+                    missing, blocking, contradictions, rounds_used, judged_by, closed_by_model)
             if rounds_used >= self.max_rounds:
                 return AdequacyVerdict(
                     BLOCKED, f"已达最大追问轮次({self.max_rounds})，必答项仍未闭合",
-                    missing, blocking, contradictions, rounds_used, judged_by)
-            return AdequacyVerdict(NOT_ACHIEVED, reason, missing, blocking, contradictions, rounds_used, judged_by)
+                    missing, blocking, contradictions, rounds_used, judged_by, closed_by_model)
+            return AdequacyVerdict(NOT_ACHIEVED, reason, missing, blocking, contradictions,
+                                   rounds_used, judged_by, closed_by_model)
 
         if not missing and not contradictions:
-            return AdequacyVerdict(ACHIEVED, reason or "问诊充分", [], [], [], rounds_used, judged_by)
+            return AdequacyVerdict(ACHIEVED, reason or "问诊充分", [], [], [],
+                                   rounds_used, judged_by, closed_by_model)
         if self._stalled(signature):
             return AdequacyVerdict(
                 STALLED, "连续两轮追问未取得新信息，带缺口继续并记录在案",
-                missing, [], contradictions, rounds_used, judged_by)
+                missing, [], contradictions, rounds_used, judged_by, closed_by_model)
         if rounds_used >= self.max_rounds:
             return AdequacyVerdict(
                 CAP_REACHED, f"已达最大追问轮次({self.max_rounds})，带缺口继续并记录在案",
-                missing, [], contradictions, rounds_used, judged_by)
-        return AdequacyVerdict(NOT_ACHIEVED, reason, missing, [], contradictions, rounds_used, judged_by)
+                missing, [], contradictions, rounds_used, judged_by, closed_by_model)
+        return AdequacyVerdict(NOT_ACHIEVED, reason, missing, [], contradictions,
+                               rounds_used, judged_by, closed_by_model)
 
     # -------------------------------------------------------------- internals
     def _stalled(self, signature: frozenset[str]) -> bool:
@@ -200,7 +226,8 @@ class AdequacyJudge:
         *,
         role: str,
         budget: Any | None,
-    ) -> tuple[list[str], str, list[str]] | None:
+        rule_required_open: list[str] | None = None,
+    ) -> tuple[list[str], str, list[str], list[dict[str, str]]] | None:
         """Run the adversarial verifier. ``None`` means it did not run."""
         if self.llm is None or not getattr(self.llm, "available", False):
             return None
@@ -224,6 +251,10 @@ class AdequacyJudge:
                             "collected_facts": _redact(facts),
                             "axes_answered": report["answered"],
                             "axes_open": catalogue,
+                            "rule_required_open": [
+                                {"axis_id": a, "label": AXES_BY_ID[a].label}
+                                for a in (rule_required_open or []) if a in AXES_BY_ID
+                            ],
                         },
                         ensure_ascii=False,
                     )},
@@ -245,7 +276,16 @@ class AdequacyJudge:
         # keep it visible rather than silently reading it as "adequate".
         if payload.get("adequate") is False and not missing and not contradictions:
             contradictions = ["审核者认为病史不足但未指明具体缺口"]
-        return missing, reason, contradictions
+        # A closure needs a quote. Without one it is an opinion about a red-flag
+        # axis, and an unsupported opinion is exactly what must not close one.
+        closed = [
+            {"axis_id": str(item.get("axis_id")), "quote": str(item.get("quote") or "")[:200]}
+            for item in (payload.get("already_answered_despite_rules") or [])
+            if isinstance(item, dict)
+            and str(item.get("axis_id")) in AXES_BY_ID
+            and str(item.get("quote") or "").strip()
+        ]
+        return missing, reason, contradictions, closed
 
 
 def _redact(facts: dict[str, Any]) -> dict[str, Any]:

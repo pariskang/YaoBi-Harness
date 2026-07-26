@@ -70,7 +70,15 @@ def _ask(state: ClinicalRunState, llm: Any, messages: list[dict[str, str]], *, m
         state.warn(f"LLM 咨询失败({type(exc).__name__})，已回退规则结果")
         return None
     state.budget.charge_llm_tokens(response.total_tokens)
-    return response.json(None)
+    from ..llm.base import extract_json_with_repairs
+
+    payload, repairs = extract_json_with_repairs(response.text, None)
+    if repairs:
+        # Recorded as a note rather than swallowed. A model whose every answer needs
+        # repairing is a prompt problem, and "unclosed" specifically means the reply
+        # hit ``max_tokens`` — neither is visible from a successful-looking result.
+        state.note("模型输出经 JSON 修复后才可解析: " + "、".join(repairs))
+    return payload
 
 
 #: Triage levels the model may return, in ascending urgency. Anything else is

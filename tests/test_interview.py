@@ -155,7 +155,7 @@ class AdequacyJudgeTests(unittest.TestCase):
         judge = AdequacyJudge(stall_threshold=3)
         # A verifier that keeps naming the same non-required gap: nothing blocks
         # release, but no progress is being made either.
-        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "还缺舌脉", [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "还缺舌脉", [], [])  # type: ignore[method-assign]
         facts = {**RED_FLAGS_ANSWERED, **CORE_ANSWERED}
         verdicts = [judge.judge(facts, "腰痛3个月", rounds_used=i).verdict for i in range(3)]
         self.assertEqual(verdicts[:2], [NOT_ACHIEVED, NOT_ACHIEVED])
@@ -186,22 +186,46 @@ class AdequacyJudgeTests(unittest.TestCase):
 
     def test_cap_reached_when_optional_gaps_remain(self):
         judge = AdequacyJudge(max_rounds=2, stall_threshold=99)
-        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "还缺舌脉", [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "还缺舌脉", [], [])  # type: ignore[method-assign]
         verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED}, "腰痛3个月", rounds_used=9)
         self.assertEqual(verdict.verdict, CAP_REACHED)
         self.assertTrue(verdict.may_proceed)
         self.assertTrue(verdict.deficit)
 
-    def test_model_may_add_gaps_but_never_remove_a_required_one(self):
+    def test_saying_it_looks_fine_does_not_close_a_required_axis(self):
+        """A closure needs the quote it rests on. An unsupported opinion about a
+        red-flag axis is exactly what must not close one."""
         judge = AdequacyJudge()
-        judge._ask_model = lambda *a, **k: ([], "看起来够了", [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: ([], "看起来够了", [], [])  # type: ignore[method-assign]
         verdict = judge.judge({}, "腰痛3个月")
         self.assertNotEqual(verdict.verdict, ACHIEVED)
         self.assertTrue(verdict.blocking_axes)
 
+    def test_the_reviewer_may_close_a_required_axis_it_can_see_was_answered(self):
+        """Keyword matching misses colloquial denials, and an axis the rules cannot
+        close is an axis the patient is re-asked forever before being told 病史不足."""
+        judge = AdequacyJudge()
+        judge._ask_model = lambda *a, **k: (  # type: ignore[method-assign]
+            [], "口语否认已覆盖", [],
+            [{"axis_id": "cauda_equina", "quote": "大便一直很正常，也没有漏尿"}])
+        verdict = judge.judge({}, "腰痛3个月")
+        self.assertNotIn("cauda_equina", verdict.blocking_axes)
+        self.assertNotIn("cauda_equina", verdict.missing_axes)
+        self.assertEqual(verdict.closed_by_reviewer[0]["axis_id"], "cauda_equina")
+        self.assertIn("大便一直很正常", verdict.to_dict()["closed_by_reviewer"][0]["quote"])
+
+    def test_a_closure_without_a_quote_is_not_a_closure(self):
+        judge = AdequacyJudge(FakeLLM([LLMResponse(text=json.dumps({
+            "adequate": True, "missing_axes": [], "reason": "x",
+            "already_answered_despite_rules": [{"axis_id": "cauda_equina"}],
+        }, ensure_ascii=False))]))
+        verdict = judge.judge({}, "腰痛3个月", budget=Budget())
+        self.assertIn("cauda_equina", verdict.blocking_axes)
+        self.assertEqual(verdict.closed_by_reviewer, [])
+
     def test_model_named_gaps_are_unioned_in(self):
         judge = AdequacyJudge()
-        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "缺舌脉", [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "缺舌脉", [], [])  # type: ignore[method-assign]
         verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED}, "腰痛3个月")
         self.assertIn("tongue_pulse", verdict.missing_axes)
         self.assertEqual(verdict.verdict, NOT_ACHIEVED)
@@ -349,9 +373,43 @@ class InterviewLoopTests(unittest.TestCase):
         self.assertEqual([q.question for q in result.questions],
                          ["你晚上睡得好吗？", "走路久了会麻吗？"])
 
-    def test_an_all_duplicate_round_says_why_it_used_the_bank(self):
-        """The bank supplying questions is fine when the model offered nothing new.
-        Doing it silently is what made 「提问来源=probe_bank」 inexplicable."""
+    def test_the_model_ends_the_interview_by_returning_no_questions(self):
+        """Stopping is the model's call. It used to be skipped entirely whenever the
+        reviewer said 'adequate' — a rule ending the consultation unasked."""
+        llm = FakeLLM([ask_call([])])
+        result = InterviewLoop(llm, judge=AdequacyJudge()).next_round({}, "腰痛", budget=Budget())
+        self.assertEqual(result.composer, "llm_complete")
+        self.assertEqual(result.questions, [])
+        self.assertTrue(any("选择不再提问" in n for n in result.notes))
+
+    def test_the_model_is_asked_even_when_the_reviewer_says_it_is_enough(self):
+        answered = {**RED_FLAGS_ANSWERED, **CORE_ANSWERED}
+        llm = FakeLLM([ask_call([{"axis_id": "sleep", "question": "还想确认一下，睡眠怎么样？"}])])
+        loop = InterviewLoop(llm, judge=AdequacyJudge())
+        result = loop.next_round(answered, "腰痛3个月", budget=Budget())
+        self.assertEqual(result.verdict.verdict, ACHIEVED, "the reviewer is satisfied")
+        self.assertEqual(result.composer, "llm", "and the model was still consulted")
+        self.assertEqual([q.question for q in result.questions], ["还想确认一下，睡眠怎么样？"])
+
+    def test_the_reviewers_opinion_reaches_the_model_as_advice(self):
+        answered = {**RED_FLAGS_ANSWERED, **CORE_ANSWERED}
+        llm = FakeLLM([ask_call([])])
+        InterviewLoop(llm, judge=AdequacyJudge()).next_round(answered, "腰痛3个月", budget=Budget())
+        payload = json.loads(llm.calls[-1][1]["content"])
+        self.assertEqual(payload["reviewer_opinion"]["verdict"], ACHIEVED)
+        self.assertTrue(payload["reviewer_opinion"]["you_may_stop_by_returning_no_questions"])
+
+    def test_more_questions_than_a_person_will_read_are_deferred_not_dropped(self):
+        llm = FakeLLM([ask_call([
+            {"axis_id": "", "question": f"第{i}个问题？"} for i in range(9)])])
+        loop = InterviewLoop(llm, judge=AdequacyJudge())
+        result = loop.next_round({}, "腰痛", budget=Budget())
+        self.assertEqual(len(result.questions), loop.max_questions)
+        self.assertEqual(len(loop.deferred_questions), 9 - loop.max_questions)
+        self.assertTrue(any("留到下一轮" in n for n in result.notes))
+
+    def test_an_all_duplicate_round_is_not_a_decision_to_stop(self):
+        """Conflating the two would end an interview because of a dedupe accident."""
         llm = FakeLLM([
             ask_call([{"axis_id": "sleep", "question": "睡得好吗？"}]),
             ask_call([{"axis_id": "sleep", "question": "睡得好吗？"}]),
@@ -360,7 +418,8 @@ class InterviewLoopTests(unittest.TestCase):
         loop.next_round({}, "腰痛", budget=Budget())
         second = loop.next_round({}, "腰痛", budget=Budget())
         self.assertEqual(second.composer, "probe_bank")
-        self.assertTrue(any("没有给出新问题" in n for n in second.notes))
+        self.assertTrue(second.questions, "the interview must keep going")
+        self.assertTrue(any("全部与此前重复" in n for n in second.notes))
 
     def test_a_reply_with_no_question_in_it_falls_back_to_the_bank(self):
         llm = FakeLLM([LLMResponse(text="我觉得病史已经很清楚了。")])

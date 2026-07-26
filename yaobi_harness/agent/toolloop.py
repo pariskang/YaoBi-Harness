@@ -90,6 +90,8 @@ class ToolLoopResult:
     output: dict[str, Any] | None = None
     steps: list[LoopStep] = field(default_factory=list)
     evidence_ids: list[str] = field(default_factory=list)
+    #: Repairs the JSON repairer had to apply to the final message, if any.
+    json_repairs: list[str] = field(default_factory=list)
     citations: list[str] = field(default_factory=list)
     mode: str = "not_run"
     error: str = ""
@@ -102,7 +104,7 @@ class ToolLoopResult:
             "ok": self.ok, "mode": self.mode, "error": self.error,
             "steps": [s.to_dict() for s in self.steps],
             "evidence_ids": self.evidence_ids, "citations": self.citations,
-            "repairs": self.repairs,
+            "repairs": self.repairs, "json_repairs": self.json_repairs,
         }
 
 
@@ -371,9 +373,15 @@ class ToolLoop:
                                      result.summary[:160], evidence_id)
 
     def _finalize(self, result: ToolLoopResult, text: str, schema_name: str, step: int) -> ToolLoopResult:
-        from ..llm.base import extract_json
+        from ..llm.base import extract_json_with_repairs
 
-        payload = extract_json(text, None)
+        payload, repairs = extract_json_with_repairs(text, None)
+        if repairs:
+            # Recorded, not hidden. "The answer parsed only after we closed a
+            # truncated string" is materially different from "the answer was
+            # well-formed" — and a run that repairs every response is a prompt or
+            # max_tokens problem wearing a success.
+            result.json_repairs = repairs
         if not isinstance(payload, dict):
             result.steps.append(LoopStep(step, "final", ok=False, summary="输出不是 JSON 对象"))
             result.mode, result.error = "invalid_output", "final message was not a JSON object"

@@ -51,6 +51,35 @@ class FactAllowlistTests(unittest.TestCase):
         self.assertNotEqual(reply.release_status, "approved_by_physician")
         self.assertNotIn("physician_review", convo.facts)
 
+    def test_off_allowlist_facts_are_kept_rather_than_deleted(self):
+        """They used to vanish, which deleted real findings (职业, 吸烟史) for no
+        reason but a list written before the conversation happened."""
+        from yaobi_harness.conversation import EXTRA_FACTS_KEY
+
+        accepted, ignored = coerce_facts({
+            "onset": "3个月", "smoking": "20年一天一包", "occupation_detail": "长途货车司机"})
+        self.assertEqual(accepted["onset"], "3个月")
+        self.assertEqual(accepted[EXTRA_FACTS_KEY],
+                         {"smoking": "20年一天一包", "occupation_detail": "长途货车司机"})
+        self.assertEqual(ignored, [], "kept is not ignored")
+
+    def test_a_signature_is_never_extractable_at_any_autonomy_level(self):
+        from yaobi_harness.conversation import EXTRA_FACTS_KEY
+
+        accepted, ignored = coerce_facts({
+            "physician_review": {"physician_id": "X", "signature": "s", "approvals": {}}})
+        self.assertEqual(accepted, {})
+        self.assertEqual(ignored, ["physician_review"])
+        self.assertNotIn(EXTRA_FACTS_KEY, accepted,
+                         "it must not survive in the extras bucket either")
+
+    def test_a_caller_cannot_smuggle_facts_in_through_the_extras_bucket(self):
+        from yaobi_harness.conversation import EXTRA_FACTS_KEY
+
+        accepted, ignored = coerce_facts({EXTRA_FACTS_KEY: {"physician_review": "yes"}})
+        self.assertEqual(accepted, {})
+        self.assertEqual(ignored, [EXTRA_FACTS_KEY])
+
     def test_unknown_and_mistyped_keys_are_dropped(self):
         accepted, ignored = coerce_facts({
             "age": "六十三",          # wrong type
@@ -59,8 +88,18 @@ class FactAllowlistTests(unittest.TestCase):
             "made_up_field": 1,
             "onset": "3个月",
         })
-        self.assertEqual(accepted, {"onset": "3个月"})
-        self.assertEqual(set(ignored), {"age", "vas", "medications", "made_up_field"})
+        from yaobi_harness.conversation import EXTRA_FACTS_KEY
+
+        # A wrong type never reaches a governed key — a bad value there would
+        # corrupt triage or dose inputs. The information itself is preserved in the
+        # extras bucket, which nothing downstream reads.
+        self.assertEqual({k: v for k, v in accepted.items() if k != EXTRA_FACTS_KEY},
+                         {"onset": "3个月"})
+        self.assertEqual(set(accepted[EXTRA_FACTS_KEY]), {"age", "vas", "medications", "made_up_field"})
+        # `ignored` now means "did not reach a governed key", which is what a
+        # surface should tell the user. An unknown key was never governed, so it is
+        # simply kept — reporting it as ignored would be a lie.
+        self.assertEqual(set(ignored), {"age", "vas", "medications"})
 
     def test_conditions_are_restricted_to_the_known_vocabulary(self):
         accepted, _ = coerce_facts({"conditions": ["renal_impairment", "任意编造的状态"]})
@@ -160,8 +199,16 @@ class ConversationFlowTests(unittest.TestCase):
         self.assertTrue(third.escalated)
         self.assertEqual(third.risk_mode, "urgent")
         self.assertEqual(third.release_status, "urgent_action_plan")
-        self.assertFalse(third.awaiting_answer, "urgent mode must stop asking questions")
         self.assertIn("120", third.message)
+
+    def test_the_agent_may_still_ask_during_an_emergency(self):
+        """Discarding the questions on a terminal status silenced the agent exactly
+        where a question matters most — 「你现在还能自己走吗？」 is triage."""
+        convo = session()
+        reply = convo.send("突然不能排尿、会阴麻木，双腿越来越无力")
+        self.assertEqual(reply.release_status, "urgent_action_plan")
+        self.assertTrue(reply.questions, "an emergency is not a reason to stop asking")
+        self.assertTrue(reply.awaiting_answer)
 
     def test_urgent_mode_never_offers_a_prescription(self):
         convo = session("physician", allow_prescription=True)

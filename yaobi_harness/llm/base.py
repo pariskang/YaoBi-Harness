@@ -1,19 +1,23 @@
-"""Provider-neutral LLM interface used by the planning and screening agents.
+"""Provider-neutral LLM interface. Every provider implements one method.
 
-The harness treats the model as an *advisory* component inside a hard control
-plane: an LLM may propose a plan, surface an extra red flag or raise an extra
-safety objection, but it can never widen a capability, clear a rule-based risk
-signal or emit a dose. Every provider therefore only has to implement
-:meth:`LLMClient.chat`.
+The model makes the clinical judgements — triage, enquiry, differentials, the
+wording of every reply. Two things it cannot do, and neither is enforced here:
+the capability broker scopes which tools exist for it, and the dose pipeline
+requires a physician's signature. Everything else the rules produce is material
+handed to the model, not a verdict applied to it.
+
+What *is* enforced here is parsing: :func:`extract_json` gets a usable object out
+of however the model chose to format its answer, because a formatting slip must
+not silently drop the whole model-driven path to its deterministic fallback.
 """
 
 from __future__ import annotations
 
 import ast
-import json
-import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+from . import jsonrepair
 
 
 class LLMError(RuntimeError):
@@ -95,12 +99,6 @@ class NullLLMClient:
         return LLMResponse(text="", provider="null", model="none")
 
 
-#: Trailing comma before a closing brace or bracket — the single most common
-#: piece of model JSON sloppiness, and strictly a syntax slip: no content is
-#: ambiguous, so repairing it changes nothing about what the model said.
-_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
-
-
 def extract_json(text: str, default: Any = None) -> Any:
     """Parse JSON from a model response, tolerating the ways models really answer.
 
@@ -110,56 +108,37 @@ def extract_json(text: str, default: Any = None) -> Any:
     payload for a trailing comma buys none of that safety and silently drops the
     whole model-driven path to its deterministic fallback.
 
-    Handled: code fences (with or without a language tag), prose before or after
-    the object, trailing commas, and Python-dict-literal quoting. Not handled, on
-    purpose: anything requiring a guess about meaning.
+    The repair itself lives in :mod:`yaobi_harness.llm.jsonrepair`; see there for
+    what is fixed and what is deliberately left to fail.
+    """
+    return extract_json_with_repairs(text, default)[0]
+
+
+def extract_json_with_repairs(text: str, default: Any = None) -> tuple[Any, list[str]]:
+    """Like :func:`extract_json`, but also reports which repairs were needed.
+
+    Callers that keep an audit trail use this: "the model's answer parsed only
+    after we closed a truncated string" is materially different from "the model's
+    answer was well-formed", and a run that repairs every response is a prompt or
+    ``max_tokens`` problem rather than a success.
     """
     if not text:
-        return default
-    candidate = text.strip()
-    if candidate.startswith("```"):
-        candidate = candidate.strip("`")
-        candidate = candidate.split("\n", 1)[1] if "\n" in candidate else candidate
-        if candidate.lstrip().startswith("json"):
-            candidate = candidate.lstrip()[4:]
-
-    for attempt in _json_candidates(candidate):
-        parsed = _loads_tolerant(attempt)
-        if parsed is not None:
-            return parsed
-    return default
+        return default, []
+    value, repairs = jsonrepair.loads_with_repairs(text)
+    if value is None:
+        # ``ast.literal_eval`` as a final resort: it parses Python literals and
+        # evaluates nothing, so it cannot execute a model response. Kept because
+        # it handles tuple and set literals, which the repairer does not rewrite.
+        value = _python_literal(text)
+        if value is None:
+            return default, repairs
+        repairs = [*repairs, "python_literal"]
+    return value, repairs
 
 
-def _json_candidates(candidate: str) -> list[str]:
-    """The whole string, then the widest brace- and bracket-delimited spans."""
-    spans = [candidate]
-    for opener, closer in (("{", "}"), ("[", "]")):
-        start, end = candidate.find(opener), candidate.rfind(closer)
-        if 0 <= start < end:
-            spans.append(candidate[start : end + 1])
-    return spans
-
-
-def _loads_tolerant(text: str) -> Any:
-    """Strict JSON, then trailing-comma repair, then a Python literal.
-
-    ``ast.literal_eval`` is the right last resort for single-quoted output: it
-    parses dict/list literals and evaluates nothing, so it cannot execute a model
-    response. ``json.loads`` is always tried first, so well-formed JSON never
-    takes this path.
-    """
+def _python_literal(text: str) -> Any:
     try:
-        return json.loads(text)
-    except (ValueError, TypeError):
-        pass
-    repaired = _TRAILING_COMMA_RE.sub(r"\1", text)
-    if repaired != text:
-        try:
-            return json.loads(repaired)
-        except (ValueError, TypeError):
-            pass
-    try:
-        value = ast.literal_eval(repaired)
+        value = ast.literal_eval(text.strip())
     except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
         return None
     return value if isinstance(value, (dict, list)) else None

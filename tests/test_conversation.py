@@ -587,5 +587,90 @@ class ConversationLlmContainmentTests(unittest.TestCase):
         self.assertEqual(reply.composer, "template")
 
 
+class WorkupDeferralTests(unittest.TestCase):
+    """A follow-up question should not cost a full differential.
+
+    Measured before the change: one turn was thirteen sequential model calls, six
+    of them the differential, the pattern and the case search — on a turn whose
+    entire output was 「您疼多久了？」. With a reasoning model at 15–30 s a call
+    that is minutes of a patient's wait spent building a differential from two
+    facts, which the note would then carry.
+    """
+
+    class Stub:
+        """Answers everything, and says whether the history is adequate yet."""
+
+        name, model, available = "stub", "s", True
+
+        def __init__(self, adequate):
+            self.adequate = adequate
+            self.agents: list[str] = []
+
+        def chat(self, messages, **kwargs):
+            import sys
+
+            frame = sys._getframe()
+            while frame:
+                owner = frame.f_locals.get("self")
+                if owner is not None and type(owner).__name__.endswith("Agent"):
+                    self.agents.append(type(owner).__name__)
+                    break
+                frame = frame.f_back
+            return LLMResponse(text=json.dumps({
+                "triage": "routine", "adequate": self.adequate,
+                "workup_now": self.adequate, "questions": [], "facts": {},
+                "message": "好的", "reply": "好的",
+                "differentials": ["腰肌劳损"], "primary_pattern": "气滞血瘀证",
+            }, ensure_ascii=False), model="s")
+
+    def _turn(self, adequate):
+        llm = self.Stub(adequate)
+        session = ConversationSession(role="patient", runner=YaobiGraphRunner(llm=llm))
+        session.open()
+        llm.agents.clear()
+        session.send("我腰痛3个月，跌倒扭伤过，夜间不痛醒，大小便正常")
+        ran = {t.agent for t in session.state.tasks if t.status == "ok"}
+        return ran, llm
+
+    def test_a_turn_that_only_asks_does_not_run_the_differential(self):
+        ran, llm = self._turn(adequate=False)
+        self.assertNotIn("BiomedicalAgent", ran)
+        self.assertNotIn("TCMPatternAgent", ran)
+        self.assertNotIn("ExpertCaseAgent", ran)
+        self.assertIn("InterviewAgent", ran, "the interview itself still runs")
+        self.assertLessEqual(len(llm.agents), 5, "the asking turn stayed cheap")
+
+    def test_the_deferred_tasks_run_once_the_reviewer_says_the_history_is_enough(self):
+        ran, _ = self._turn(adequate=True)
+        self.assertLessEqual({"BiomedicalAgent", "TCMPatternAgent", "ExpertCaseAgent"}, ran)
+
+    def test_the_safety_screens_are_never_deferred(self):
+        """Postponing a safety screen to save latency is the wrong trade in the
+        wrong direction: it exists to catch something *before* the conversation
+        continues."""
+        ran, _ = self._turn(adequate=False)
+        self.assertIn("MedicationSafetyAgent", ran)
+
+    def test_a_one_shot_run_never_defers(self):
+        """There is no later turn to defer *to*, so deferring would mean silently
+        dropping the differential and handing back an answer that quietly contains
+        less than it looks like it does."""
+        from yaobi_harness.state import ClinicalRunState
+
+        llm = self.Stub(adequate=False)
+        state = ClinicalRunState("腰痛3个月，跌倒扭伤过", role="patient")
+        YaobiGraphRunner(llm=llm).run(state)
+        self.assertFalse(state.interactive)
+        ran = {t.agent for t in state.tasks if t.status == "ok"}
+        self.assertIn("BiomedicalAgent", ran)
+
+    def test_a_deferral_is_recorded_rather_than_silent(self):
+        llm = self.Stub(adequate=False)
+        session = ConversationSession(role="patient", runner=YaobiGraphRunner(llm=llm))
+        session.send("我腰痛3个月")
+        self.assertTrue(any("推迟" in note for note in session.state.notes),
+                        f"the deferral left no trace: {session.state.notes}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -477,6 +477,17 @@ class VisionAgent(BaseAgent):
                 state.warn(f"图片判读未完成: {result.summary}")
                 continue
             payload = dict(result.data)
+            if payload.get("configured") is False:
+                # A missing vision model returns ``ok=True`` — it is not a tool
+                # failure, nothing was retried, nothing broke. But it also means
+                # nobody looked at the film, and this agent recording a clean
+                # "read" of it was how an uploaded X-ray came to be accepted,
+                # stored and silently ignored. Say it out loud.
+                state.warn(
+                    f"未配置视觉模型，{len(images)} 张图片未被判读。"
+                    f"{payload.get('how_to_fix', '')}"
+                )
+                continue
             reads.append(payload)
             if payload.get("phi_detected"):
                 state.warn(

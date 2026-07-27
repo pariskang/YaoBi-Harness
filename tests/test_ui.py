@@ -632,5 +632,255 @@ class StaticAssetTests(unittest.TestCase):
         self.assertIn("REPLAY = await api(", page)
 
 
+def _png(width: int = 900, height: int = 700) -> bytes:
+    """A real PNG, deliberately noisy so it does not compress away.
+
+    Size is the point of these tests: the console's JSON limit is 256 KB and this
+    lands near 2 MB, which is an ordinary phone photo of an X-ray on a light box.
+    """
+    import random
+    import struct
+    import zlib
+
+    random.seed(7)
+    raw = b"".join(b"\x00" + bytes(random.randrange(256) for _ in range(width * 3))
+                   for _ in range(height))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 1))
+            + chunk(b"IEND", b""))
+
+
+def post_bytes(url: str, body: bytes, headers: dict) -> tuple[int, dict]:
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+class ImageUploadTests(unittest.TestCase):
+    """An X-ray does not fit through the JSON control channel, and never did.
+
+    The console used to keep the whole base64 data URI in the page and re-send it
+    inside every chat message. A 12 MB film became a 16 MB JSON body, the server
+    refused it at 256 KB, and the operator saw 「出错了：请求体过大」 on the first
+    question after attaching — with the attach itself having looked successful,
+    because nothing had left the browser yet.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.service = ConsoleService()
+        cls.server = create_server(cls.service, "127.0.0.1", 8734)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = "http://127.0.0.1:8734"
+        cls.film = _png()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def upload(self, body=None, **overrides):
+        headers = {"Content-Type": "image/png", "X-Image-Kind": "radiograph",
+                   "X-Deidentified": "1", **overrides}
+        return post_bytes(self.base + "/api/image/upload", body or self.film, headers)
+
+    def test_the_test_image_is_actually_bigger_than_the_json_limit(self):
+        """Otherwise every test below would pass for the wrong reason."""
+        from yaobi_harness.ui.server import MAX_BODY_BYTES
+
+        self.assertGreater(len(self.film), MAX_BODY_BYTES * 4)
+
+    def test_an_xray_uploads_and_comes_back_as_a_handle(self):
+        status, data = self.upload()
+        self.assertEqual(status, 200)
+        self.assertTrue(data["handle"].startswith("img_"))
+        self.assertEqual(data["bytes"], len(self.film))
+        self.assertEqual(len(data["sha256"]), 64)
+
+    def test_a_handle_is_all_the_chat_payload_has_to_carry(self):
+        _, up = self.upload()
+        status, out = post(self.base + "/api/chat",
+                           {"message": "帮我看看片子，我腰痛3个月",
+                            "images": [{"kind": "radiograph", "handle": up["handle"]}]})
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["session_id"])
+
+    def test_an_inline_film_is_refused_with_an_answer_not_a_dropped_connection(self):
+        """Rejecting on the header alone left the client still writing into a
+        socket nobody was reading — a broken pipe, which a browser reports as yet
+        another 「Failed to fetch」."""
+        import base64
+
+        status, out = post(self.base + "/api/chat", {
+            "message": "看片",
+            "images": [{"kind": "radiograph", "deidentified": True,
+                        "ref": "data:image/png;base64," + base64.b64encode(self.film).decode()}],
+        })
+        self.assertEqual(status, 413)
+        self.assertIn("请求体过大", out["error"])
+        self.assertIn("/api/image/upload", out["error"], "the error must say what to do instead")
+
+    def test_the_attestation_is_required_per_upload(self):
+        status, out = self.upload(**{"X-Deidentified": "0"})
+        self.assertEqual(status, 400)
+        self.assertIn("去标识化", out["error"])
+
+    def test_an_unknown_kind_is_refused(self):
+        status, out = self.upload(**{"X-Image-Kind": "chest_ct_but_made_up"})
+        self.assertEqual(status, 400)
+
+    def test_a_non_image_body_is_refused(self):
+        status, out = post_bytes(
+            self.base + "/api/image/upload", b"not an image at all",
+            {"Content-Type": "application/pdf", "X-Image-Kind": "radiograph", "X-Deidentified": "1"})
+        self.assertEqual(status, 400)
+        self.assertIn("不支持", out["error"])
+
+    def test_an_expired_handle_says_so_rather_than_running_without_the_image(self):
+        status, out = post(self.base + "/api/chat",
+                           {"message": "看片", "images": [{"kind": "radiograph",
+                                                           "handle": "img_neverexisted"}]})
+        self.assertEqual(status, 400)
+        self.assertIn("重新上传", out["error"])
+
+    def test_uploads_are_bounded_and_never_written_to_disk(self):
+        from yaobi_harness.ui.server import MAX_UPLOADS
+
+        service = ConsoleService()
+        for i in range(MAX_UPLOADS + 5):
+            service.store_image(_png(8, 8 + i), mime="image/png", kind="other")
+        self.assertLessEqual(len(service.uploads), MAX_UPLOADS)
+
+
+class UnreadImageTests(unittest.TestCase):
+    """An attached image must never end a run in silence.
+
+    Someone photographed a film, ticked the box and waited. The one unacceptable
+    outcome is an answer that reads as though nothing was attached.
+    """
+
+    def test_a_run_with_no_vision_model_says_the_image_was_not_read(self):
+        from yaobi_harness.graph import YaobiGraphRunner
+        from yaobi_harness.state import ClinicalRunState
+
+        state = ClinicalRunState("腰痛3个月", role="patient")
+        state.images = [{"kind": "radiograph", "ref": "data:image/png;base64,AA==",
+                         "deidentified": True}]
+        YaobiGraphRunner().run(state)
+        self.assertTrue(any("未配置视觉模型" in w and "未被判读" in w for w in state.warnings),
+                        f"nothing explained the unread image: {state.warnings}")
+
+    def test_a_plan_that_omits_the_read_still_reports_the_image_as_unread(self):
+        from yaobi_harness.graph import YaobiGraphRunner
+        from yaobi_harness.state import ClinicalRunState, Task
+
+        state = ClinicalRunState("腰痛3个月", role="patient")
+        state.images = [{"kind": "radiograph", "ref": "data:image/png;base64,AA==",
+                         "deidentified": True}]
+        state.tasks = [Task("T1", "TimelineAgent", "标准化病历与时间线")]
+        YaobiGraphRunner().run(state)
+        self.assertNotIn("image_findings", state.outputs)
+        self.assertTrue(any("图片" in w and "未" in w for w in state.warnings),
+                        f"nothing explained the unread image: {state.warnings}")
+
+    def test_the_planner_is_told_that_images_are_attached(self):
+        """A model-authored plan never scheduled the read, because the planner's
+        context did not mention that anything had been uploaded."""
+        from yaobi_harness.agent.planner import build_planner_prompt
+        from yaobi_harness.state import ClinicalRunState
+
+        state = ClinicalRunState("腰痛3个月", role="patient")
+        state.images = [{"kind": "radiograph", "deidentified": True}]
+        prompt = build_planner_prompt(state)
+        self.assertIn("radiograph", prompt[1]["content"])
+        self.assertIn("VisionAgent", prompt[0]["content"])
+
+
+class ProgressStreamTests(unittest.TestCase):
+    """A turn must be watchable, not a spinner."""
+
+    def setUp(self):
+        self.service = ConsoleService()
+
+    def _drain(self, job_id: str, limit: int = 400):
+        import time as _time
+
+        cursor, events = 0, []
+        for _ in range(limit):
+            poll = self.service.poll_chat({"job_id": job_id, "cursor": cursor})
+            cursor = poll["cursor"]
+            events += poll["events"]
+            if poll["status"] != "running":
+                return poll, events
+            _time.sleep(0.02)
+        raise AssertionError("job never finished")
+
+    def test_a_turn_streams_its_agents_and_tool_calls(self):
+        job = self.service.start_chat({"message": "腰痛3个月，久坐加重", "role": "patient"})
+        poll, events = self._drain(job["job_id"])
+        self.assertEqual(poll["status"], "done")
+        kinds = {e["kind"] for e in events}
+        self.assertIn("agent", kinds)
+        self.assertIn("tool", kinds)
+        labels = {e["label"] for e in events}
+        self.assertIn("IntakeAgent", labels)
+        self.assertIn("CriticAgent", labels)
+
+    def test_every_event_arrives_exactly_once(self):
+        job = self.service.start_chat({"message": "腰痛3个月", "role": "patient"})
+        _, events = self._drain(job["job_id"])
+        seqs = [e["seq"] for e in events]
+        self.assertEqual(len(seqs), len(set(seqs)))
+        self.assertEqual(seqs, sorted(seqs))
+
+    def test_tool_events_report_names_never_the_patients_words(self):
+        """The stream renders in a browser tab that may be on a shared screen."""
+        job = self.service.start_chat(
+            {"message": "我叫张三，住在城东，腰痛3个月，晚上疼得睡不着", "role": "patient"})
+        _, events = self._drain(job["job_id"])
+        for event in events:
+            if event["kind"].startswith("tool"):
+                self.assertNotIn("张三", event["detail"])
+                self.assertNotIn("城东", event["detail"])
+
+    def test_a_denied_tool_call_is_visible(self):
+        """「为什么模型没调用工具」 is usually 「调用了，被技能策略拒了」."""
+        from yaobi_harness import progress
+        from yaobi_harness.tools import CapabilityBroker, ToolRegistry
+
+        sink = progress.ProgressSink()
+        broker = CapabilityBroker("patient", "urgent", skill_registry=None)
+        with progress.bound(sink, "FormulaAgent"):
+            ToolRegistry().call(broker, "formula_composition_search", pattern="气滞血瘀证")
+        denied = [e for e in sink.since(0) if e["kind"] == "tool_denied"]
+        self.assertTrue(denied)
+        self.assertIn("urgent_mode_forbids", denied[0]["detail"])
+
+    def test_the_page_renders_the_stream(self):
+        page = STATIC.read_text(encoding="utf-8")
+        self.assertIn("renderEvents(", page)
+        self.assertIn("poll.events", page)
+        self.assertIn("cursor", page)
+        self.assertIn("思考过程", page, "the model's reasoning must be reachable in the UI")
+
+    def test_the_page_uploads_images_out_of_band(self):
+        page = STATIC.read_text(encoding="utf-8")
+        self.assertIn("/api/image/upload", page)
+        self.assertIn("X-Deidentified", page)
+        self.assertNotIn("readAsDataURL", page,
+                         "a film must not be turned into base64 in the page again")
+        self.assertIn("i.handle", page)
+
+
 if __name__ == "__main__":
     unittest.main()

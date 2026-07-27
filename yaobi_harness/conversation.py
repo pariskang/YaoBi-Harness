@@ -36,6 +36,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from . import progress
 from .agent.agents import DEFAULT_QUESTIONS, signal_text
 from .graph import YaobiGraphRunner
 from .interview.axes import AXES_BY_ID
@@ -682,14 +683,15 @@ class ConversationSession:
         if budget is not None and not budget.reserve_llm():
             return None
         try:
-            response = self.llm.chat(
-                [
-                    {"role": "system", "content": OPENING_SYSTEM_PROMPT},
-                    {"role": "user", "content": json.dumps(
-                        {"role": self.role, "specialty": "骨科 / 腰痹"}, ensure_ascii=False)},
-                ],
-                temperature=0.5, max_tokens=300,
-            )
+            with progress.activity("开场白"):
+                response = self.llm.chat(
+                    [
+                        {"role": "system", "content": OPENING_SYSTEM_PROMPT},
+                        {"role": "user", "content": json.dumps(
+                            {"role": self.role, "specialty": "骨科 / 腰痹"}, ensure_ascii=False)},
+                    ],
+                    temperature=0.5, max_tokens=300,
+                )
             if budget is not None:
                 budget.charge_llm_tokens(response.total_tokens)
         except (LLMError, Exception):  # noqa: BLE001 - an opening must never fail a session
@@ -824,6 +826,9 @@ class ConversationSession:
         # The note wants the patient's own words per turn, not one fused string.
         state.outputs["_narrative"] = list(self.narrative)
         state.images = [dict(i) for i in self.images]
+        # There is a next turn, so the graph may hold the diagnostic workup back
+        # until the interview has something worth reasoning from.
+        state.interactive = True
         state.budget = self.budget_factory()
         return self.runner.run(state, allow_prescription=self.allow_prescription)
 
@@ -838,14 +843,15 @@ class ConversationSession:
         budget = self.state.budget if self.state else self.budget_factory()
         if self.llm is not None and getattr(self.llm, "available", False) and budget.reserve_llm():
             try:
-                response = self.llm.chat(
-                    [
-                        {"role": "system", "content": EXTRACT_SYSTEM_PROMPT.format(
-                            conditions=", ".join(sorted(KNOWN_CONDITIONS)))},
-                        {"role": "user", "content": text},
-                    ],
-                    temperature=0.0, max_tokens=400, response_format_json=True,
-                )
+                with progress.activity("信息抽取"):
+                    response = self.llm.chat(
+                        [
+                            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT.format(
+                                conditions=", ".join(sorted(KNOWN_CONDITIONS)))},
+                            {"role": "user", "content": text},
+                        ],
+                        temperature=0.0, max_tokens=400, response_format_json=True,
+                    )
                 proposed = response.json(None)
             except (LLMError, Exception):  # noqa: BLE001 - extraction must never break a turn
                 proposed = None
@@ -1059,13 +1065,14 @@ class ConversationSession:
             "disclaimer": delivered.get("disclaimer", ""),
         }
         try:
-            response = self.llm.chat(
-                [
-                    {"role": "system", "content": REPLY_SYSTEM_PROMPT.format(role=self.role)},
-                    {"role": "user", "content": json.dumps(material, ensure_ascii=False)},
-                ],
-                temperature=0.4, max_tokens=900,
-            )
+            with progress.activity("撰写回复"):
+                response = self.llm.chat(
+                    [
+                        {"role": "system", "content": REPLY_SYSTEM_PROMPT.format(role=self.role)},
+                        {"role": "user", "content": json.dumps(material, ensure_ascii=False)},
+                    ],
+                    temperature=0.4, max_tokens=900,
+                )
             self.state.budget.charge_llm_tokens(response.total_tokens)
         except (LLMError, Exception):  # noqa: BLE001
             self.state.warn("模型撰写回复失败，使用模板回复")

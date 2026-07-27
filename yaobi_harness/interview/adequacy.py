@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple, Sequence
 
+from .. import progress
 from ..llm.base import LLMError
 from .axes import AXES_BY_ID, coverage, required_open_axes
 
@@ -71,15 +72,41 @@ VERIFIER_SYSTEM_PROMPT = """你是骨科门诊的**问诊充分性审核者**，
 这条能力有分量：它决定能不能进入含剂量环节，所以只在你真的读到答复时才用，
 不要因为"大概没事"就填。
 
+`workup_now` 由你决定：本轮要不要**立刻**展开西医鉴别、中医辨证、病例检索这套推理。
+病史还很薄的时候，这套推理只会基于两三条事实生成噪音，而且会让患者多等好几倍时间；
+默认先把问诊问透（填 false）。但只要你认为**现在就需要**——例如读到危险信号想让鉴别
+诊断去追、或者已经够了可以收口——就填 true，规则不会拦你。
+
 只输出 JSON：
 {{"adequate": true/false,
   "missing_axes": ["axis_id", ...],
   "already_answered_despite_rules": [{{"axis_id": "...", "quote": "病史原话"}}],
+  "workup_now": true/false,
   "reason": "一句话说明依据",
   "contradictions": ["如有矛盾，逐条列出"]}}
 
 `missing_axes` 与 `already_answered_despite_rules` 的 axis_id 只能取自：{axis_ids}
 不要输出诊断、治疗建议或任何剂量。"""
+
+
+class ReviewerOpinion(NamedTuple):
+    """What the adversarial verifier said, when it ran.
+
+    A record rather than a positional tuple because it grew a fifth field and a
+    five-wide anonymous tuple is a bug waiting to be written — by this module or
+    by a test that stubs it. Every field defaults, so a caller (or a stub) states
+    only the part it cares about.
+    """
+
+    #: Empty *tuples*, not lists: a NamedTuple's defaults are one shared object
+    #: per field, and a shared mutable default is a bug that shows up months
+    #: later as one interview's gaps appearing in another's.
+    missing: Sequence[str] = ()
+    reason: str = ""
+    contradictions: Sequence[str] = ()
+    closed_by_reviewer: Sequence[dict[str, str]] = ()
+    #: ``None`` when the reviewer expressed no view on running the workup now.
+    workup_now: bool | None = None
 
 
 @dataclass
@@ -98,11 +125,29 @@ class AdequacyVerdict:
     #: quote it relied on. Recorded because closing one is what lets the run reach
     #: a dose draft — a decision that must be reviewable after the fact.
     closed_by_reviewer: list[dict[str, str]] = field(default_factory=list)
+    #: The reviewer's call on whether to run the diagnostic workup *this* turn.
+    #: ``None`` when no model was consulted, which the graph reads as "decide by
+    #: the verdict" rather than as a refusal.
+    workup_now: bool | None = None
 
     @property
     def may_proceed(self) -> bool:
         """Whether the interview may hand off, deficit or not."""
         return self.verdict in (ACHIEVED, STALLED, CAP_REACHED)
+
+    @property
+    def wants_workup(self) -> bool:
+        """Whether the diagnostic agents should run on this turn.
+
+        The reviewer's explicit answer wins in **both** directions — it may pull
+        the workup forward on a thin history because it wants the differential to
+        chase a red flag, and it may hold it back on a complete one. Only when it
+        did not answer does the verdict decide, and then the rule is the obvious
+        one: a history still being taken is not a history to reason from.
+        """
+        if self.workup_now is not None:
+            return self.workup_now
+        return self.may_proceed
 
     @property
     def deficit(self) -> bool:
@@ -121,6 +166,8 @@ class AdequacyVerdict:
                 {**c, "label": AXES_BY_ID[c["axis_id"]].label}
                 for c in self.closed_by_reviewer if c.get("axis_id") in AXES_BY_ID
             ],
+            "workup_now": self.workup_now,
+            "wants_workup": self.wants_workup,
         }
 
 
@@ -167,10 +214,14 @@ class AdequacyJudge:
         verdict = self._ask_model(facts, complaint, role=role, budget=budget,
                                   rule_required_open=blocking)
         closed_by_model: list[dict[str, str]] = []
+        workup_now: bool | None = None
         if verdict is None:
             missing, reason, contradictions, judged_by = rule_missing, "规则审核：按必答轴判定", [], "rule"
         else:
-            model_missing, reason, contradictions, closed_by_model = verdict
+            reason, workup_now = verdict.reason, verdict.workup_now
+            model_missing = list(verdict.missing)
+            contradictions = list(verdict.contradictions)
+            closed_by_model = [dict(c) for c in verdict.closed_by_reviewer]
             # The reviewer may add gaps *and* close a rule-required axis it can see
             # was answered. Keyword matching routinely misses a colloquial denial
             # ("大便一直很正常"), and an axis the rules cannot close is an axis the
@@ -184,32 +235,30 @@ class AdequacyJudge:
         self._record_round(frozenset(missing), facts, complaint)
         signature = frozenset(missing)
 
+        def decided(kind: str, why: str, gaps: list[str], blocks: list[str],
+                    clashes: list[str]) -> AdequacyVerdict:
+            return AdequacyVerdict(kind, why, gaps, blocks, clashes, rounds_used,
+                                   judged_by, closed_by_model, workup_now)
+
         # Blocking axes come first: nothing below can clear them.
         if blocking:
             if self._stalled(signature):
-                return AdequacyVerdict(
-                    BLOCKED, "反复追问后必答项仍未获答复，不能进入含剂量或处方环节",
-                    missing, blocking, contradictions, rounds_used, judged_by, closed_by_model)
+                return decided(BLOCKED, "反复追问后必答项仍未获答复，不能进入含剂量或处方环节",
+                               missing, blocking, contradictions)
             if rounds_used >= self.max_rounds:
-                return AdequacyVerdict(
-                    BLOCKED, f"已达最大追问轮次({self.max_rounds})，必答项仍未闭合",
-                    missing, blocking, contradictions, rounds_used, judged_by, closed_by_model)
-            return AdequacyVerdict(NOT_ACHIEVED, reason, missing, blocking, contradictions,
-                                   rounds_used, judged_by, closed_by_model)
+                return decided(BLOCKED, f"已达最大追问轮次({self.max_rounds})，必答项仍未闭合",
+                               missing, blocking, contradictions)
+            return decided(NOT_ACHIEVED, reason, missing, blocking, contradictions)
 
         if not missing and not contradictions:
-            return AdequacyVerdict(ACHIEVED, reason or "问诊充分", [], [], [],
-                                   rounds_used, judged_by, closed_by_model)
+            return decided(ACHIEVED, reason or "问诊充分", [], [], [])
         if self._stalled(signature):
-            return AdequacyVerdict(
-                STALLED, "连续两轮追问未取得新信息，带缺口继续并记录在案",
-                missing, [], contradictions, rounds_used, judged_by, closed_by_model)
+            return decided(STALLED, "连续两轮追问未取得新信息，带缺口继续并记录在案",
+                           missing, [], contradictions)
         if rounds_used >= self.max_rounds:
-            return AdequacyVerdict(
-                CAP_REACHED, f"已达最大追问轮次({self.max_rounds})，带缺口继续并记录在案",
-                missing, [], contradictions, rounds_used, judged_by, closed_by_model)
-        return AdequacyVerdict(NOT_ACHIEVED, reason, missing, [], contradictions,
-                               rounds_used, judged_by, closed_by_model)
+            return decided(CAP_REACHED, f"已达最大追问轮次({self.max_rounds})，带缺口继续并记录在案",
+                           missing, [], contradictions)
+        return decided(NOT_ACHIEVED, reason, missing, [], contradictions)
 
     # -------------------------------------------------------------- internals
     def _record_round(self, signature: frozenset[str], facts: dict[str, Any], complaint: str) -> None:
@@ -261,7 +310,7 @@ class AdequacyJudge:
         role: str,
         budget: Any | None,
         rule_required_open: list[str] | None = None,
-    ) -> tuple[list[str], str, list[str], list[dict[str, str]]] | None:
+    ) -> ReviewerOpinion | None:
         """Run the adversarial verifier. ``None`` means it did not run."""
         if self.llm is None or not getattr(self.llm, "available", False):
             return None
@@ -275,26 +324,27 @@ class AdequacyJudge:
             if axis_id in AXES_BY_ID
         }
         try:
-            response = self.llm.chat(
-                [
-                    {"role": "system", "content": VERIFIER_SYSTEM_PROMPT.format(
-                        axis_ids=", ".join(sorted(AXES_BY_ID)))},
-                    {"role": "user", "content": json.dumps(
-                        {
-                            "narrative": complaint[:4000],
-                            "collected_facts": _redact(facts),
-                            "axes_answered": report["answered"],
-                            "axes_open": catalogue,
-                            "rule_required_open": [
-                                {"axis_id": a, "label": AXES_BY_ID[a].label}
-                                for a in (rule_required_open or []) if a in AXES_BY_ID
-                            ],
-                        },
-                        ensure_ascii=False,
-                    )},
-                ],
-                temperature=0.0, max_tokens=700, response_format_json=True,
-            )
+            with progress.activity('问诊充分性审核'):
+                response = self.llm.chat(
+                    [
+                        {"role": "system", "content": VERIFIER_SYSTEM_PROMPT.format(
+                            axis_ids=", ".join(sorted(AXES_BY_ID)))},
+                        {"role": "user", "content": json.dumps(
+                            {
+                                "narrative": complaint[:4000],
+                                "collected_facts": _redact(facts),
+                                "axes_answered": report["answered"],
+                                "axes_open": catalogue,
+                                "rule_required_open": [
+                                    {"axis_id": a, "label": AXES_BY_ID[a].label}
+                                    for a in (rule_required_open or []) if a in AXES_BY_ID
+                                ],
+                            },
+                            ensure_ascii=False,
+                        )},
+                    ],
+                    temperature=0.0, max_tokens=700, response_format_json=True,
+                )
             if budget is not None:
                 budget.charge_llm_tokens(response.total_tokens)
         except (LLMError, Exception):  # noqa: BLE001 - fail open to the rule verdict
@@ -319,7 +369,14 @@ class AdequacyJudge:
             and str(item.get("axis_id")) in AXES_BY_ID
             and str(item.get("quote") or "").strip()
         ]
-        return missing, reason, contradictions, closed
+        # Absent means "no opinion", not "no". A model that omits the field must
+        # not be read as having voted against its own workup.
+        raw_workup = payload.get("workup_now")
+        return ReviewerOpinion(
+            missing=missing, reason=reason, contradictions=contradictions,
+            closed_by_reviewer=closed,
+            workup_now=bool(raw_workup) if isinstance(raw_workup, bool) else None,
+        )
 
 
 def _redact(facts: dict[str, Any]) -> dict[str, Any]:

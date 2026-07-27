@@ -465,5 +465,198 @@ class ConcurrencyConfigTests(unittest.TestCase):
             self.assertIsInstance(journal_default.meta["panel_concurrency"], int)
 
 
+class WaveSchedulingTests(unittest.TestCase):
+    """Independent graph tasks run together, and it must not show in the result.
+
+    On a routine plan, 西医鉴别 / 辨证 / 病例检索 / 用药安全 read nothing of each
+    other's output — eight sequential model calls that had no reason to be
+    sequential. Collapsing them is worth several minutes of a patient's wait with
+    a reasoning model. It is only worth it if the ledger is unchanged, which is
+    what these tests are for.
+    """
+
+    ANSWERS = {
+        "BiomedicalAgent": {"differentials": ["腰椎间盘突出"], "exam_advice": ["直腿抬高"]},
+        "TCMPatternAgent": {"primary_pattern": "气滞血瘀证", "evidence": ["刺痛固定"],
+                            "differential_patterns": ["寒湿痹阻证"], "counter_evidence_needed": ["舌脉"]},
+        "ExpertCaseAgent": {"similar": ["同证型12例"], "counterexamples": [], "limitation": "单一专家经验"},
+    }
+
+    class Jittery:
+        """Random latency, so an ordering race shows up rather than hiding."""
+
+        name, model, available = "jittery", "j", True
+
+        def __init__(self, answers):
+            self.answers = answers
+            self.spans: list[tuple[str, float, float]] = []
+            self.lock = threading.Lock()
+
+        def chat(self, messages, **kwargs):
+            import sys
+
+            started = time.monotonic()
+            frame, agent = sys._getframe(), "-"
+            while frame:
+                owner = frame.f_locals.get("self")
+                if owner is not None and type(owner).__name__.endswith("Agent"):
+                    agent = type(owner).__name__
+                    break
+                frame = frame.f_back
+            time.sleep(random.uniform(0, 0.02))
+            with self.lock:
+                self.spans.append((agent, started, time.monotonic()))
+            payload = dict(self.answers.get(agent) or {})
+            payload.setdefault("triage", "routine")
+            payload.setdefault("adequate", True)
+            payload.setdefault("workup_now", True)
+            return LLMResponse(text=json.dumps(payload, ensure_ascii=False), model="j")
+
+    def _run(self, concurrency, seed):
+        from yaobi_harness.graph import YaobiGraphRunner
+
+        random.seed(seed)
+        llm = self.Jittery(self.ANSWERS)
+        runner = YaobiGraphRunner(llm=llm, task_concurrency=concurrency)
+        state = ClinicalRunState("腰痛3月，刺痛固定，夜间不痛醒，大小便正常", role="physician")
+        runner.run(state, allow_prescription=True)
+        return state, llm
+
+    @staticmethod
+    def _ledger(state):
+        return {
+            "release_status": state.release_status,
+            "risk_mode": state.risk_mode,
+            "tasks": [(t.task_id, t.agent, t.status) for t in state.tasks],
+            "evidence": [f"{i}|{e.source}|{e.level}" for i, e in state.evidence.items()],
+            "claims": [(c.kind, c.text, tuple(c.evidence_ids)) for c in state.claims],
+            "traces": [(t.agent, t.action) for t in state.traces],
+            "safety_issues": sorted(state.safety_issues),
+        }
+
+    def test_a_parallel_run_produces_the_same_ledger_as_a_sequential_one(self):
+        baseline = self._ledger(self._run(1, 0)[0])
+        for seed in range(6):
+            with self.subTest(seed=seed):
+                self.assertEqual(self._ledger(self._run(4, seed)[0]), baseline)
+
+    def test_the_wave_actually_overlaps(self):
+        """Without this the test above would pass on a scheduler that never
+        parallelised anything."""
+        _, llm = self._run(4, 11)
+        wave = [s for s in llm.spans if s[0] in ("BiomedicalAgent", "TCMPatternAgent", "ExpertCaseAgent")]
+        self.assertTrue(wave, "the workup did not run")
+        # Each agent makes several calls, so "all overlap" is the wrong claim.
+        # The real one is that at some instant more than one workup agent was in
+        # flight — a sequential scheduler can never produce that.
+        edges = sorted([(s[1], 1) for s in wave] + [(s[2], -1) for s in wave])
+        peak, live = 0, 0
+        for _, delta in edges:
+            live += delta
+            peak = max(peak, live)
+        self.assertGreater(peak, 1, "no two workup calls were ever in flight together")
+
+    def test_every_agent_in_a_wave_is_recorded_in_the_shared_autonomy_ledger(self):
+        """Output dicts merge key-by-key. Replacing them wholesale kept only the
+        last member of the wave, so the run reported two of its four agents as
+        never having run autonomously — a false audit trail, not a slow one."""
+        state, _ = self._run(4, 3)
+        recorded = set(state.outputs.get("autonomy") or {})
+        self.assertLessEqual({"BiomedicalAgent", "TCMPatternAgent", "ExpertCaseAgent"}, recorded)
+
+    def test_a_journalled_run_is_never_parallel(self):
+        """A journal is an ordered sequence of calls. Recording concurrently
+        writes an order that depends on network timing, and replaying it
+        concurrently consumes an order the recording never had."""
+        import tempfile
+
+        from yaobi_harness.graph import YaobiGraphRunner
+        from yaobi_harness.journal import Journal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Journal(Path(tmp) / "run.jsonl", mode="record")
+            runner = YaobiGraphRunner(journal=journal, task_concurrency=8)
+            self.assertEqual(runner.task_concurrency, 1)
+
+    def test_a_task_that_raises_fails_the_run_rather_than_hanging_the_wave(self):
+        from yaobi_harness.graph import YaobiGraphRunner
+
+        runner = YaobiGraphRunner(llm=self.Jittery(self.ANSWERS), task_concurrency=4)
+
+        def explode(state, tools, broker):
+            raise RuntimeError("模拟子体崩溃")
+
+        runner.agents["TCMPatternAgent"].run = explode
+        state = ClinicalRunState("腰痛3月，刺痛固定，夜间不痛醒，大小便正常", role="patient")
+        runner.run(state)
+        self.assertEqual(state.release_status, "failed_closed")
+        self.assertTrue(any("模拟子体崩溃" in issue for issue in state.safety_issues))
+
+
+class TaskScopeTests(unittest.TestCase):
+    """A graph task may write the release status; a panel member may not."""
+
+    def setUp(self):
+        self.parent = ClinicalRunState("腰痛", role="patient")
+        self.parent.outputs["autonomy"] = {"IntakeAgent": {"mode": "llm"}}
+
+    def scope(self, label="T1"):
+        from yaobi_harness.agent.scope import TaskScope
+
+        return TaskScope(self.parent, Budget(), label=label)
+
+    def test_a_status_write_is_recorded_and_replayed_in_task_order(self):
+        from yaobi_harness.agent.scope import merge_task_scopes
+
+        first, second = self.scope("N1"), self.scope("N2")
+        first.release_status = "needs_examination"
+        second.release_status = "treatment_advice_only"
+        merge_task_scopes(self.parent, [first, second])
+        self.assertEqual(self.parent.release_status, "treatment_advice_only",
+                         "later task in plan order wins, whichever finished first")
+
+    def test_a_task_may_not_rewrite_the_plan_it_is_being_scheduled_from(self):
+        """Silently dropping the write at merge would leave a task looking as
+        though it had rewritten the plan when it had not."""
+        for field_name in ("tasks", "planner_mode"):
+            with self.subTest(field=field_name), self.assertRaises(PermissionError):
+                setattr(self.scope("N1"), field_name, [])
+
+    def test_a_member_scope_still_refuses_a_status_write(self):
+        with self.assertRaises(PermissionError):
+            MemberScope(self.parent, Budget(), label="M1").release_status = "approved_by_physician"
+
+    def test_output_dicts_merge_rather_than_replace(self):
+        from yaobi_harness.agent.scope import merge_task_scopes
+
+        first, second = self.scope("N1"), self.scope("N2")
+        first.outputs["autonomy"]["BiomedicalAgent"] = {"mode": "llm_tool_loop"}
+        second.outputs["autonomy"]["TCMPatternAgent"] = {"mode": "llm_tool_loop"}
+        merge_task_scopes(self.parent, [first, second])
+        self.assertEqual(set(self.parent.outputs["autonomy"]),
+                         {"IntakeAgent", "BiomedicalAgent", "TCMPatternAgent"})
+
+    def test_gaps_and_questions_a_task_added_reach_the_parent(self):
+        from yaobi_harness.agent.scope import merge_task_scopes
+
+        scope = self.scope("N7")
+        scope.missing_information.append("当前用药清单")
+        scope.open_questions.append("目前在吃什么药？")
+        scope.note("并行任务的备注也要合并回去")
+        merge_task_scopes(self.parent, [scope])
+        self.assertIn("当前用药清单", self.parent.missing_information)
+        self.assertIn("目前在吃什么药？", self.parent.open_questions)
+        self.assertIn("并行任务的备注也要合并回去", self.parent.notes)
+
+    def test_a_task_may_fail_the_run_closed(self):
+        from yaobi_harness.agent.scope import merge_task_scopes
+
+        scope = self.scope("N1")
+        scope.fail_closed("关键工具失败")
+        merge_task_scopes(self.parent, [scope])
+        self.assertEqual(self.parent.release_status, "failed_closed")
+        self.assertIn("关键工具失败", self.parent.safety_issues)
+
+
 if __name__ == "__main__":
     unittest.main()

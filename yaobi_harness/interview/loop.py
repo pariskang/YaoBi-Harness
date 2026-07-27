@@ -55,6 +55,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .. import progress
 from ..llm.base import LLMError, ToolSpec, split_reasoning
 from .adequacy import AdequacyJudge, AdequacyVerdict
 from .axes import AXES_BY_ID, coverage, plan_next
@@ -541,15 +542,16 @@ class InterviewLoop:
             } if verdict is not None else {},
         }
         try:
-            response = self.llm.chat(
-                [
-                    {"role": "system", "content": INTERVIEW_SYSTEM_PROMPT.format(
-                        role=role, risk_mode=risk_mode, max_questions=self.max_questions,
-                        skill_instructions=getattr(self.skill_spec, "instructions", "") or "")},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                tools=[ASK_TOOL, IMAGE_TOOL], temperature=0.3, max_tokens=1200,
-            )
+            with progress.activity('撰写追问'):
+                response = self.llm.chat(
+                    [
+                        {"role": "system", "content": INTERVIEW_SYSTEM_PROMPT.format(
+                            role=role, risk_mode=risk_mode, max_questions=self.max_questions,
+                            skill_instructions=getattr(self.skill_spec, "instructions", "") or "")},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                    tools=[ASK_TOOL, IMAGE_TOOL], temperature=0.3, max_tokens=1200,
+                )
             if budget is not None:
                 budget.charge_llm_tokens(response.total_tokens)
         except (LLMError, Exception):  # noqa: BLE001 - never break a turn

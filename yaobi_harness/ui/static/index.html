@@ -221,6 +221,13 @@ textarea:focus, input:focus, select:focus {
   overflow:hidden; background:var(--bg-soft); position:relative;
 }
 .imgs img { display:block; width:100%; height:48px; object-fit:cover; }
+/* An upload that failed must look failed. It is still in the tray, and it will
+   not be sent — the one thing worse than a rejected film is a rejected film the
+   page shows as attached. */
+.imgs figure.failed { border-color:var(--warn, #b45309); }
+.imgs figure.failed img { opacity:.4; }
+.imgs figure.failed figcaption { color:var(--warn, #b45309); }
+.imgs figure { width:auto; min-width:64px; max-width:140px; }
 .imgs figcaption {
   font:500 9px/1.3 var(--sans); padding:3px 4px; color:var(--muted);
   text-align:center; word-break:break-all;
@@ -425,6 +432,28 @@ pre.json {
 .msg.me .bubble { background:var(--accent-soft); border-color:var(--accent-line); }
 .bubble .meta { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:8px; }
 .bubble .learned { margin-top:9px; padding-top:8px; border-top:1px dashed var(--line); font-size:12px; color:var(--text-3); }
+
+/* Live execution stream. Capped in height and scrolled, so a physician run with
+   a consult panel cannot push the input box off the screen. */
+.ev-head { font-size:12px; color:var(--text-3); margin-bottom:6px; }
+.ev-log { max-height:340px; overflow-y:auto; font-size:12px; line-height:1.5; }
+.ev-replay { margin-top:10px; padding-top:8px; border-top:1px dashed var(--line); }
+.ev-replay > summary { font-size:12px; color:var(--text-3); cursor:pointer; }
+.ev { display:grid; grid-template-columns:14px minmax(0,auto) minmax(0,1fr) auto; gap:6px;
+      align-items:baseline; padding:1px 0; color:var(--text-3); }
+.ev-i { text-align:center; }
+.ev-n { font-weight:600; color:var(--text-2); white-space:nowrap; }
+.ev-d { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ev-t { font-variant-numeric:tabular-nums; opacity:.65; }
+.ev-agent .ev-n { color:var(--accent); }
+.ev-deny .ev-n, .ev-deny .ev-d { color:var(--warn, #b45309); }
+.ev-wave { font-style:italic; }
+.ev-defer { opacity:.75; }
+.ev.done { opacity:.8; }
+.ev-think { grid-column:2 / -1; margin:2px 0 4px; }
+.ev-think > summary { cursor:pointer; opacity:.7; }
+.ev-think pre { white-space:pre-wrap; margin:4px 0 0; padding:6px 8px; font-size:11px;
+                background:var(--surface-2, rgba(127,127,127,.08)); border-radius:6px; }
 .qbar { display:flex; flex-wrap:wrap; gap:6px; padding:0 var(--sp-5) var(--sp-3); }
 .chat-input {
   border-top:1px solid var(--line); padding:var(--sp-4) var(--sp-5);
@@ -852,8 +881,13 @@ async function boot() {
   $("#badgeKnow").className = "badge mono" + (kn.configured ? " b-ok" : " b-warn");
 
   const vis = BOOT.vision || {};
-  $("#badgeVision").textContent = vis.configured ? `视觉 ${vis.model}` : "视觉 未配置";
+  $("#badgeVision").textContent = vis.configured
+    ? `视觉 ${vis.model}${vis.borrowed_chat_model ? "（借用对话模型）" : ""}`
+    : "视觉 未配置";
   $("#badgeVision").className = "badge mono" + (vis.configured ? " b-accent" : "");
+  $("#badgeVision").title = vis.borrowed_chat_model
+    ? "未单独配置视觉模型，正在使用当前对话模型读图；若它不是多模态模型，读图会在调用时报错"
+    : (vis.note || "");
   if (!vis.configured) {
     $("#imgDeid").disabled = true;
     $("#imgDropNote").textContent = "未配置视觉模型：设置 YAOBI_VISION_PROVIDER 与 POE_API_KEY 后可用";
@@ -1696,9 +1730,18 @@ function renderInterview(interview) {
 }
 
 /* ═══════════════════ 图片附件 ═══════════════════ */
-/* Images are held in the page only until the next turn sends them, and never
-   written to any store. The de-identification checkbox gates the file picker
-   itself, so there is no path that uploads before the attestation is made. */
+/* A picked file is uploaded immediately to /api/image/upload as raw bytes, and
+   the page keeps only the handle it gets back plus a local preview URL.
+
+   It used to keep the whole base64 data URI and re-send it inside every chat
+   message. A 12 MB film became a 16 MB JSON body, the console rejected it at its
+   256 KB control-traffic limit, and the symptom was 「出错了：请求体过大」 on the
+   first question after attaching — the upload itself having appeared to succeed,
+   because nothing had left the browser yet.
+
+   Bytes are still never written to any store, on either side. The
+   de-identification checkbox gates the file picker itself, so there is no path
+   that uploads before the attestation is made. */
 let PENDING_IMAGES = [];
 
 function syncImgLock() {
@@ -1711,11 +1754,13 @@ function syncImgLock() {
 
 function renderImages() {
   $("#imgList").replaceChildren(...PENDING_IMAGES.map((img, index) => {
-    const fig = el(`<figure>
-      <img alt="${esc(img.name)}" src="${img.ref}">
-      <figcaption>${esc(img.kindLabel)}</figcaption>
+    const state = img.error ? `⚠ ${img.error}` : (img.handle ? img.kindLabel : "上传中…");
+    const fig = el(`<figure${img.error ? ' class="failed"' : ""}>
+      <img alt="${esc(img.name)}" src="${img.preview}">
+      <figcaption>${esc(state)}</figcaption>
       <button type="button" title="移除">×</button></figure>`);
     fig.querySelector("button").addEventListener("click", () => {
+      URL.revokeObjectURL(img.preview);
       PENDING_IMAGES.splice(index, 1);
       renderImages();
     });
@@ -1730,15 +1775,31 @@ async function addImages(files) {
   for (const file of Array.from(files).slice(0, 6 - PENDING_IMAGES.length)) {
     if (!file.type.startsWith("image/")) continue;
     if (file.size > 12 * 1024 * 1024) { alert(`${file.name} 超过 12 MB`); continue; }
-    const ref = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-    PENDING_IMAGES.push({ kind, kindLabel, ref, name:file.name, deidentified:true });
+    // A blob URL for the thumbnail: the browser never has to hold a 16 MB base64
+    // string just to draw a 90 px preview.
+    const entry = { kind, kindLabel, name: file.name,
+                    preview: URL.createObjectURL(file), handle: null, error: "" };
+    PENDING_IMAGES.push(entry);
+    renderImages();
+    try {
+      const headers = { "Content-Type": file.type, "X-Image-Kind": kind, "X-Deidentified": "1" };
+      if (TOKEN) headers["X-Yaobi-Token"] = TOKEN;
+      // Not through api(): that helper JSON-encodes its body, which is the whole
+      // problem. This posts the File blob itself.
+      const res = await fetch("/api/image/upload", { method: "POST", body: file, headers });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      entry.handle = data.handle;
+      // Say it here, once, at the moment it can still be acted on. Discovering
+      // after a three-minute turn that nothing could read the film is worse.
+      if (data.vision_available === false) {
+        entry.error = "已上传，但未配置视觉模型，本次不会判读";
+      }
+    } catch (e) {
+      entry.error = e.message || "上传失败";
+    }
+    renderImages();
   }
-  renderImages();
 }
 
 $("#imgDeid").addEventListener("change", syncImgLock);
@@ -1788,17 +1849,63 @@ function replyMeta(reply) {
 const CHAT_POLL_MS = 1500;
 const CHAT_MAX_WAIT_MS = 15 * 60 * 1000;
 
+/* What each event looks like in the live stream. The pairs collapse: an `llm`
+   line is replaced in place by its `llm_done`, so the log reads as a list of
+   completed steps with one line still in flight at the bottom. */
+const EVENT_STYLE = {
+  agent:       { icon:"▶", cls:"ev-agent" },
+  agent_done:  { icon:"✓", cls:"ev-agent done" },
+  llm:         { icon:"◌", cls:"ev-llm" },
+  llm_done:    { icon:"●", cls:"ev-llm done" },
+  tool:        { icon:"⚒", cls:"ev-tool" },
+  tool_done:   { icon:"✓", cls:"ev-tool done" },
+  tool_denied: { icon:"⊘", cls:"ev-deny" },
+  wave:        { icon:"⇉", cls:"ev-wave" },
+  deferred:    { icon:"⏸", cls:"ev-defer" },
+  error:       { icon:"✕", cls:"ev-deny" },
+};
+
+function renderEvents(host, events) {
+  for (const e of events) {
+    const style = EVENT_STYLE[e.kind] || { icon:"·", cls:"" };
+    // Replace the open line for this step rather than appending a second one.
+    const key = e.kind.endsWith("_done") ? `${e.kind.slice(0, -5)}:${e.label}` : `${e.kind}:${e.label}`;
+    const existing = e.kind.endsWith("_done") ? host.querySelector(`[data-k="${CSS.escape(key)}"]`) : null;
+    const secs = e.data?.elapsed_s ? ` <span class="ev-t">${e.data.elapsed_s}s</span>` : "";
+    const line = el(`<div class="ev ${style.cls}" data-k="${esc(key)}">
+      <span class="ev-i">${style.icon}</span>
+      <span class="ev-n">${esc(e.label)}</span>
+      <span class="ev-d">${esc(e.detail || "")}</span>${secs}</div>`);
+    if (e.reasoning) {
+      // The model's own scratch pad. Operator-facing and collapsed by default:
+      // it is the most interesting thing here and the least suitable for a
+      // patient to read over someone's shoulder.
+      line.appendChild(el(`<details class="ev-think"><summary>思考过程</summary>
+        <pre>${esc(e.reasoning)}</pre></details>`));
+    }
+    if (existing) existing.replaceWith(line); else host.appendChild(line);
+  }
+  host.scrollTop = host.scrollHeight;
+}
+
 async function runChatTurn(payload, bubble) {
   const { job_id } = await api("/api/chat/start", payload);
+  // The stream lives inside the pending bubble, so it sits exactly where the
+  // reply will land and is replaced by it.
+  bubble.innerHTML = '<div class="ev-head">正在推理…</div><div class="ev-log"></div>';
+  const head = bubble.querySelector(".ev-head");
+  const host = bubble.querySelector(".ev-log");
   const started = Date.now();
+  let cursor = 0;
   while (Date.now() - started < CHAT_MAX_WAIT_MS) {
     await new Promise(r => setTimeout(r, CHAT_POLL_MS));
-    const poll = await api("/api/chat/poll", { job_id }, { timeoutMs: 20000, retries: 3 });
+    const poll = await api("/api/chat/poll", { job_id, cursor }, { timeoutMs: 20000, retries: 3 });
+    cursor = poll.cursor ?? cursor;
+    renderEvents(host, poll.events || []);
     if (poll.status === "done") return poll;
     if (poll.status === "error") throw new Error(poll.error || "本轮运行失败");
     const p = poll.progress || {};
-    bubble.textContent = `正在检索证据并推理…（已完成 ${p.llm_calls || 0} 次模型调用，`
-      + `${Math.round(p.elapsed_s || 0)} 秒）`;
+    head.textContent = `正在推理…（${p.llm_calls || 0} 次模型调用，${Math.round(p.elapsed_s || 0)} 秒）`;
   }
   throw new Error("本轮超过 15 分钟仍未完成，已停止等待；模型可能仍在后台计算。");
 }
@@ -1828,17 +1935,31 @@ async function chatSend(text) {
     const data = await runChatTurn({
       message, role: chatRole(), session_id: CHAT.sessionId,
       allow_prescription: $("#chatAllowRx").checked, use_llm: $("#chatUseLlm").checked,
-      images: PENDING_IMAGES.map(i => ({ kind:i.kind, ref:i.ref, deidentified:true })),
+      // Handles, not bytes. An image that failed to upload is not sent at all —
+      // it stays in the tray showing its error, rather than silently going
+      // missing from a turn that claims to have looked at it.
+      images: PENDING_IMAGES.filter(i => i.handle)
+                            .map(i => ({ kind:i.kind, handle:i.handle })),
     }, pendingBubble);
     // Sent images belong to the session now; clearing keeps the next turn from
-    // re-reading them and re-charging the vision budget.
-    PENDING_IMAGES = [];
+    // re-reading them and re-charging the vision budget. Ones that failed to
+    // upload stay put, so the tray keeps showing why.
+    PENDING_IMAGES.filter(i => i.handle).forEach(i => URL.revokeObjectURL(i.preview));
+    PENDING_IMAGES = PENDING_IMAGES.filter(i => !i.handle);
     renderImages();
     CHAT.sessionId = data.session_id;
     CHAT.turns = data.turn_count;
     const reply = data.reply;
 
+    // Keep the trace under the reply rather than discarding it — 「刚才它到底
+    // 调了什么」 is asked after the answer arrives, not during the wait.
+    const trace = pendingBubble.querySelector(".ev-log");
     pendingBubble.innerHTML = replyMeta(reply) + esc(reply.message);
+    if (trace && trace.children.length) {
+      const box = el(`<details class="ev-replay"><summary>本轮执行过程（${trace.children.length} 步）</summary></details>`);
+      box.appendChild(trace);
+      pendingBubble.appendChild(box);
+    }
     if (Object.keys(reply.extracted || {}).length) {
       pendingBubble.appendChild(el(
         `<div class="learned">本轮记录：${esc(JSON.stringify(reply.extracted))}</div>`));

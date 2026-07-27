@@ -13,7 +13,7 @@ import unittest
 from yaobi_harness.conversation import ConversationSession, rule_extract
 from yaobi_harness.interview import axes as ax
 from yaobi_harness.interview.adequacy import (
-    ACHIEVED, BLOCKED, CAP_REACHED, NOT_ACHIEVED, STALLED, AdequacyJudge,
+    ACHIEVED, BLOCKED, CAP_REACHED, NOT_ACHIEVED, STALLED, AdequacyJudge, ReviewerOpinion,
 )
 from yaobi_harness.interview.loop import InterviewLoop
 from yaobi_harness.llm.base import LLMResponse, ToolCall
@@ -155,7 +155,7 @@ class AdequacyJudgeTests(unittest.TestCase):
         judge = AdequacyJudge(stall_threshold=3)
         # A verifier that keeps naming the same non-required gap: nothing blocks
         # release, but no progress is being made either.
-        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "还缺舌脉", [], [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(["tongue_pulse"], "还缺舌脉")  # type: ignore[method-assign]
         facts = {**RED_FLAGS_ANSWERED, **CORE_ANSWERED}
         # A real stall is the patient *speaking* and adding nothing: the narrative
         # grows, the gaps do not. Repeating the identical call is a recomputation,
@@ -173,7 +173,7 @@ class AdequacyJudgeTests(unittest.TestCase):
         while the patient had been asked once and not yet answered."""
         judge = AdequacyJudge(stall_threshold=2)
         facts = {**RED_FLAGS_ANSWERED, **CORE_ANSWERED}
-        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "缺舌脉", [], [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(["tongue_pulse"], "缺舌脉")  # type: ignore[method-assign]
         for _ in range(5):
             verdict = judge.judge(facts, "腰痛3个月")
         self.assertEqual(len(judge.history), 1, "five recomputations are one round")
@@ -203,7 +203,7 @@ class AdequacyJudgeTests(unittest.TestCase):
 
     def test_cap_reached_when_optional_gaps_remain(self):
         judge = AdequacyJudge(max_rounds=2, stall_threshold=99)
-        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "还缺舌脉", [], [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(["tongue_pulse"], "还缺舌脉")  # type: ignore[method-assign]
         verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED}, "腰痛3个月", rounds_used=9)
         self.assertEqual(verdict.verdict, CAP_REACHED)
         self.assertTrue(verdict.may_proceed)
@@ -213,7 +213,7 @@ class AdequacyJudgeTests(unittest.TestCase):
         """A closure needs the quote it rests on. An unsupported opinion about a
         red-flag axis is exactly what must not close one."""
         judge = AdequacyJudge()
-        judge._ask_model = lambda *a, **k: ([], "看起来够了", [], [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: ReviewerOpinion([], "看起来够了")  # type: ignore[method-assign]
         verdict = judge.judge({}, "腰痛3个月")
         self.assertNotEqual(verdict.verdict, ACHIEVED)
         self.assertTrue(verdict.blocking_axes)
@@ -222,7 +222,7 @@ class AdequacyJudgeTests(unittest.TestCase):
         """Keyword matching misses colloquial denials, and an axis the rules cannot
         close is an axis the patient is re-asked forever before being told 病史不足."""
         judge = AdequacyJudge()
-        judge._ask_model = lambda *a, **k: (  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(  # type: ignore[method-assign]
             [], "口语否认已覆盖", [],
             [{"axis_id": "cauda_equina", "quote": "大便一直很正常，也没有漏尿"}])
         verdict = judge.judge({}, "腰痛3个月")
@@ -242,7 +242,7 @@ class AdequacyJudgeTests(unittest.TestCase):
 
     def test_model_named_gaps_are_unioned_in(self):
         judge = AdequacyJudge()
-        judge._ask_model = lambda *a, **k: (["tongue_pulse"], "缺舌脉", [], [])  # type: ignore[method-assign]
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(["tongue_pulse"], "缺舌脉")  # type: ignore[method-assign]
         verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED}, "腰痛3个月")
         self.assertIn("tongue_pulse", verdict.missing_axes)
         self.assertEqual(verdict.verdict, NOT_ACHIEVED)
@@ -665,6 +665,57 @@ class ScreeningRegressionTests(unittest.TestCase):
         from yaobi_harness.safety.red_flags import screen
 
         self.assertTrue(screen("既往体健，现突发胸痛、大汗").hits)
+
+
+class WorkupTimingTests(unittest.TestCase):
+    """Whether to reason now is the reviewer's call, not a rule's.
+
+    Six of a turn's thirteen model calls are the differential, the pattern and the
+    case search. On a turn whose only output is 「您疼多久了？」 they are latency
+    the patient pays for nothing — and worse than nothing, because a differential
+    built from two facts is a differential the note will carry. So the reviewer is
+    asked, and its answer wins in both directions.
+    """
+
+    def test_the_reviewer_can_pull_the_workup_forward_on_a_thin_history(self):
+        """It may want the differential to chase a red flag it just read."""
+        judge = AdequacyJudge()
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(  # type: ignore[method-assign]
+            ["tongue_pulse"], "病史还薄，但夜间痛醒要立刻查", workup_now=True)
+        verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED}, "腰痛3个月")
+        self.assertEqual(verdict.verdict, NOT_ACHIEVED)
+        self.assertTrue(verdict.wants_workup, "an explicit yes is not overridden")
+
+    def test_the_reviewer_can_hold_the_workup_back_on_a_complete_one(self):
+        judge = AdequacyJudge()
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(  # type: ignore[method-assign]
+            [], "够了，但先确认一件事", workup_now=False)
+        verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED, "conditions": []}, "腰痛3个月")
+        self.assertEqual(verdict.verdict, ACHIEVED)
+        self.assertFalse(verdict.wants_workup)
+
+    def test_no_answer_means_no_opinion_not_no(self):
+        """A model that omits the field must not be read as having voted against
+        its own workup."""
+        judge = AdequacyJudge()
+        judge._ask_model = lambda *a, **k: ReviewerOpinion([], "够了")  # type: ignore[method-assign]
+        verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED, "conditions": []}, "腰痛3个月")
+        self.assertIsNone(verdict.workup_now)
+        self.assertTrue(verdict.wants_workup, "an adequate history proceeds by default")
+
+    def test_an_interview_still_asking_defers_by_default(self):
+        judge = AdequacyJudge()
+        verdict = judge.judge({}, "腰痛3个月")
+        self.assertFalse(verdict.may_proceed)
+        self.assertFalse(verdict.wants_workup)
+
+    def test_the_decision_is_visible_in_the_serialised_verdict(self):
+        judge = AdequacyJudge()
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(  # type: ignore[method-assign]
+            ["tongue_pulse"], "先问透", workup_now=False)
+        payload = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED}, "腰痛").to_dict()
+        self.assertIs(payload["workup_now"], False)
+        self.assertIs(payload["wants_workup"], False)
 
 
 if __name__ == "__main__":

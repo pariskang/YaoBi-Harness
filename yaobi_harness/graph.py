@@ -12,10 +12,11 @@ Guarantees this runner provides regardless of the plan it is given:
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from . import schemas
+from . import progress, schemas
 from .agent.agents import (
     BiomedicalAgent, ConsultPanelAgent, CriticAgent, DoseAgent, ExpertCaseAgent,
     FormulaAgent, IntakeAgent, InterviewAgent, MedicationSafetyAgent,
@@ -31,6 +32,34 @@ from .tools import CapabilityBroker, ToolHealth, ToolRegistry
 
 #: Agents that may only run for a physician who explicitly opted in.
 PRESCRIPTIVE_AGENTS = {"FormulaAgent", "DoseAgent", "PhysicianReviewAgent"}
+
+#: The diagnostic workup: agents that reason *towards a diagnosis*. Six of a
+#: turn's thirteen model calls live here, and on a turn whose only output is a
+#: follow-up question none of them is worth making. Whether to run them is the
+#: interview reviewer's call — see :meth:`YaobiGraphRunner._defer_workup`.
+#:
+#: The safety screens are deliberately **not** here. ``MedicationSafetyAgent`` is
+#: a tool call over the drug list the patient just gave, and ``OsteoporosisAgent``
+#: a risk screen; both cost far less than the differential and both exist to
+#: catch something *before* the conversation continues. Postponing a safety
+#: screen to save latency is the wrong trade in the wrong direction.
+WORKUP_AGENTS = {
+    "BiomedicalAgent", "TCMPatternAgent", "ExpertCaseAgent", "ConsultPanelAgent",
+}
+
+#: Agents that may share a wave. An **allowlist**, not a denylist: an agent
+#: earns a place here by reading only outputs its task declares as dependencies,
+#: and a new agent is sequential until someone has checked that it does.
+#:
+#: Notably absent — ``IntakeAgent`` (its risk mode decides the plan itself),
+#: ``InterviewAgent`` (one loop object is shared across the whole conversation
+#: and is not thread-safe), ``ConsultPanelAgent`` (already runs its members
+#: concurrently; nesting the pools would multiply the thread count), and the
+#: 方 → 量 → 审 chain, which is a dependency chain by construction.
+CONCURRENT_SAFE_AGENTS = {
+    "BiomedicalAgent", "TCMPatternAgent", "ExpertCaseAgent",
+    "MedicationSafetyAgent", "OsteoporosisAgent", "VisionAgent",
+}
 
 
 def _panel_concurrency() -> int:
@@ -52,6 +81,7 @@ class YaobiGraphRunner:
         interview_loop: Any | None = None,
         journal: Any | None = None,
         panel_concurrency: int | None = None,
+        task_concurrency: int | None = None,
     ) -> None:
         self.tools = tools or ToolRegistry()
         # Resolved here rather than inside the panel, because the journal's meta
@@ -59,6 +89,16 @@ class YaobiGraphRunner:
         # a matching one: an unresolved ``None`` in the meta would tell a future
         # replayer nothing.
         self.panel_concurrency = panel_concurrency if panel_concurrency else _panel_concurrency()
+        #: How many independent graph tasks may run at once. Forced to 1 whenever
+        #: a journal is attached: a journal is an ordered sequence of calls, so
+        #: recording concurrently would write an order that depends on network
+        #: timing, and replaying concurrently would consume it in an order the
+        #: recording never had. Neither is a faithful audit, and an audit that is
+        #: not faithful is worse than a slow one.
+        self.task_concurrency = (
+            1 if journal is not None
+            else max(1, task_concurrency if task_concurrency else _panel_concurrency())
+        )
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         manifest = Path(skill_manifest) if skill_manifest else Path(__file__).parent / "skills" / "manifest.yaml"
         # ``discover`` layers every ``SKILL.md`` over the manifest, so the rich
@@ -171,17 +211,43 @@ class YaobiGraphRunner:
     # -------------------------------------------------------------------- nodes
     def _bootstrap(self, state: ClinicalRunState) -> None:
         """Intake runs before planning: the plan depends on the risk mode."""
-        self.agents["IntakeAgent"].run(state, self.tools, self._broker(state, "IntakeAgent"))
-        self._validate_output(state, "IntakeAgent")
+        with progress.activity("IntakeAgent"), \
+                progress.step("agent", "IntakeAgent", "分诊与红旗筛查") as report:
+            self.agents["IntakeAgent"].run(state, self.tools, self._broker(state, "IntakeAgent"))
+            self._validate_output(state, "IntakeAgent")
+            report["detail"] = f"分诊={state.risk_mode}"
         self._checkpoint(state, "IntakeAgent")
 
     def _plan(self, state: ClinicalRunState) -> None:
-        PlannerAgent(self.llm, self.skill_registry).run(state)
-        self._validate_output(state, "PlannerAgent")
+        with progress.activity("PlannerAgent"), \
+                progress.step("agent", "PlannerAgent", "规划本轮任务图") as report:
+            PlannerAgent(self.llm, self.skill_registry).run(state)
+            self._validate_output(state, "PlannerAgent")
+            report["detail"] = f"{len(state.tasks)} 个任务，来源 {state.planner_mode}"
         self._checkpoint(state, "PlannerAgent")
 
     def _execute_tasks(self, state: ClinicalRunState, allow_prescription: bool) -> None:
-        for task in state.tasks:
+        """Drive the plan, one wave of independent tasks at a time.
+
+        Two behaviours here exist purely to make a turn finish before the patient
+        gives up on it, and neither costs a decision:
+
+        *Waves.* Consecutive tasks that depend on nothing in the wave run
+        concurrently. On the routine plan that is 西医鉴别 / 辨证 / 病例检索 /
+        用药安全 — four agents, eight sequential model calls, none of which reads
+        another's output. Ordering is preserved everywhere it means something:
+        anything with a dependency still waits, and results merge in plan order,
+        so the ledger is byte-identical to a sequential run.
+
+        *Deferral.* The diagnostic workup is skipped on turns where the interview
+        reviewer said the history is not yet worth reasoning from — see
+        :meth:`_defer_workup`. Those tasks return to ``pending`` and run on a
+        later turn.
+        """
+        index = 0
+        while index < len(state.tasks):
+            task = state.tasks[index]
+            index += 1
             if task.status not in ("pending", "repair_requested"):
                 continue
             if task.agent == "CriticAgent":
@@ -195,24 +261,136 @@ class YaobiGraphRunner:
             if not self._deps_ok(state, task):
                 task.status = "skipped_dependency"
                 continue
-            agent = self.agents.get(task.agent)
-            if agent is None or task.agent not in AGENT_CATALOG:
-                task.status = "failed"
-                state.fail_closed(f"未实现或未登记的任务Agent: {task.agent}")
-                return
+            if self._defer_workup(state, task):
+                continue
 
+            wave = [task] + self._wave_after(state, index, allow_prescription)
+            index += len(wave) - 1
+            for member in wave:
+                if member.agent not in AGENT_CATALOG or self.agents.get(member.agent) is None:
+                    member.status = "failed"
+                    state.fail_closed(f"未实现或未登记的任务Agent: {member.agent}")
+                    return
+
+            if len(wave) == 1:
+                self._run_task(state, wave[0])
+            else:
+                self._run_wave(state, wave)
+
+            for member in wave:
+                self._checkpoint(state, member.agent)
+            if state.release_status == "failed_closed":
+                return
+            if state.risk_mode == "urgent" and any(m.agent == "UrgentCareAgent" for m in wave):
+                return  # urgent plan is terminal; nothing downstream may run
+
+    def _wave_after(self, state: ClinicalRunState, index: int, allow_prescription: bool) -> list[Task]:
+        """Tasks immediately following ``index`` that may run beside their predecessor.
+
+        Deliberately a *consecutive prefix* rather than "everything currently
+        runnable". A topological scheduler would also be correct, and would also
+        quietly reorder tasks the plan wrote in a particular order for reasons it
+        did not encode as dependencies. Taking a prefix can only ever collapse
+        neighbours, so a plan's sequence is never rearranged — only compressed.
+        """
+        leader = state.tasks[index - 1]
+        if self.task_concurrency <= 1 or leader.agent not in CONCURRENT_SAFE_AGENTS:
+            return []
+        picked: list[Task] = []
+        chosen_ids = {leader.task_id}
+        for task in state.tasks[index:]:
+            if len(picked) + 1 >= self.task_concurrency:
+                break
+            if task.status not in ("pending", "repair_requested"):
+                break
+            if task.agent == "CriticAgent" or task.agent not in CONCURRENT_SAFE_AGENTS:
+                break
+            if task.agent in PRESCRIPTIVE_AGENTS and not (state.role == "physician" and allow_prescription):
+                break
+            if not self._deps_ok(state, task) or chosen_ids & set(task.depends_on):
+                break
+            if self._defer_workup(state, task, dry_run=True):
+                break
+            picked.append(task)
+            chosen_ids.add(task.task_id)
+        return picked
+
+    def _run_task(self, state: ClinicalRunState, task: Task) -> None:
+        agent = self.agents[task.agent]
+        with progress.bound(progress.current(), task.agent), \
+                progress.step("agent", task.agent, task.objective) as report:
             agent.run(state, self.tools, self._broker(state, task.agent))
             self._validate_output(state, task.agent)
             task.status = "failed" if state.release_status == "failed_closed" else "ok"
-            self._checkpoint(state, task.agent)
-            if state.release_status == "failed_closed":
-                return
-            if state.risk_mode == "urgent" and task.agent == "UrgentCareAgent":
-                return  # urgent plan is terminal; nothing downstream may run
+            report["detail"] = f"{task.task_id} → {task.status}"
+
+    def _run_wave(self, state: ClinicalRunState, wave: list[Task]) -> None:
+        """Run independent tasks concurrently against private scopes."""
+        from .agent.scope import TaskScope, merge_task_scopes
+
+        sink = progress.current()
+        progress.emit("wave", "、".join(t.agent for t in wave), f"{len(wave)} 个互不依赖的子体并行")
+        scopes = [TaskScope(state, state.budget, label=t.task_id) for t in wave]
+
+        def work(pair: tuple[Task, TaskScope]) -> None:
+            task, scope = pair
+            # The sink is re-bound inside the worker: a thread does not inherit
+            # its parent's thread-locals, and without this the whole wave would
+            # run invisibly.
+            with progress.bound(sink, task.agent), \
+                    progress.step("agent", task.agent, task.objective) as report:
+                try:
+                    self.agents[task.agent].run(scope, self.tools, self._broker(scope, task.agent))
+                except Exception as exc:  # noqa: BLE001 - one task must not kill the wave
+                    scope.fail_closed(f"并行任务异常: {task.agent}: {type(exc).__name__}: {exc}")
+                report["detail"] = task.task_id
+
+        with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+            list(pool.map(work, zip(wave, scopes)))
+
+        merge_task_scopes(state, scopes)
+        for task in wave:
+            self._validate_output(state, task.agent)
+            task.status = "failed" if state.release_status == "failed_closed" else "ok"
+
+    @staticmethod
+    def _defer_workup(state: ClinicalRunState, task: Task, *, dry_run: bool = False) -> bool:
+        """Whether to hold this diagnostic task back until the history is worth it.
+
+        Six of a turn's thirteen model calls are the differential, the pattern and
+        the case search. On a turn whose only output is 「您疼多久了？」 they are
+        latency the patient pays for nothing — and worse than nothing, because a
+        differential built from two facts is a differential the note will carry.
+
+        The decision is the interview reviewer's, not this function's: it answers
+        ``workup_now`` and may pull the workup forward on a thin history whenever
+        it wants the differential to chase something. Absent an answer, an
+        interview that is still asking defers and one that has finished proceeds.
+
+        Only in a conversation. A one-shot run has no later turn to defer *to*, so
+        deferring there would mean silently dropping the differential and handing
+        back an answer that quietly contains less than it looks like it does.
+        """
+        if task.agent not in WORKUP_AGENTS or not state.interactive:
+            return False
+        verdict = (state.outputs.get("interview") or {}).get("verdict") or {}
+        if not verdict or verdict.get("wants_workup", True):
+            return False
+        if not dry_run:
+            task.status = "pending"
+            state.note(
+                f"本轮先把问诊问透，{task.agent} 推迟到病史足够时再跑"
+                f"（审核者判断：{verdict.get('reason') or '病史尚不充分'}）"
+            )
+            progress.emit("deferred", task.agent, "问诊未结束，本轮不跑鉴别推理")
+        return True
 
     def _critic(self, state: ClinicalRunState) -> list[dict[str, str]]:
-        self.agents["CriticAgent"].run(state, self.tools, self._broker(state, "CriticAgent"))
-        self._validate_output(state, "CriticAgent")
+        with progress.activity("CriticAgent"), \
+                progress.step("agent", "CriticAgent", "安全审查与引用校验") as report:
+            self.agents["CriticAgent"].run(state, self.tools, self._broker(state, "CriticAgent"))
+            self._validate_output(state, "CriticAgent")
+            report["detail"] = f"放行状态={state.release_status}"
         for task in state.tasks:
             if task.agent == "CriticAgent":
                 task.status = "ok"
@@ -244,6 +422,7 @@ class YaobiGraphRunner:
         # Repair loops re-run agents, so the same finding can be recorded twice.
         state.safety_issues = list(dict.fromkeys(state.safety_issues))
         self._backfill_questions(state)
+        self._report_unread_images(state)
         if state.release_status == "needs_more_information":
             has_soft = bool(state.outputs.get("intake", {}).get("screening", {}).get("soft_hits"))
             critical_gaps = [m for m in state.missing_information if m in {"神经症状", "大小便/会阴感觉", "发热外伤肿瘤史"}]
@@ -278,9 +457,35 @@ class YaobiGraphRunner:
         cannot schedule it somewhere it would be useless.
         """
         try:
-            self.agents["SummaryAgent"].run(state, self.tools, self._broker(state, "SummaryAgent"))
+            with progress.activity("SummaryAgent"), \
+                    progress.step("agent", "SummaryAgent", "生成病历摘要") as report:
+                self.agents["SummaryAgent"].run(state, self.tools, self._broker(state, "SummaryAgent"))
+                report["detail"] = "已生成" if state.outputs.get("clinical_note") else "未结束，本轮不生成"
         except Exception as exc:  # noqa: BLE001 - a note is an artefact, never a gate
             state.warn(f"病历摘要生成失败（不影响本次结论）: {type(exc).__name__}: {exc}")
+
+    def _report_unread_images(self, state: ClinicalRunState) -> None:
+        """Never let an attached image end a run in silence.
+
+        Someone photographed a film, ticked the de-identification box and waited.
+        If nothing looked at it, the one unacceptable outcome is an answer that
+        reads as though nothing was attached. There are three ways to get here and
+        the operator needs to know which: no vision model is configured, the plan
+        omitted the read, or the read ran and failed — the last already warns from
+        inside ``VisionAgent``, so this covers the first two.
+        """
+        if not state.images or state.outputs.get("image_findings"):
+            return
+        vision = getattr(self.tools, "vision", None)
+        if not getattr(vision, "available", False):
+            state.warn(
+                f"已收到 {len(state.images)} 张图片，但本次运行没有可用的视觉模型，图片未被判读。"
+                "请配置 YAOBI_VISION_PROVIDER / YAOBI_VISION_MODEL，或使用一个多模态对话模型。"
+            )
+            return
+        state.warn(
+            f"已收到 {len(state.images)} 张图片，但本次计划没有安排判读节点，图片未被读取。"
+        )
 
     @staticmethod
     def _backfill_questions(state: ClinicalRunState) -> None:

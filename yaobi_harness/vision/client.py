@@ -213,6 +213,9 @@ class VisionClient:
         #: Model override, so a text-only run can still borrow a vision model.
         self.model = model or getattr(chat_client, "model", "")
         self.phi_precheck = phi_precheck
+        #: Set by the caller when this client is the session's ordinary chat
+        #: model standing in for an unconfigured vision provider.
+        self.borrowed = False
 
     @property
     def available(self) -> bool:
@@ -383,6 +386,11 @@ def describe_vision(client: VisionClient | None) -> dict[str, Any]:
         "provider": getattr(client.chat_client, "name", "unknown"),
         "phi_precheck": client.phi_precheck,
         "kinds": list(IMAGE_KINDS),
+        # True when no vision-specific provider was configured and the session's
+        # chat model is being used instead. Worth surfacing rather than hiding:
+        # if that model turns out not to be multimodal, this is the line that
+        # explains the failure.
+        "borrowed_chat_model": bool(getattr(client, "borrowed", False)),
     }
 
 

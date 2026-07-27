@@ -203,6 +203,8 @@ PLANNER_SYSTEM_PROMPT = """你是骨科临床决策系统的规划器。你只�
 3. depends_on 只能引用本次计划中已存在的 task_id，且不得构成环。
 4. 任务总数不超过 {max_tasks}。
 5. 安全审查节点由系统强制追加，你不需要也不应该省略其它必要的证据收集步骤。
+6. `attached_images` 非空时，患者已经上传了图片并在等你看。除非你有明确理由跳过，
+   否则请安排 VisionAgent（工具 medical_image_read）——上传了却没人看，比没上传更糟。
 
 只输出 JSON：{{"reasoning": "一句话说明取舍", "tasks": [
   {{"task_id": "P1", "agent": "AgentName", "objective": "本任务目标", "required_tools": [...], "depends_on": [...]}}
@@ -230,6 +232,16 @@ def build_planner_prompt(state: ClinicalRunState, skill_registry: Any | None = N
         "soft_signals": screening.get("soft_hits", []),
         "missing_information": state.missing_information,
         "known_facts": {k: v for k, v in state.facts.items() if k != "raw"},
+        # Attached images were missing from this context entirely, and the
+        # consequence was not subtle: a model-authored plan never scheduled
+        # ``VisionAgent``, so an uploaded X-ray was accepted, stored, and never
+        # looked at — 「上传 X 片无法自动解析」, with nothing anywhere saying why.
+        # The rule plan schedules the read whenever images exist; the model needs
+        # the same fact to make the same call.
+        "attached_images": [
+            {"kind": str(i.get("kind") or "other"), "deidentified": bool(i.get("deidentified"))}
+            for i in (state.images or [])
+        ],
         "agent_catalog": catalog,
         # What each skill is for, so the planner reasons about capabilities
         # rather than guessing from agent names alone.

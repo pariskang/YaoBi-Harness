@@ -243,3 +243,122 @@ def merge_scopes(
             claims=len(scope.claims),
         ))
     return reports
+
+
+class TaskScope(MemberScope):
+    """A scope for a graph task running beside its independent siblings.
+
+    A consult member and a graph task want almost the same isolation, and differ
+    in exactly one place: a member may not touch the run's release status, while
+    ``BiomedicalAgent`` escalating to ``needs_examination`` **is** the agent doing
+    its job. So the frozen fields are not refused here — they are *recorded*, and
+    :func:`merge_task_scopes` replays them in task order.
+
+    Replaying in task order is what makes concurrency invisible in the result.
+    Every one of these writes is a conditional escalation of the form "if the
+    status is still X, make it Y"; evaluating those conditions against the
+    pre-wave value and then applying them in order reproduces what a sequential
+    run would have produced, whichever agent's HTTP response happened to land
+    first.
+
+    The scope also tracks ``outputs``, ``missing_information``, ``open_questions``
+    and ``notes``, which :class:`MemberScope` isolates but never merges back —
+    correct for a panel, where a member's private working notes stay private, and
+    wrong for a graph task, whose output *is* the point of running it.
+    """
+
+    #: The release status is frozen on a panel member and merely *recorded* here.
+    #: These two stay genuinely off-limits: a task rewriting the plan mid-wave
+    #: would race with the scheduler that is iterating it.
+    #:
+    #: Enforced, not documented. Without the guard below a write would land as an
+    #: instance attribute on the scope, be dropped at merge, and leave no trace —
+    #: the failure mode is a task that appears to have rewritten the plan and did
+    #: not.
+    FROZEN = ("tasks", "planner_mode")
+
+    def __init__(self, parent: ClinicalRunState, budget: Budget, *, label: str = "") -> None:
+        super().__init__(parent, budget, label=label)
+        self.notes: list[str] = []
+        self.status_writes: list[tuple[str, str]] = []
+        self._outputs_before = copy.deepcopy(parent.outputs)
+        self._missing_before = list(parent.missing_information)
+        self._questions_before = list(parent.open_questions)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self.FROZEN:
+            raise PermissionError(
+                f"并行任务不能改写 {name}：计划正在被调度器遍历，任务改写它会与遍历竞争"
+            )
+        super().__setattr__(name, value)
+
+    # `MemberScope` raises on these; a task legitimately sets them.
+    @property
+    def risk_mode(self) -> str:
+        return self._risk_mode
+
+    @risk_mode.setter
+    def risk_mode(self, value: str) -> None:
+        self._risk_mode = str(value)
+        self.status_writes.append(("risk_mode", str(value)))
+
+    @property
+    def release_status(self) -> str:
+        return self._release_status
+
+    @release_status.setter
+    def release_status(self, value: str) -> None:
+        self._release_status = str(value)
+        self.status_writes.append(("release_status", str(value)))
+
+    def note(self, message: str) -> None:
+        if message not in self.notes:
+            self.notes.append(message)
+
+    def fail_closed(self, reason: str) -> None:
+        """A task *may* fail the run closed; it is recorded and replayed in order."""
+        self.safety_issues.append(reason)
+        self.release_status = "failed_closed"
+
+    def new_outputs(self) -> dict[str, Any]:
+        """Output keys this task wrote or changed."""
+        return {k: v for k, v in self.outputs.items()
+                if k not in self._outputs_before or self._outputs_before[k] != v}
+
+    def new_missing(self) -> list[str]:
+        return [m for m in self.missing_information if m not in self._missing_before]
+
+    def new_questions(self) -> list[str]:
+        return [q for q in self.open_questions if q not in self._questions_before]
+
+
+def merge_task_scopes(parent: ClinicalRunState, scopes: list["TaskScope"]) -> list[MergeReport]:
+    """Fold concurrent graph tasks into the parent, in task order.
+
+    Order is the plan's order, never completion order — the same guarantee
+    :func:`merge_scopes` gives a panel, for the same reason.
+    """
+    reports = merge_scopes(parent, scopes)
+    for scope in scopes:
+        for key, value in scope.new_outputs().items():
+            # Dict-valued outputs merge key-by-key rather than replace. Most
+            # output keys have exactly one writer, for which the two are the same
+            # thing — but ``outputs["autonomy"]`` is a shared ledger every
+            # autonomous agent adds its own entry to, and wholesale replacement
+            # silently kept only whichever member of the wave merged last. The
+            # run then reported two of its four agents as never having run
+            # autonomously, which is a false audit trail, not a slow one.
+            existing = parent.outputs.get(key)
+            if isinstance(existing, dict) and isinstance(value, dict):
+                parent.outputs[key] = {**existing, **value}
+            else:
+                parent.outputs[key] = value
+        parent.missing_information = list(dict.fromkeys(
+            parent.missing_information + scope.new_missing()))
+        parent.open_questions = list(dict.fromkeys(
+            parent.open_questions + scope.new_questions()))
+        for message in scope.notes:
+            parent.note(message)
+        for field_name, value in scope.status_writes:
+            setattr(parent, field_name, value)
+    return reports

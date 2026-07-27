@@ -129,10 +129,11 @@ storage 被拦时，刷新只能靠它。
 | POST | `/api/replay` | `{run_id, complaint?, facts?}` → `{fidelity, journal, delivered, audit, meta}` |
 | POST | `/api/interactions` | `{medications, conditions}` → 相互作用筛查结果 |
 | POST | `/api/chat/open` | `{role}` → `{session_id, reply, ...}`；智能体先开口，页面加载即调用 |
-| POST | `/api/chat/start` | `{message, role, session_id?}` → `{job_id, status}`；后台跑一轮 |
-| POST | `/api/chat/poll` | `{job_id}` → `{status, progress:{llm_calls, elapsed_s}, ...}` |
+| POST | `/api/chat/start` | `{message, role, session_id?, images:[{kind, handle}]}` → `{job_id, status}`；后台跑一轮 |
+| POST | `/api/chat/poll` | `{job_id, cursor}` → `{status, progress, events, cursor, ...}` |
 | POST | `/api/chat` | `{message, role, session_id?}` → `{session_id, reply, audit, meta}` |
 | POST | `/api/chat/reset` | `{session_id}` → 清空该会话 |
+| POST | `/api/image/upload` | **原始图片字节**（非 JSON），头 `Content-Type: image/*`、`X-Image-Kind`、`X-Deidentified: 1` → `{handle, sha256, bytes, vision_available}` |
 
 `/api/run` 的返回结构固定为三段：`delivered`（角色化答复）、`audit`（推理记录，仅操作者）、
 `meta`（放行状态、规划来源、预算、会诊并发、知识库与许可模式）；
@@ -152,6 +153,46 @@ storage 被拦时，刷新只能靠它。
 runner 在构造时就把客户端绑进了每个 Agent。
 
 `/api/chat` 仍然保留同步版本，脚本与回归测试用它。
+
+### 执行过程是流式可见的
+
+轮询返回的不只是计数，还有 `events`——从上次 `cursor` 之后发生的每一步：
+哪个 Agent 开始了、调了什么工具、工具回了什么、模型这次想了什么。
+页面把它渲染成实时列表，答复到达后折叠成「本轮执行过程」留在气泡里，
+因为「刚才它到底调了什么」是**答复之后**才会问的问题。
+
+```jsonc
+{"seq": 21, "at": 3.4, "kind": "agent",     "label": "BiomedicalAgent", "detail": "西医鉴别"}
+{"seq": 22, "at": 3.4, "kind": "llm",       "label": "BiomedicalAgent", "detail": "思考中…"}
+{"seq": 23, "at": 19.8,"kind": "llm_done",  "label": "BiomedicalAgent",
+ "reasoning": "跌倒后3个月、遇冷加重，先排除骨折…", "data": {"elapsed_s": 16.4}}
+{"seq": 24, "at": 19.8,"kind": "tool",      "label": "clinical_guideline_search", "detail": "topic=low back pain"}
+{"seq": 25, "at": 20.1,"kind": "tool_denied","label": "formula_composition_search","detail": "urgent_mode_forbids_…"}
+```
+
+**是按步流式，不是按 token 流式。** 逐字流式只能让第十三次调用一个字一个字地出现，
+前十二次仍然一片空白——而那十二次才是等待的来源。有意义的单位是
+"哪个子体在做什么、用了哪个工具"，所以就用这个单位。模型自己的思考文本挂在产生它的
+那次调用上，这是非流式接口能诚实给出的、最接近思考流的东西。
+
+`tool_denied` 是刻意保留的：「为什么模型没调用工具」的答案通常是
+「调用了，被技能策略拒了」，只显示成功调用的流会恰好把最值得看的那一类藏起来。
+工具参数只显示**名称类**字段（药名、证型、轴 id），自由文本一律只显示形状不显示值——
+这个流会渲染在可能被人从旁看到的浏览器标签里。
+
+### 上传影像走单独的通道
+
+聊天请求体上限 256 KB，这是**控制信令**的合理尺寸。一张手机翻拍的 X 线片是几 MB，
+转成 base64 再塞进 JSON 会涨三分之一——页面以前正是这么做的，而且**每一轮都重发一次**。
+结果是附件看起来传成功了（其实什么都还没离开浏览器），下一次提问才炸，
+报「出错了：请求体过大」。
+
+现在选中文件就立刻 `POST /api/image/upload`，发的是 `File` 本身，不是 base64；
+换回一个 `handle`，之后每轮只带这四十来个字节。服务端上限 24 MB（`MAX_UPLOAD_BYTES`），
+图片本身上限 12 MB（`MAX_IMAGE_BYTES`），最近 24 张留在内存里、不落盘。
+
+超限的请求体会被**读完再拒**。只看 `Content-Length` 就回错误，客户端还在往没人读的
+socket 里写，得到的是 broken pipe——在浏览器里又是一句「Failed to fetch」。
 
 `/api/replay` 的 `fidelity` 先给结论：`reproduced`、`against`（`recording` / `modified`）、
 `differences`、`before` / `after` 指纹、`divergences`、`live_after_exhaustion`。

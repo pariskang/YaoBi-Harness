@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-635%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-694%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -174,6 +174,9 @@ python -m yaobi_harness interview --complaint "68岁女性腰痛3月，走远了
 * **去标识化仍由人确认。** 模型不能替对方勾选「已去标识化」，也不能声称已确认——
   它没看过那个文件，由它断言等于让这项声明失去意义。
 * **没配置视觉模型时请求会被拦下并记录**。上传了也读不了的图，只是白费对方的力气。
+  没单独配视觉模型时，控制台会借用会话自己的对话模型（多模态对话模型就是能用的视觉模型），
+  并在徽章上标明；无论如何，**运行结束时若有图而无判读结果，必须说清是哪一种情况**——
+  一张片子被接收、存下、再也没被看过，而答复读起来像什么都没附，是唯一不可接受的结局。
 
 **得出结论后自动生成结构化病历摘要**，按门诊病历的节次排列：主诉 / 现病史 / 既往史与用药 /
 中医四诊 / 查体与量表 / 辅助检查与影像 / 西医诊断（鉴别）/ 中医诊断与证型 / 风险评估与红旗 /
@@ -306,9 +309,26 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 把 HTTP 请求挂那么久正是「出错了：Failed to fetch」的成因——那是**浏览器**对连接中断的
 用词，不是本服务发出的错误，Colab 的 iframe 代理尤其不会让请求开那么久。
 现在 `POST /api/chat/start` 立刻返回任务号，页面每 1.5 秒轮询一次
-`/api/chat/poll`，并显示**已完成的模型调用数与已用秒数**——多分钟的等待里，
-最需要的就是能分辨"还在算"和"已经挂了"。所有请求都带超时、一次静默重试，
+`/api/chat/poll`。所有请求都带超时、一次静默重试，
 以及说明问题的错误文案，而不是把浏览器的原话直接抛给用户。
+
+**执行过程是流式可见的。** 轮询带回的不只是计数，还有从上次游标之后的每一步：
+哪个子体开始了、调了什么工具（含**被技能策略拒掉的**调用）、工具回了什么、
+模型这次想了什么。页面实时渲染，答复到达后折叠成「本轮执行过程」留在气泡里。
+是**按步**流式而不是按 token：逐字流式只会让第十三次调用一个字一个字地出现，
+而前十二次——真正的等待来源——仍然一片空白。工具参数只显示名称类字段，
+自由文本一律只显示形状，因为这个流会渲染在可能被人从旁看到的标签页里。
+
+**一轮问诊从十三次调用降到七次。** 六次是鉴别/辨证/病例检索，而那一轮的产出
+可能只是一句「您疼多久了？」。要不要现在就展开这套推理，由问诊充分性审核者回答
+（`workup_now`，两个方向都算数）；安全筛查从不推迟，单轮 `run` 也从不推迟——
+没有下一轮可推迟到时，推迟就等于静默丢弃。剩下的调用里，互不依赖的子体并行执行，
+按计划顺序合并，审计轨迹与串行跑出来的逐字节相同。
+
+**影像走单独的上传通道。** 选中文件即以原始字节 `POST /api/image/upload`，
+换回一个 handle，之后每轮只带这几十个字节。此前页面把整张片子转成 base64
+塞进每一条聊天消息，附件看起来传成功了（其实什么都还没离开浏览器），
+下一次提问才炸出「请求体过大」。
 
 需要分享给同事评审时可映射成公开链接（会**强制**生成访问令牌并拼进 URL）：
 
@@ -496,5 +516,5 @@ LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 635 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 694 个用例，无需 pytest 与网络
 ```

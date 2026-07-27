@@ -232,6 +232,13 @@ class ClinicalRunState:
     #: decision — the interview needs it to know whether 四诊 completeness is
     #: required, and a checkpoint needs it to resume with the same permission.
     allow_prescription: bool = False
+    #: Whether another turn is coming. Set by :class:`ConversationSession`, false
+    #: for a one-shot run. It gates one thing: whether the diagnostic workup may
+    #: be *deferred* while history-taking is still in progress. Deferring is only
+    #: honest when the deferred work will actually happen later — in a one-shot
+    #: run there is no later, so "defer" would mean "silently drop", and the
+    #: caller would get an answer with no differential in it and no说明.
+    interactive: bool = False
 
     # ---------------------------------------------------------------- evidence
     def add_evidence(

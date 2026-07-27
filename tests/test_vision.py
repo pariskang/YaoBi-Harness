@@ -494,3 +494,85 @@ class ModelRequestsAnImageTests(unittest.TestCase):
         self.assertEqual(reply.image_requests[0]["kind"], "tongue")
         self.assertNotIn("deidentified", reply.image_requests[0],
                          "the attestation is the uploader's, never the model's")
+
+
+class VisionFallbackTests(unittest.TestCase):
+    """Where 「上传 X 片无法自动解析」 actually came from.
+
+    ``build_vision_client`` looks for a *separate* vision provider, defaulting to
+    Poe. Start the console with an OpenAI-compatible endpoint and no
+    ``YAOBI_VISION_*`` and that lookup finds nothing: image reading is off, the
+    tool returns a cheerful ``ok=True`` stub, and the film is accepted, stored and
+    never looked at.
+
+    Every endpoint this harness speaks to is OpenAI-shaped and takes an
+    ``image_url`` content part, so a multimodal chat model *is* a working vision
+    model. Borrowing it is right; guessing "probably not multimodal" and staying
+    dark is how the silence happened.
+    """
+
+    class Chat:
+        name, model, available = "openai-compatible", "some-multimodal-1", True
+
+        def chat(self, messages, **kwargs):
+            return LLMResponse(text="{}")
+
+    def setUp(self):
+        import os
+
+        self._saved = {k: os.environ.pop(k, None)
+                       for k in ("YAOBI_VISION_PROVIDER", "YAOBI_VISION_MODEL",
+                                 "POE_API_KEY", "POE_VISION_MODEL")}
+
+    def tearDown(self):
+        import os
+
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def service_with(self, client):
+        from yaobi_harness.ui.server import ConsoleService, _CountingLLM
+
+        service = ConsoleService.__new__(ConsoleService)
+        service.llm = _CountingLLM(client)
+        return service
+
+    def test_the_chat_model_is_borrowed_when_no_vision_provider_is_set(self):
+        service = self.service_with(self.Chat())
+        vision = service._open_vision(True)
+        self.assertIsNotNone(vision, "an available chat model must not leave vision dark")
+        self.assertTrue(vision.available)
+        self.assertTrue(vision.borrowed)
+        self.assertEqual(vision.model, "some-multimodal-1")
+
+    def test_the_borrowing_is_announced_rather_than_hidden(self):
+        """If that model turns out not to be multimodal, this is the line that
+        explains the failure."""
+        from yaobi_harness.vision.client import describe_vision
+
+        described = describe_vision(self.service_with(self.Chat())._open_vision(True))
+        self.assertTrue(described["configured"])
+        self.assertTrue(described["borrowed_chat_model"])
+
+    def test_an_explicitly_configured_provider_that_fails_is_not_papered_over(self):
+        """A stated intention that did not work is a configuration error to
+        report, not a gap to quietly fill with something else."""
+        import os
+
+        os.environ["YAOBI_VISION_PROVIDER"] = "poe"      # set, but no POE_API_KEY
+        self.assertIsNone(self.service_with(self.Chat())._open_vision(True))
+
+    def test_no_chat_model_means_no_vision_either(self):
+        class Absent:
+            name, model, available = "none", "none", False
+
+            def chat(self, messages, **kwargs):
+                raise AssertionError("must not be called")
+
+        self.assertIsNone(self.service_with(Absent())._open_vision(True))
+
+    def test_vision_stays_off_when_it_was_switched_off(self):
+        self.assertIsNone(self.service_with(self.Chat())._open_vision(False))

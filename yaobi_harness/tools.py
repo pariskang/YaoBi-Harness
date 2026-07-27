@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import progress
 from .knowledge import ortho_interactions
 from .knowledge.store import KnowledgeStore
 from .llm.base import ToolSpec
@@ -104,6 +105,32 @@ class ToolResult:
         if self.is_stub:
             return EvidenceLevel.STUB.value
         return self.evidence_level
+
+
+#: Tool arguments safe to show in the live progress stream. Everything else is
+#: reported as a shape, never a value. The stream is rendered in a browser tab
+#: that may be on a shared screen, and a call like
+#: ``similar_case_search(narrative="45岁女性，产后腰痛…")`` would put the patient's
+#: own words there. Names of things — a drug, a pattern, an axis — are what make
+#: the stream readable; the free text adds nothing but exposure.
+_SHOWABLE_TOOL_ARGS = (
+    "tool", "name", "kind", "pattern", "herb", "drug", "medications", "conditions",
+    "axis_id", "axis", "topic", "query_kind", "signal", "level", "population",
+)
+
+
+def _tool_arg_preview(kwargs: dict[str, Any]) -> str:
+    """A one-line, de-identified rendering of a tool call's arguments."""
+    parts: list[str] = []
+    for key, value in kwargs.items():
+        if key in _SHOWABLE_TOOL_ARGS:
+            text = "、".join(str(v) for v in value[:4]) if isinstance(value, (list, tuple)) else str(value)
+            parts.append(f"{key}={text[:60]}")
+        elif isinstance(value, (list, tuple, dict)):
+            parts.append(f"{key}[{len(value)}]")
+        elif value not in (None, "", False):
+            parts.append(key)
+    return ", ".join(parts)[:200]
 
 
 def _tool_result_to_dict(result: ToolResult) -> dict[str, Any]:
@@ -304,15 +331,23 @@ class ToolRegistry:
         cannot hand a patient-role replay a formula result, because the broker
         denies the call before the recorded result is ever reached. The journal
         supplies data, never permission.
+
+        Every exit reports itself to the progress stream — including the denied
+        and unknown-tool paths, which is the point: 「为什么模型没调用工具」 is
+        usually 「调用了，被技能策略拒了」, and a stream that showed only the
+        successful calls would hide exactly the case worth seeing.
         """
         allowed, reason = broker.allow(name)
         if not allowed:
             # Policy denials and budget exhaustion are *not* tool failures: they
             # must not trip the circuit breaker or consume budget.
+            progress.emit("tool_denied", name, reason, agent=progress.label())
             return ToolResult(name, False, reason, {"denied_reason": reason}, error=reason)
         if name not in self.tools:
+            progress.emit("tool_denied", name, "unknown_tool", agent=progress.label())
             return ToolResult(name, False, "unknown_tool", error="unknown_tool", recoverable=True)
 
+        progress.emit("tool", name, _tool_arg_preview(kwargs), agent=progress.label())
         journal = getattr(broker, "journal", None)
         if journal is not None:
             hit, recorded = journal.next_result("tool", name, kwargs)
@@ -323,9 +358,11 @@ class ToolRegistry:
                     broker.health.record_success(name)
                 elif not replayed.recoverable:
                     broker.health.record_failure(name)
+                progress.emit("tool_done", name, f"（重放）{replayed.summary}", ok=replayed.ok)
                 return replayed
 
         final = self._execute_with_retry(broker, name, kwargs)
+        progress.emit("tool_done", name, final.summary or final.error or "", ok=final.ok)
         if journal is not None:
             # Recorded once, on every exit path, and only the *final* result: a
             # replay reproduces the outcome the run acted on, not the transient

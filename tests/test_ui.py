@@ -953,5 +953,112 @@ class ProgressStreamTests(unittest.TestCase):
         self.assertIn("i.handle", page)
 
 
+class ProductSurfaceTests(unittest.TestCase):
+    """Behaviour of the console as a product, not as an API.
+
+    Everything here is a contract the page has to keep, checked against the page
+    source because there is no browser in this suite. They are deliberately
+    behavioural — 'the deliverable is reachable from where it was produced' —
+    rather than assertions about markup.
+    """
+
+    def setUp(self):
+        self.page = STATIC.read_text(encoding="utf-8")
+
+    def test_the_note_is_delivered_inside_the_conversation(self):
+        """It used to be announced with a line telling the clinician to switch to
+        another page and find one of eight tabs — four steps and a context switch
+        to reach the one artefact the consultation exists to produce."""
+        self.assertIn("renderNoteCard(reply.clinical_note)", self.page)
+        self.assertNotIn("在「单次运行」页的「病历摘要」标签查看与复制", self.page)
+
+    def test_the_note_can_be_copied_and_downloaded(self):
+        self.assertIn("function copyText", self.page)
+        self.assertIn("function downloadText", self.page)
+        self.assertIn('data-act="copy"', self.page)
+        self.assertIn('data-act="download"', self.page)
+
+    def test_copy_never_claims_a_success_it_did_not_have(self):
+        """Clipboard access is blocked in a cross-origin iframe and on plain http
+        — Colab, ngrok-over-http and a LAN address between them. A note the
+        clinician believes is on the clipboard and is not is worse than a button
+        that says it failed."""
+        self.assertIn("复制失败", self.page)
+        self.assertIn("execCommand", self.page)
+
+    def test_the_downloaded_filename_carries_no_patient_identifier(self):
+        self.assertIn("function noteFilename", self.page)
+        self.assertIn("run_id", self.page.split("function noteFilename")[1][:400])
+
+    def test_a_question_chip_keeps_what_the_user_already_typed(self):
+        """The old handler cleared the box and moved the question into the
+        placeholder: a half-written answer was destroyed, and the question then
+        vanished the moment typing resumed."""
+        self.assertIn("function answerChip", self.page)
+        body = self.page.split("function answerChip")[1][:400]
+        self.assertIn("input.value.trim()", body)
+        self.assertNotIn("input.placeholder = item.question", self.page)
+
+    def test_the_input_grows_with_the_answer(self):
+        self.assertIn("function autoGrow", self.page)
+        self.assertIn('$("#chatInput").addEventListener("input"', self.page)
+
+    def test_resetting_re_opens_with_the_agent_speaking(self):
+        """Reset used to drop the user back to a blank box — the precise thing
+        the agent opening first exists to avoid, on the one path that looks most
+        like starting over."""
+        handler = self.page.split('$("#chatReset").addEventListener')[1][:1400]
+        self.assertIn("chatOpen()", handler)
+        self.assertNotIn("chat-empty", handler,
+                         "reset must not rebuild the empty-state block itself")
+
+    def test_resetting_confirms_before_destroying_a_consultation(self):
+        handler = self.page.split('$("#chatReset").addEventListener')[1][:1400]
+        self.assertIn("confirm(", handler)
+        self.assertIn("CHAT.turns > 0", handler, "a fresh session must not prompt")
+
+    def test_the_patient_can_say_they_have_nothing_more_to_add(self):
+        """Until now the only way to reach the model's "enough" was to keep
+        answering; someone with nothing more had to say 不知道 three times before
+        the stall detector noticed."""
+        self.assertIn("DONE_MESSAGE", self.page)
+        self.assertIn("我说完了，请给结论", self.page)
+        # It is an ordinary message through the ordinary pipeline, not a flag.
+        self.assertIn("chatSend(DONE_MESSAGE)", self.page)
+
+    def test_the_way_out_is_not_offered_in_an_emergency(self):
+        self.assertIn('reply.risk_mode !== "urgent"', self.page)
+
+    def test_the_llm_toggle_describes_what_it_actually_does(self):
+        """Its label said 「用于信息抽取与措辞改写；不新增临床内容」, which describes a
+        design three commits dead — the model now triages, questions and writes
+        every reply. A setting that misdescribes itself is a defect: the operator
+        turning it off does not know what they are turning off."""
+        self.assertNotIn("用于信息抽取与措辞改写", self.page)
+        self.assertIn("由模型驱动本次对话", self.page)
+
+    def test_an_unconfigured_model_is_reported_at_the_point_of_use(self):
+        self.assertIn('$("#llmOff")', self.page)
+        self.assertIn('id="llmOff"', self.page)
+        self.assertIn('$("#chatUseLlm").disabled = true', self.page)
+
+    def test_the_conversation_comes_first_on_a_narrow_screen(self):
+        """Collapsed to one column the settings card came first by DOM order, so a
+        phone opened onto a role selector, two checkboxes, a coverage ring, an
+        image uploader and a JSON dump — every one with a working default."""
+        self.assertIn("#view-chat > .composer { order:2; }", self.page)
+        self.assertIn("#view-chat > .card:not(.composer) { order:1; }", self.page)
+
+    def test_an_image_request_scrolls_the_uploader_into_view(self):
+        """The uploader is in the settings column, which on a narrow screen sits
+        below the conversation — 「请拍一张舌象」 would otherwise arrive with
+        nowhere on screen to do it."""
+        self.assertIn('block: "center"', self.page)
+
+    def test_a_removed_or_sent_image_releases_its_preview(self):
+        # Removed from the tray, sent with a turn, and cleared by reset.
+        self.assertEqual(self.page.count("URL.revokeObjectURL"), 4)
+
+
 if __name__ == "__main__":
     unittest.main()

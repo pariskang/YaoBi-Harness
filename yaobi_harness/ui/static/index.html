@@ -133,7 +133,18 @@ main { max-width:1440px; margin:0 auto; padding:var(--sp-5); }
    whole column — and with it the composer — instead of scrolling inside its own
    container. */
 .split > * { min-width:0; }
-@media (max-width:1080px) { .split { grid-template-columns:minmax(0,1fr); } }
+@media (max-width:1080px) {
+  .split { grid-template-columns:minmax(0,1fr); }
+  /* Conversation first. Collapsed to one column the settings card came first by
+     DOM order, so a phone opened onto a role selector, two checkboxes, a
+     coverage ring, an image uploader and a JSON dump — every one of which has a
+     working default — and the thing the page is *for* was a screen and a half
+     down. The settings stay reachable; they stop being the front door. */
+  #view-chat > .composer { order:2; }
+  #view-chat > .card:not(.composer) { order:1; }
+  /* The chat pane sizes itself against the viewport rather than a sidebar. */
+  #view-chat .chat-wrap { min-height:min(70vh, 560px); }
+}
 
 .card {
   background:var(--surface); border:1px solid var(--line);
@@ -255,6 +266,11 @@ textarea:focus, input:focus, select:focus {
 }
 .chip:hover { border-color:var(--accent-line); color:var(--text); }
 .chip[aria-pressed="true"] { background:var(--accent-soft); border-color:var(--accent-line); color:var(--accent); font-weight:500; }
+/* The way out of the questionnaire. Set apart from the questions — it does
+   something different from them — but deliberately quiet: the useful thing is
+   usually to answer one more question, not to stop. */
+.chip-done { margin-left:auto; border-style:dashed; color:var(--text-3); }
+.chip-done:hover { border-style:solid; }
 
 .btn {
   width:100%; border:0; border-radius:var(--r-sm); padding:11px 16px; cursor:pointer;
@@ -454,6 +470,17 @@ pre.json {
 .ev-think > summary { cursor:pointer; opacity:.7; }
 .ev-think pre { white-space:pre-wrap; margin:4px 0 0; padding:6px 8px; font-size:11px;
                 background:var(--surface-2, rgba(127,127,127,.08)); border-radius:6px; }
+
+/* The clinical note, delivered inside the conversation that produced it. */
+.note-card { margin-top:12px; border:1px solid var(--line); border-radius:var(--r-md, 10px);
+             overflow:hidden; background:var(--surface); }
+.note-card-head { display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+                  padding:8px 10px; border-bottom:1px solid var(--line); font-size:12.5px; }
+.note-card-head .grow { flex:1 1 auto; }
+.btn.sm { width:auto; flex:none; padding:4px 10px; font-size:12px; }
+.note-card-body > summary { padding:8px 10px; cursor:pointer; font-size:12.5px; color:var(--text-3); }
+.note-secs { padding:0 10px 8px; max-height:420px; overflow-y:auto; }
+.note-card .hint { padding:0 10px 10px; margin:0; }
 .qbar { display:flex; flex-wrap:wrap; gap:6px; padding:0 var(--sp-5) var(--sp-3); }
 .chat-input {
   border-top:1px solid var(--line); padding:var(--sp-4) var(--sp-5);
@@ -524,6 +551,7 @@ pre.json {
     <div class="card composer">
       <div class="card-head"><h2>对话设置</h2><span class="sub" id="chatTurns"></span></div>
       <div class="card-body">
+        <div class="note n-warn" id="llmOff" hidden style="margin-bottom:14px"></div>
         <div class="field">
           <label class="lbl">交付对象 <em>决定可用工具与输出裁剪</em></label>
           <div class="seg" id="chatRoleSeg">
@@ -538,7 +566,8 @@ pre.json {
           </label>
           <label class="check">
             <input type="checkbox" id="chatUseLlm" checked>
-            <div>启用 LLM<small>用于信息抽取与措辞改写；不新增临床内容</small></div>
+            <div>由模型驱动本次对话<small>分诊、追问、何时收尾与每一句回复都由模型决定；
+              关掉则全程走确定性规则路径，问诊会变成固定题库</small></div>
           </label>
         </div>
         <div class="field">
@@ -874,6 +903,20 @@ async function boot() {
   const llm = BOOT.llm || {};
   $("#badgeLlm").textContent = llm.available ? `LLM ${llm.provider}/${llm.model}` : "LLM 未配置";
   $("#badgeLlm").className = "badge mono" + (llm.available ? " b-accent" : "");
+  if (!llm.available) {
+    // At the point of use, not only in a header badge that is hidden below 720px
+    // anyway. Without a model the conversation still runs — on the deterministic
+    // path — and it behaves so differently (fixed question bank, template
+    // replies, no model triage) that discovering it from the answers is a much
+    // worse way to find out.
+    $("#chatUseLlm").checked = false;
+    $("#chatUseLlm").disabled = true;
+    $("#llmOff").hidden = false;
+    $("#llmOff").innerHTML = `<span class="ico">◎</span><div><b>未配置对话模型，本页走确定性规则路径</b>
+      <br><small>问诊会用固定题库、回复由模板生成，分诊完全由关键词决定。
+      设置 <code>POE_API_KEY</code>（或 Azure / MiniMax / LiteLLM 的等价变量）后重启控制台即可启用。
+      规则路径下的安全边界与放行状态机完全相同。</small></div>`;
+  }
 
   const kn = BOOT.knowledge || {};
   const nSrc = kn.stats?.enabled_sources?.length || 0;
@@ -1515,8 +1558,9 @@ function tabNote(d, audit, meta) {
     </div>
     <div class="note ${note.release_status === "approved_by_physician" ? "n-ok" : "n-warn"}">
       <span class="ico">◎</span><div>${esc(note.disclaimer)}</div></div>
-    <div style="display:flex;gap:8px;margin:14px 0">
+    <div style="display:flex;gap:8px;margin:14px 0;flex-wrap:wrap">
       <button class="btn btn-ghost" id="noteCopy">复制病历文本</button>
+      <button class="btn btn-ghost" id="noteDownload">下载 .txt</button>
       <button class="btn btn-ghost" id="noteToggle">切换：分节 / 纯文本</button>
     </div>
     <div id="noteSections">${(note.sections || []).map(section => `
@@ -1529,6 +1573,48 @@ function tabNote(d, audit, meta) {
   </div>`;
 }
 
+/* Copy that works where this console actually runs.
+
+   `navigator.clipboard` is unavailable in a cross-origin iframe and on plain
+   http:// origins — which between them describe Colab, ngrok-over-http and a
+   LAN address, i.e. most real deployments. The textarea fallback is not a
+   nicety, it is the main path. */
+async function copyText(text, button, done = "已复制") {
+  const original = button.textContent;
+  let ok = true;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.cssText = "position:fixed;top:-1000px";
+    document.body.appendChild(area);
+    area.select();
+    try { ok = document.execCommand("copy"); } catch { ok = false; } finally { area.remove(); }
+  }
+  // Never claim success we did not have: a note the clinician believes is on the
+  // clipboard and is not is worse than a button that says it failed.
+  button.textContent = ok ? done : "复制失败，请手动选中";
+  setTimeout(() => { button.textContent = original; }, ok ? 1500 : 3000);
+}
+
+function downloadText(text, filename) {
+  const url = URL.createObjectURL(new Blob([text], { type:"text/plain;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function noteFilename(note) {
+  // No patient identifier in the filename, by construction: a note downloaded to
+  // a shared machine should not name its subject in the file listing.
+  return `骨科门诊摘要_${(note.run_id || "run").slice(-8)}.txt`;
+}
+
 function bindNote() {
   const text = () => (LAST.audit.clinical_note || {}).text || "";
   $("#noteToggle")?.addEventListener("click", () => {
@@ -1536,22 +1622,42 @@ function bindNote() {
     pre.hidden = !pre.hidden;
     sections.hidden = !pre.hidden;
   });
-  $("#noteCopy")?.addEventListener("click", async () => {
-    const button = $("#noteCopy");
-    try {
-      // Clipboard access is blocked in a cross-origin iframe, which is exactly
-      // where this console usually runs, so the textarea path is the real one.
-      await navigator.clipboard.writeText(text());
-    } catch {
-      const area = document.createElement("textarea");
-      area.value = text();
-      document.body.appendChild(area);
-      area.select();
-      try { document.execCommand("copy"); } finally { area.remove(); }
-    }
-    button.textContent = "已复制";
-    setTimeout(() => { button.textContent = "复制病历文本"; }, 1500);
-  });
+  $("#noteCopy")?.addEventListener("click", e => copyText(text(), e.currentTarget));
+  $("#noteDownload")?.addEventListener("click",
+    () => downloadText(text(), noteFilename(LAST.audit.clinical_note || {})));
+}
+
+/* The note is the deliverable, so it arrives where the consultation happened.
+
+   It used to be announced in the chat with a line telling the clinician to
+   switch to the 「单次运行」 page and find the 「病历摘要」 tab — four steps and a
+   context switch to reach the one artefact the whole consultation exists to
+   produce, landing them on a case form that has nothing to do with the
+   conversation they just had. */
+function renderNoteCard(note) {
+  const approved = note.release_status === "approved_by_physician";
+  const card = el(`<div class="note-card">
+    <div class="note-card-head">
+      <b>病历摘要</b>
+      ${badge(note.status_label, approved ? "ok" : "warn")}
+      ${badge(note.composed_by === "llm" ? "模型撰写" : "确定性拼装",
+              note.composed_by === "llm" ? "accent" : "mute")}
+      <span class="grow"></span>
+      <button class="btn btn-ghost sm" data-act="copy">复制</button>
+      <button class="btn btn-ghost sm" data-act="download">下载</button>
+    </div>
+    <details class="note-card-body">
+      <summary>展开全文（${(note.sections || []).length} 节）</summary>
+      <div class="note-secs">${(note.sections || []).map(s => `
+        <div class="row"><div class="k">${esc(s.title)}</div>
+          <div class="v" style="white-space:pre-wrap">${esc(s.text)}</div></div>`).join("")}</div>
+    </details>
+    <p class="hint">${esc(note.disclaimer || "")}</p></div>`);
+  card.querySelector('[data-act="copy"]')
+      .addEventListener("click", e => copyText(note.text || "", e.currentTarget));
+  card.querySelector('[data-act="download"]')
+      .addEventListener("click", () => downloadText(note.text || "", noteFilename(note)));
+  return card;
 }
 
 /* ── tab: offline replay ───────────────────────────────────────
@@ -1925,6 +2031,7 @@ async function chatSend(text) {
   if (log.querySelector(".chat-empty")) log.replaceChildren();
   log.appendChild(chatBubble("me", message));
   input.value = "";
+  autoGrow(input);
   $("#chatQuestions").replaceChildren();
 
   const pending = chatBubble("agent", "正在检索证据并推理…（推理型模型一轮需要十余次调用）");
@@ -1987,30 +2094,20 @@ async function chatSend(text) {
 
     // Clicking a suggested question drops it into the box so the user can edit
     // their answer rather than sending the question text back verbatim.
+    // The tier prefix tells the operator *why* something is being asked now; a
+    // RED_FLAG chip and a CONTEXT chip carry very different urgency.
     const asked = (reply.structured_questions || []).length
       ? reply.structured_questions
       : (reply.questions || []).map(q => ({ question:q, label:"", tier:"CORE" }));
-    $("#chatQuestions").replaceChildren(...asked.map(item => {
-      const chip = document.createElement("button");
-      chip.className = "chip";
-      chip.type = "button";
-      // The tier prefix tells the operator *why* this is being asked now; a
-      // RED_FLAG chip and a CONTEXT chip carry very different urgency.
-      chip.textContent = item.label ? `${TIER_LABEL[item.tier] || ""}·${item.question}` : item.question;
-      chip.title = item.why || item.label || "";
-      chip.addEventListener("click", () => {
-        input.value = "";
-        input.placeholder = item.question;
-        input.focus();
-      });
-      return chip;
-    }));
+    // No way out offered once the run has reached a terminal state — there is
+    // nothing left to conclude, and an emergency plan is not a questionnaire to
+    // escape from.
+    renderChips(asked, { allowDone: reply.awaiting_answer && reply.risk_mode !== "urgent" });
 
     // Keep the run inspector in sync so the other tabs show this turn's audit.
     LAST = { delivered: reply.delivered, audit: data.audit, meta: data.meta };
     if (reply.clinical_note) {
-      pendingBubble.appendChild(el(`<div class="learned">已生成病历摘要（${
-        esc(reply.clinical_note.status_label)}）——在「单次运行」页的「病历摘要」标签查看与复制。</div>`));
+      pendingBubble.appendChild(renderNoteCard(reply.clinical_note));
     }
   } catch (e) {
     pendingBubble.textContent = "出错了：" + e.message;
@@ -2066,33 +2163,92 @@ function renderImageAsk(requests) {
       <br><small>类型已预选。上传前请先遮盖姓名、各类编号、日期、条码与人脸，
       然后勾选「已去标识化」——这一步只能由你确认。</small>
     </div></div>`));
-  box.scrollIntoView({ block: "nearest" });
+  // Centre it, not "nearest". The uploader lives in the settings column, which
+  // on a narrow screen sits *below* the conversation — a request the model made
+  // would otherwise land entirely off-screen, and the patient would read
+  // 「请拍一张舌象」 with nowhere to do it.
+  box.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+/* Clicking a question puts it in the box, above whatever is already there.
+
+   The old handler moved it into the *placeholder*, which disappears the moment
+   typing starts — so the patient answered a prompt they could no longer read —
+   and cleared the field, destroying a half-written answer without warning. */
+function answerChip(question) {
+  const input = $("#chatInput");
+  const existing = input.value.trim();
+  input.value = `${question}\n` + (existing ? existing + "\n" : "");
+  input.setSelectionRange(input.value.length, input.value.length);
+  autoGrow(input);
+  input.focus();
+}
+
+/* A way out of the questionnaire.
+
+   The model decides when the enquiry is over, which is right — but until now the
+   only way to reach that decision was to keep answering. Someone who genuinely
+   has nothing more to add had to say 「不知道」 three times before the stall
+   detector noticed, and it reads as being stonewalled by the thing that is
+   supposed to be helping.
+
+   This is not an override: it sends an ordinary message saying so, through the
+   ordinary pipeline. The model still decides what to do with it, the adequacy
+   reviewer still runs, and a required red-flag axis still blocks a dose-bearing
+   result. What changes is that the patient can say it once, plainly. */
+const DONE_MESSAGE = "我能想到的都说了，没有别的补充。请根据现有信息给出你的判断和建议。";
+
+function doneChip() {
+  const chip = document.createElement("button");
+  chip.className = "chip chip-done";
+  chip.type = "button";
+  chip.textContent = "我说完了，请给结论";
+  chip.title = "把「没有更多可补充」告诉智能体；它仍会自行判断是否够了";
+  chip.addEventListener("click", () => chatSend(DONE_MESSAGE));
+  return chip;
+}
+
+function renderChips(items, { allowDone = true } = {}) {
+  const chips = items.map(item => {
+    const chip = document.createElement("button");
+    chip.className = "chip";
+    chip.type = "button";
+    chip.textContent = item.label ? `${TIER_LABEL[item.tier] || ""}·${item.question}` : item.question;
+    chip.title = item.why || item.label || "";
+    chip.addEventListener("click", () => answerChip(item.question));
+    return chip;
+  });
+  if (allowDone && chips.length) chips.push(doneChip());
+  $("#chatQuestions").replaceChildren(...chips);
 }
 
 function renderOpeningChips(reply) {
-  const asked = (reply.structured_questions || []);
-  $("#chatQuestions").replaceChildren(...asked.map(item => {
-    const chip = document.createElement("button");
-    chip.className = "chip"; chip.type = "button";
-    chip.textContent = item.question;
-    chip.addEventListener("click", () => {
-      const input = $("#chatInput");
-      input.placeholder = item.question;
-      input.focus();
-    });
-    return chip;
-  }));
+  // No "I'm done" on the opening: there is nothing to be done with yet.
+  renderChips(reply.structured_questions || [], { allowDone: false });
+}
+
+/* The box grows with the answer. It was a fixed one-row field, which is fine for
+   「3个月」 and wrong for the paragraph a patient writes when asked to describe
+   their symptoms — they typed into a slot showing one line of their own text. */
+function autoGrow(area) {
+  area.style.height = "auto";
+  area.style.height = Math.min(area.scrollHeight, 160) + "px";
 }
 
 $("#chatSend").addEventListener("click", () => chatSend());
+$("#chatInput").addEventListener("input", e => autoGrow(e.currentTarget));
 $("#chatInput").addEventListener("keydown", e => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); chatSend(); }
 });
 $("#chatReset").addEventListener("click", async () => {
+  // A consultation with turns in it is real work, and this button destroys it
+  // with no undo — the transcript is memory-only by design, so there is nothing
+  // to recover it from. Confirm once there is something to lose, and stay silent
+  // on a fresh session where the button is a no-op.
+  if (CHAT.turns > 0 && !confirm(`将清空这次问诊（${CHAT.turns} 条消息）并重新开始。\n`
+      + "对话记录只存在内存中，清空后无法恢复。确定吗？")) return;
   if (CHAT.sessionId) { try { await api("/api/chat/reset", { session_id: CHAT.sessionId }); } catch {} }
   CHAT = { sessionId:null, turns:0 };
-  $("#chatLog").replaceChildren(el(`<div class="chat-empty"><div class="big">◌</div>
-    <h3>说说你的情况</h3><p>例如「腰痛3个月，久坐加重」。</p></div>`));
   $("#chatQuestions").replaceChildren();
   $("#chatFacts").textContent = "{}";
   $("#chatTurns").textContent = "";
@@ -2101,8 +2257,13 @@ $("#chatReset").addEventListener("click", async () => {
   $("#covRing").style.setProperty("--pct", 0);
   $("#covRing").dataset.pct = "0%";
   $("#covMeta").innerHTML = `<b>尚未开始</b><small>发出第一条消息后，这里会显示已闭合与仍缺的问诊轴。</small>`;
+  PENDING_IMAGES.forEach(i => URL.revokeObjectURL(i.preview));
   PENDING_IMAGES = [];
   renderImages();
+  // Re-open rather than leaving an empty box. Resetting used to drop the user
+  // back to 「说说你的情况」 and a blinking cursor — the precise thing the agent
+  // opening first exists to avoid, reintroduced on the one path that looks most
+  // like starting over.
   chatOpen();
 });
 

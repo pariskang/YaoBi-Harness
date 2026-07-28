@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-707%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-722%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -186,6 +186,10 @@ python -m yaobi_harness interview --complaint "68岁女性腰痛3月，走远了
 python -m yaobi_harness run --complaint "..." --facts '{...}' --summary   # 直接打印病历文本
 python -m yaobi_harness chat --role patient        # 对话里输入 /note 查看
 ```
+
+控制台里，**摘要直接出现在对话里**，带复制与下载——成果交付在做成果的地方。
+此前是在气泡里写一句「请到「单次运行」页的「病历摘要」标签查看与复制」：为了拿到这次问诊
+唯一的产出，要切页面、在八个标签里找一个，还会落在一张与刚才的对话毫无关系的病例表单上。
 
 三条设计要点：
 
@@ -517,5 +521,5 @@ LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 707 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 722 个用例，无需 pytest 与网络
 ```

@@ -1868,11 +1868,17 @@ const EVENT_STYLE = {
 function renderEvents(host, events) {
   for (const e of events) {
     const style = EVENT_STYLE[e.kind] || { icon:"·", cls:"" };
-    // Replace the open line for this step rather than appending a second one.
+    // Collapse each pair in place: a `_done` replaces the line its opener left
+    // behind. The `:not([data-done])` matters — an agent's tool loop opens
+    // `llm:BiomedicalAgent` twice, and matching the first line of that key
+    // regardless of state made the second `_done` overwrite the first one and
+    // left the second "思考中…" spinning for the rest of the session.
     const key = e.kind.endsWith("_done") ? `${e.kind.slice(0, -5)}:${e.label}` : `${e.kind}:${e.label}`;
-    const existing = e.kind.endsWith("_done") ? host.querySelector(`[data-k="${CSS.escape(key)}"]`) : null;
+    const existing = e.kind.endsWith("_done")
+      ? host.querySelector(`[data-k="${CSS.escape(key)}"]:not([data-done])`) : null;
     const secs = e.data?.elapsed_s ? ` <span class="ev-t">${e.data.elapsed_s}s</span>` : "";
-    const line = el(`<div class="ev ${style.cls}" data-k="${esc(key)}">
+    const line = el(`<div class="ev ${style.cls}" data-k="${esc(key)}"${
+        e.kind.endsWith("_done") ? ' data-done="1"' : ""}>
       <span class="ev-i">${style.icon}</span>
       <span class="ev-n">${esc(e.label)}</span>
       <span class="ev-d">${esc(e.detail || "")}</span>${secs}</div>`);

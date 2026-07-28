@@ -29,6 +29,7 @@ Two things a message can never do, and they are the only two:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -618,6 +619,10 @@ class ConversationSession:
         self.turns: list[Turn] = []
         self.asked: list[str] = []
         self.images: list[dict[str, Any]] = []
+        #: Vision findings already obtained, keyed by attachment id. An image is
+        #: the one input to this system that cannot change between turns, so it
+        #: is read once and replayed thereafter.
+        self.image_reads: dict[str, dict[str, Any]] = {}
         self.state: ClinicalRunState | None = None
         self.llm = getattr(self.runner, "llm", None)
         # One interview loop for the whole conversation. This is what makes
@@ -794,12 +799,21 @@ class ConversationSession:
         The attestation is stored with the attachment rather than assumed, so the
         run records who asserted de-identification. Bytes are not copied anywhere:
         ``ref`` is a path or a ``data:`` URI that the vision tool reads once.
+
+        Once. Each turn is a fresh run over the accumulated case, which is what
+        makes a red flag disclosed on turn three get screened on turn three — but
+        applied to images it meant the film attached on turn two was sent to the
+        multimodal model again on turns three, four and five. An image is the one
+        input in this system that cannot change, so re-reading it buys nothing and
+        costs a paid vision call every single turn. The finding is cached against
+        the attachment by :meth:`_remember_image_reads` and replayed instead.
         """
         from .vision.client import IMAGE_KINDS  # noqa: PLC0415 - optional stack
 
         if kind not in IMAGE_KINDS:
             raise ValueError(f"未知图片类型 {kind!r}；支持 {list(IMAGE_KINDS)}")
-        entry = {"kind": kind, "ref": ref, "deidentified": bool(deidentified)}
+        entry = {"kind": kind, "ref": ref, "deidentified": bool(deidentified),
+                 "image_id": f"{kind}:{hashlib.sha256(ref.encode('utf-8')).hexdigest()[:16]}"}
         self.images.append(entry)
         # So the model can see it already has the tongue photo and ask for the
         # radiograph instead of asking for the same thing again.
@@ -825,12 +839,24 @@ class ConversationSession:
         state.facts.update(self.facts)
         # The note wants the patient's own words per turn, not one fused string.
         state.outputs["_narrative"] = list(self.narrative)
-        state.images = [dict(i) for i in self.images]
+        # Each attachment carries the finding from the turn it was read on, so the
+        # vision model sees each image exactly once per conversation.
+        state.images = [{**image, "cached_read": self.image_reads.get(image.get("image_id", ""))}
+                        for image in self.images]
         # There is a next turn, so the graph may hold the diagnostic workup back
         # until the interview has something worth reasoning from.
         state.interactive = True
         state.budget = self.budget_factory()
-        return self.runner.run(state, allow_prescription=self.allow_prescription)
+        state = self.runner.run(state, allow_prescription=self.allow_prescription)
+        self._remember_image_reads(state)
+        return state
+
+    def _remember_image_reads(self, state: ClinicalRunState) -> None:
+        """Keep this turn's image findings so later turns replay rather than re-read."""
+        for read in (state.outputs.get("image_findings") or {}).get("reads", []):
+            image_id = str(read.get("_image_id") or "")
+            if image_id and image_id not in self.image_reads:
+                self.image_reads[image_id] = dict(read)
 
     def _hits(self) -> list[dict[str, Any]]:
         if not self.state:

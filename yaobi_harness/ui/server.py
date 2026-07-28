@@ -50,7 +50,12 @@ MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 #: Uploaded images held in memory. Never written to disk: an X-ray is clinical
 #: content, and a demo console that persisted one would be the wrong default to
 #: discover later.
-MAX_UPLOADS = 24
+#:
+#: Bounded by **total bytes**, not by count. A count bound over a variable-size
+#: object is not a bound: twenty-four films at the 12 MB ceiling is 288 MB of
+#: resident memory, which a Colab kernel notices. Sixty megabytes is a dozen
+#: phone photos and a number an operator can reason about.
+MAX_UPLOAD_STORE_BYTES = 60 * 1024 * 1024
 #: Live conversations kept in memory before the oldest is evicted.
 MAX_SESSIONS = 50
 #: Background chat turns retained before the oldest is evicted. Each holds one
@@ -117,6 +122,11 @@ class ConsoleService:
         #: Uploaded images, keyed by handle. In memory only, and for the same
         #: reason transcripts are: an X-ray is clinical content.
         self.uploads: dict[str, dict[str, Any]] = {}
+        #: Resident bytes allowed in :attr:`uploads`. An instance attribute rather
+        #: than a constant read at the call site, so a long-lived deployment can
+        #: size it to its own memory and a test can exercise eviction without
+        #: allocating sixty megabytes to do it.
+        self.max_upload_store_bytes = MAX_UPLOAD_STORE_BYTES
 
     def store_image(self, raw: bytes, *, mime: str, kind: str) -> dict[str, Any]:
         """Accept one uploaded image and return a handle to it.
@@ -126,10 +136,18 @@ class ConsoleService:
         12 MB on upload and about forty bytes on each subsequent question. That
         is the whole point — the browser used to re-send the entire base64 blob
         with every message, and the second one is what failed.
-        """
-        import base64
 
-        from ..vision.client import MAX_IMAGE_BYTES, SUPPORTED_SUFFIXES, VisionError, decode_data_uri
+        The **raw bytes** are kept, not the ``data:`` URI. Base64 inflates by a
+        third, and the URI is needed once per conversation, so building it on
+        demand trades a millisecond for a quarter of the memory.
+
+        The handle covers the content *and* the kind. Keying on content alone made
+        the same photo uploaded as a radiograph and then as a tongue image collide
+        on one entry, and the second upload silently rewrote the first one's kind.
+        """
+        import hashlib
+
+        from ..vision.client import MAX_IMAGE_BYTES, SUPPORTED_SUFFIXES
 
         if not raw:
             raise ValueError("上传内容为空")
@@ -138,21 +156,26 @@ class ConsoleService:
                 f"图片 {len(raw) // (1024 * 1024)} MB，超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MB 上限")
         if mime not in {f"image/{s.lstrip('.')}" for s in SUPPORTED_SUFFIXES} | {"image/jpg"}:
             raise ValueError(f"不支持的图片类型 {mime or '(未提供)'}；支持 {sorted(SUPPORTED_SUFFIXES)}")
-        data_uri = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-        try:
-            _, digest = decode_data_uri(data_uri)
-        except VisionError as exc:
-            raise ValueError(str(exc)) from exc
 
-        handle = f"img_{digest[:16]}"
+        digest = hashlib.sha256(raw).hexdigest()
+        handle = f"img_{hashlib.sha256(f'{kind}:{digest}'.encode()).hexdigest()[:16]}"
         with self._sessions_lock:
-            self.uploads[handle] = {"ref": data_uri, "kind": kind, "sha256": digest,
+            self.uploads.pop(handle, None)   # re-upload counts as most recent
+            self.uploads[handle] = {"raw": raw, "kind": kind, "sha256": digest,
                                     "bytes": len(raw), "mime": mime}
-            while len(self.uploads) > MAX_UPLOADS:
-                self.uploads.pop(next(iter(self.uploads)))
+            resident = sum(entry["bytes"] for entry in self.uploads.values())
+            while resident > self.max_upload_store_bytes and len(self.uploads) > 1:
+                resident -= self.uploads.pop(next(iter(self.uploads)))["bytes"]
         return {"handle": handle, "sha256": digest, "bytes": len(raw),
                 "kind": kind, "mime": mime,
                 "vision_available": bool(getattr(self.vision, "available", False))}
+
+    @staticmethod
+    def _data_uri(entry: dict[str, Any]) -> str:
+        """Build the transport encoding for a stored upload, on demand."""
+        import base64
+
+        return f"data:{entry['mime']};base64,{base64.b64encode(entry['raw']).decode('ascii')}"
 
     def _open_knowledge(self):
         if not self.knowledge_store_path:
@@ -758,10 +781,11 @@ def _coerce_images(raw: Any, uploads: dict[str, dict[str, Any]] | None = None) -
             stored = (uploads or {}).get(handle)
             if stored is None:
                 raise ValueError(f"图片 {handle} 已失效，请重新上传（控制台只在内存里保留最近若干张）")
-            kind = str(entry.get("kind") or stored["kind"])
-            if kind not in IMAGE_KINDS:
-                raise ValueError(f"未知图片类型: {kind}")
-            images.append({"kind": kind, "ref": stored["ref"], "deidentified": True})
+            # The kind is the stored one, not the caller's: it is part of what the
+            # handle identifies, and the de-identification attestation was made
+            # against *that* kind at upload time.
+            images.append({"kind": stored["kind"], "ref": ConsoleService._data_uri(stored),
+                           "deidentified": True})
             continue
         ref = str(entry.get("ref") or "").strip()
         if not ref:

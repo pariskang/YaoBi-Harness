@@ -576,3 +576,85 @@ class VisionFallbackTests(unittest.TestCase):
 
     def test_vision_stays_off_when_it_was_switched_off(self):
         self.assertIsNone(self.service_with(self.Chat())._open_vision(False))
+
+
+class ImageIsReadOncePerConversationTests(unittest.TestCase):
+    """A film attached on turn two must not be re-read on turns three and four.
+
+    Every turn is a fresh audited run over the accumulated case — that is what
+    makes a red flag disclosed on turn three get screened on turn three. Applied
+    to images it meant the same X-ray went to a paid multimodal endpoint on every
+    subsequent turn, forever, for content that cannot change.
+    """
+
+    class CountingVision:
+        available = True
+        model = "v"
+        chat_client = None
+        phi_precheck = True
+        borrowed = False
+
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, image, kind="other", context="", budget=None):
+            from yaobi_harness.vision.client import ImageRead
+
+            self.reads += 1
+            return ImageRead(image_sha256="abc", image_kind=kind, readable=True,
+                             observations=["骨皮质连续，未见明确骨折线"], model="v")
+
+    class Stub:
+        name, model, available = "s", "s", True
+
+        def chat(self, messages, **kwargs):
+            return LLMResponse(text=json.dumps({
+                "triage": "routine", "adequate": False, "workup_now": False,
+                "questions": [], "facts": {}, "message": "好的", "reply": "好的",
+            }, ensure_ascii=False))
+
+    def _session(self):
+        from yaobi_harness.conversation import ConversationSession
+        from yaobi_harness.graph import YaobiGraphRunner
+
+        vision = self.CountingVision()
+        runner = YaobiGraphRunner(tools=ToolRegistry(vision=vision), llm=self.Stub())
+        return ConversationSession(role="patient", runner=runner), vision
+
+    def test_one_attachment_costs_exactly_one_vision_call(self):
+        session, vision = self._session()
+        session.send("腰痛3个月")
+        session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        for message in ("这是我的片子", "还有别的要问吗", "我不知道", "嗯"):
+            session.send(message)
+        self.assertEqual(vision.reads, 1, "the film was re-read on later turns")
+
+    def test_the_finding_still_appears_in_every_later_turns_ledger(self):
+        """A citation has to resolve inside the run that made it, so the carried
+        finding is recorded again — labelled as carried, not as a fresh read."""
+        session, _ = self._session()
+        session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        session.send("这是我的片子")
+        session.send("还有呢")
+        entries = [e for e in session.state.evidence.values() if e.source == "medical_image_read"]
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0].payload.get("carried_forward"))
+        findings = session.state.outputs["image_findings"]
+        self.assertIn("骨皮质连续，未见明确骨折线", findings["observations"])
+
+    def test_a_second_image_is_read_when_it_is_attached(self):
+        session, vision = self._session()
+        session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        session.send("这是片子")
+        session.attach_image("data:image/png;base64,BB==", kind="tongue", deidentified=True)
+        session.send("这是舌象")
+        self.assertEqual(vision.reads, 2)
+
+    def test_the_same_bytes_as_a_different_kind_are_a_different_attachment(self):
+        """A tongue reading and a radiograph reading are different tasks with
+        different prompts, so sharing one cached finding would be wrong."""
+        session, vision = self._session()
+        session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        session.attach_image("data:image/png;base64,AA==", kind="tongue", deidentified=True)
+        session.send("看看这两张")
+        self.assertEqual(vision.reads, 2)

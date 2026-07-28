@@ -367,9 +367,13 @@ class YaobiGraphRunner:
         it wants the differential to chase something. Absent an answer, an
         interview that is still asking defers and one that has finished proceeds.
 
-        Only in a conversation. A one-shot run has no later turn to defer *to*, so
-        deferring there would mean silently dropping the differential and handing
-        back an answer that quietly contains less than it looks like it does.
+        Deferring is only honest when the deferred work will actually happen, and
+        that is checked twice. A one-shot run has no later turn at all. And a
+        conversation whose enquiry has ended — ``achieved``, ``stalled``,
+        ``cap_reached`` or ``blocked`` — has no later turn that would *differ*;
+        past that point ``wants_workup`` stops accepting "not yet", because
+        otherwise a reviewer answering ``false`` every round defers the
+        differential forever and the patient gets an answer that never has one.
         """
         if task.agent not in WORKUP_AGENTS or not state.interactive:
             return False

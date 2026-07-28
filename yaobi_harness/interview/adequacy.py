@@ -136,18 +136,38 @@ class AdequacyVerdict:
         return self.verdict in (ACHIEVED, STALLED, CAP_REACHED)
 
     @property
+    def still_asking(self) -> bool:
+        """Whether another round of questions is coming.
+
+        Only ``NOT_ACHIEVED`` means "ask again". ``ACHIEVED`` is done,
+        ``STALLED`` and ``CAP_REACHED`` proceed with the deficit recorded, and
+        ``BLOCKED`` has stopped asking too — it bars a dose-bearing result, not
+        the reasoning that would explain the case to the patient.
+        """
+        return self.verdict == NOT_ACHIEVED
+
+    @property
     def wants_workup(self) -> bool:
         """Whether the diagnostic agents should run on this turn.
 
-        The reviewer's explicit answer wins in **both** directions — it may pull
-        the workup forward on a thin history because it wants the differential to
-        chase a red flag, and it may hold it back on a complete one. Only when it
-        did not answer does the verdict decide, and then the rule is the obvious
-        one: a history still being taken is not a history to reason from.
+        While the enquiry continues the reviewer's explicit answer wins in **both**
+        directions: it may pull the workup forward on a thin history because it
+        wants the differential to chase a red flag, and it may hold it back for
+        another round because it would rather ask first. Absent an answer the
+        verdict decides, and the rule is the obvious one — a history still being
+        taken is not a history to reason from.
+
+        Once the enquiry is over, "not yet" stops being an available answer. That
+        is not a clinical override: it is a scheduling answer that presumes a
+        later turn which will differ, and after ``achieved`` / ``stalled`` /
+        ``cap_reached`` / ``blocked`` there is no such turn. A reviewer answering
+        ``false`` past that point defers the differential forever, and the patient
+        gets an answer that never contains one — the same reason a one-shot run
+        never defers either.
         """
-        if self.workup_now is not None:
-            return self.workup_now
-        return self.may_proceed
+        if not self.still_asking:
+            return True
+        return self.workup_now if self.workup_now is not None else self.may_proceed
 
     @property
     def deficit(self) -> bool:
@@ -168,6 +188,7 @@ class AdequacyVerdict:
             ],
             "workup_now": self.workup_now,
             "wants_workup": self.wants_workup,
+            "still_asking": self.still_asking,
         }
 
 

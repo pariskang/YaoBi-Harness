@@ -686,13 +686,37 @@ class WorkupTimingTests(unittest.TestCase):
         self.assertEqual(verdict.verdict, NOT_ACHIEVED)
         self.assertTrue(verdict.wants_workup, "an explicit yes is not overridden")
 
-    def test_the_reviewer_can_hold_the_workup_back_on_a_complete_one(self):
+    def test_the_reviewer_can_hold_the_workup_back_while_it_is_still_asking(self):
         judge = AdequacyJudge()
         judge._ask_model = lambda *a, **k: ReviewerOpinion(  # type: ignore[method-assign]
-            [], "够了，但先确认一件事", workup_now=False)
+            ["tongue_pulse"], "先把舌脉问到再说", workup_now=False)
+        verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED}, "腰痛3个月")
+        self.assertEqual(verdict.verdict, NOT_ACHIEVED)
+        self.assertTrue(verdict.still_asking)
+        self.assertFalse(verdict.wants_workup)
+
+    def test_not_yet_stops_being_an_answer_once_the_enquiry_is_over(self):
+        """A reviewer answering ``false`` every round would defer the differential
+        forever, and the patient would get an answer that never contains one.
+        "Not yet" presumes a later turn that will differ; after the enquiry ends
+        there is none — the same reason a one-shot run never defers."""
+        for said, expected in (("腰痛3个月", BLOCKED), ("腰痛3个月，都问过了", BLOCKED)):
+            judge = AdequacyJudge(max_rounds=0)
+            judge._ask_model = lambda *a, **k: ReviewerOpinion(  # type: ignore[method-assign]
+                [], "先不做", workup_now=False)
+            verdict = judge.judge({}, said, rounds_used=9)
+            self.assertEqual(verdict.verdict, expected)
+            self.assertFalse(verdict.still_asking)
+            self.assertTrue(verdict.wants_workup,
+                            "the workup must run when no later turn is coming")
+
+    def test_an_adequate_history_reasons_now_whatever_the_reviewer_says(self):
+        judge = AdequacyJudge()
+        judge._ask_model = lambda *a, **k: ReviewerOpinion(  # type: ignore[method-assign]
+            [], "够了", workup_now=False)
         verdict = judge.judge({**RED_FLAGS_ANSWERED, **CORE_ANSWERED, "conditions": []}, "腰痛3个月")
         self.assertEqual(verdict.verdict, ACHIEVED)
-        self.assertFalse(verdict.wants_workup)
+        self.assertTrue(verdict.wants_workup)
 
     def test_no_answer_means_no_opinion_not_no(self):
         """A model that omits the field must not be read as having voted against

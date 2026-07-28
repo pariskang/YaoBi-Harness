@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-694%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-707%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -316,8 +316,9 @@ python -m yaobi_harness ui --port 8000 --knowledge-store ./knowledge.db
 哪个子体开始了、调了什么工具（含**被技能策略拒掉的**调用）、工具回了什么、
 模型这次想了什么。页面实时渲染，答复到达后折叠成「本轮执行过程」留在气泡里。
 是**按步**流式而不是按 token：逐字流式只会让第十三次调用一个字一个字地出现，
-而前十二次——真正的等待来源——仍然一片空白。工具参数只显示名称类字段，
-自由文本一律只显示形状，因为这个流会渲染在可能被人从旁看到的标签页里。
+而前十二次——真正的等待来源——仍然一片空白。工具参数**只在取值属于代码掌握的封闭词表时
+才显示原值**（轴 id、图片类型、已知合并症），其余只显示参数名和形状：这个流会渲染在
+可能被人从旁看到的标签页里，而模型驱动的工具循环自己挑参数，按参数名做白名单只是猜。
 
 **一轮问诊从十三次调用降到七次。** 六次是鉴别/辨证/病例检索，而那一轮的产出
 可能只是一句「您疼多久了？」。要不要现在就展开这套推理，由问诊充分性审核者回答
@@ -516,5 +517,5 @@ LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 694 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 707 个用例，无需 pytest 与网络
 ```

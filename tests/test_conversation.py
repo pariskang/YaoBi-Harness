@@ -664,6 +664,22 @@ class WorkupDeferralTests(unittest.TestCase):
         ran = {t.agent for t in state.tasks if t.status == "ok"}
         self.assertIn("BiomedicalAgent", ran)
 
+    def test_the_workup_runs_once_the_enquiry_ends_however_the_reviewer_votes(self):
+        """A reviewer answering ``workup_now: false`` every round used to defer the
+        differential forever — the conversation reached its end and the patient got
+        an answer that never contained one. "Not yet" presumes a later turn."""
+        llm = self.Stub(adequate=False)
+        session = ConversationSession(role="patient", runner=YaobiGraphRunner(llm=llm))
+        ran = set()
+        for message in ("腰痛3个月，跌倒扭伤过，夜间不痛醒，大小便正常，腿不麻，没发烧",
+                        "我不知道", "说不清", "还是不知道", "真的不知道"):
+            session.send(message)
+            ran |= {t.agent for t in session.state.tasks if t.status == "ok"}
+        verdict = (session.state.outputs.get("interview") or {}).get("verdict") or {}
+        self.assertFalse(verdict.get("still_asking"), "the enquiry never ended")
+        self.assertIn("BiomedicalAgent", ran,
+                      "the differential was deferred past the end of the conversation")
+
     def test_a_deferral_is_recorded_rather_than_silent(self):
         llm = self.Stub(adequate=False)
         session = ConversationSession(role="patient", runner=YaobiGraphRunner(llm=llm))

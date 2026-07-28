@@ -463,6 +463,22 @@ class VisionAgent(BaseAgent):
         reads: list[dict[str, Any]] = []
         evidence_ids: list[str] = []
         for image in images[:6]:
+            cached = image.get("cached_read")
+            if cached:
+                # Read on an earlier turn. An image is the one input here that
+                # cannot change, so re-sending it to a paid multimodal endpoint on
+                # every subsequent turn bought nothing at all. The finding still
+                # enters this run's ledger — a citation must resolve inside the run
+                # that made it — but says which turn actually produced it.
+                from ..state import EvidenceLevel  # noqa: PLC0415 - avoid a cycle
+
+                evidence_ids.append(state.add_evidence(
+                    EvidenceLevel.MODEL.value, "medical_image_read",
+                    f"沿用本次对话中已完成的判读（{cached.get('image_kind', 'other')}）",
+                    {**cached, "carried_forward": True},
+                ))
+                reads.append(dict(cached))
+                continue
             result = tools.call(
                 broker, "medical_image_read",
                 image=str(image.get("ref") or ""),
@@ -488,6 +504,9 @@ class VisionAgent(BaseAgent):
                     f"{payload.get('how_to_fix', '')}"
                 )
                 continue
+            # Stamped so the conversation can cache this finding against the
+            # attachment that produced it and never pay for the read twice.
+            payload["_image_id"] = str(image.get("image_id") or "")
             reads.append(payload)
             if payload.get("phi_detected"):
                 state.warn(

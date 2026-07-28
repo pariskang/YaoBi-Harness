@@ -753,13 +753,45 @@ class ImageUploadTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("重新上传", out["error"])
 
-    def test_uploads_are_bounded_and_never_written_to_disk(self):
-        from yaobi_harness.ui.server import MAX_UPLOADS
+    def test_the_store_is_bounded_by_bytes_not_by_count(self):
+        """A count bound over a variable-size object is not a bound: twenty-four
+        films at the 12 MB ceiling is 288 MB resident, which a Colab kernel
+        notices."""
+        service = ConsoleService()
+        service.max_upload_store_bytes = 300 * 1024
+        for i in range(12):
+            service.store_image(_png(200, 150 + i), mime="image/png", kind="other")
+        resident = sum(e["bytes"] for e in service.uploads.values())
+        self.assertLessEqual(resident, service.max_upload_store_bytes)
+        self.assertLess(len(service.uploads), 12, "nothing was evicted")
+        self.assertTrue(service.uploads, "eviction must never empty the store")
+
+    def test_raw_bytes_are_stored_rather_than_the_inflated_encoding(self):
+        service = ConsoleService()
+        film = _png(400, 300)
+        handle = service.store_image(film, mime="image/png", kind="other")["handle"]
+        self.assertEqual(service.uploads[handle]["raw"], film)
+        self.assertTrue(ConsoleService._data_uri(service.uploads[handle]).startswith("data:image/png;base64,"))
+
+    def test_the_same_photo_uploaded_as_two_kinds_is_two_entries(self):
+        """Keying on content alone made the second upload silently rewrite the
+        first one's kind."""
+        service = ConsoleService()
+        film = _png(300, 200)
+        first = service.store_image(film, mime="image/png", kind="radiograph")
+        second = service.store_image(film, mime="image/png", kind="tongue")
+        self.assertNotEqual(first["handle"], second["handle"])
+        self.assertEqual(service.uploads[first["handle"]]["kind"], "radiograph")
+        self.assertEqual(service.uploads[second["handle"]]["kind"], "tongue")
+
+    def test_the_kind_comes_from_the_upload_not_from_the_chat_payload(self):
+        """The de-identification attestation was made against that kind."""
+        from yaobi_harness.ui.server import _coerce_images
 
         service = ConsoleService()
-        for i in range(MAX_UPLOADS + 5):
-            service.store_image(_png(8, 8 + i), mime="image/png", kind="other")
-        self.assertLessEqual(len(service.uploads), MAX_UPLOADS)
+        handle = service.store_image(_png(120, 90), mime="image/png", kind="radiograph")["handle"]
+        coerced = _coerce_images([{"handle": handle, "kind": "tongue"}], service.uploads)
+        self.assertEqual(coerced[0]["kind"], "radiograph")
 
 
 class UnreadImageTests(unittest.TestCase):
@@ -852,6 +884,45 @@ class ProgressStreamTests(unittest.TestCase):
             if event["kind"].startswith("tool"):
                 self.assertNotIn("张三", event["detail"])
                 self.assertNotIn("城东", event["detail"])
+
+    def test_no_tool_argument_can_carry_free_text_into_the_stream(self):
+        """Driven into *every* argument of *every* tool, in three shapes.
+
+        The first attempt allowlisted argument names and truncated their values,
+        and both halves were wrong: a model-driven tool loop picks its own
+        arguments so any field can receive anything, and twenty-four characters
+        of Chinese is a whole sentence — 「我叫张三，住城东，身份证110101…」 went
+        through a 24-character cap with the name and the ID intact.
+        """
+        import inspect
+
+        from yaobi_harness.tools import ToolRegistry, _tool_arg_preview
+
+        secret = "我叫张三，住城东，身份证110101，腰痛三个月了每天晚上都疼"
+        registry = ToolRegistry()
+        for name in sorted(registry.tools):
+            fn = getattr(registry, name, None)
+            if fn is None:
+                continue
+            params = [p for p in inspect.signature(fn).parameters if p != "self"]
+            for shape in (lambda s: s, lambda s: [s, s], lambda s: {"a": s}):
+                with self.subTest(tool=name):
+                    preview = _tool_arg_preview({p: shape(secret) for p in params})
+                    self.assertNotIn(secret[:4], preview)
+
+    def test_closed_vocabulary_values_still_show_because_that_is_the_point(self):
+        from yaobi_harness.tools import _tool_arg_preview
+
+        self.assertEqual(_tool_arg_preview({"axis_id": "cauda_equina", "tier": "RED_FLAG"}),
+                         "axis_id=cauda_equina, tier=RED_FLAG")
+        self.assertEqual(_tool_arg_preview({"kind": "radiograph"}), "kind=radiograph")
+        self.assertEqual(_tool_arg_preview({"conditions": ["elderly"]}), "conditions=elderly")
+
+    def test_a_value_outside_its_vocabulary_fails_to_the_name_alone(self):
+        from yaobi_harness.tools import _tool_arg_preview
+
+        self.assertEqual(_tool_arg_preview({"axis_id": "不是真的轴"}), "axis_id")
+        self.assertEqual(_tool_arg_preview({"kind": "<整段主诉>"}), "kind")
 
     def test_a_denied_tool_call_is_visible(self):
         """「为什么模型没调用工具」 is usually 「调用了，被技能策略拒了」."""

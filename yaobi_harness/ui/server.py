@@ -33,7 +33,9 @@ from .. import progress
 from ..graph import YaobiGraphRunner
 from ..knowledge import ortho_interactions
 from ..llm.base import LLMError, NullLLMClient
-from ..llm.factory import build_client, describe_client
+from ..llm.factory import (
+    build_client, describe_client, public_client_info, show_model_identity,
+)
 from ..render import console_payload
 from ..state import Budget, ClinicalRunState
 from ..tools import DeidentificationKeyError, ToolRegistry
@@ -272,7 +274,7 @@ class ConsoleService:
         from ..vision.client import IMAGE_KINDS, describe_vision
 
         return {
-            "llm": {**describe_client(self.llm), "error": self.llm_error},
+            "llm": {**public_client_info(self.llm), "error": self.llm_error},
             "vision": {**describe_vision(self.vision), "kinds": list(IMAGE_KINDS)},
             "skills": skills,
             "interview": {
@@ -1114,9 +1116,17 @@ def serve(
     print(f"Yaobi 控制台已启动: {entry}")
     if token:
         print(f"  访问令牌 : {token}   （链接已包含；也可用 X-Yaobi-Token 头调用 API）")
-    print(f"  LLM      : {describe_client(service.llm)}")
+    # Colab prints this into a cell whose output is routinely committed to a
+    # repository, so the banner follows the same policy as the page: it answers
+    # "is a model driving this" without naming the vendor, unless asked to.
+    if show_model_identity():
+        print(f"  对话模型 : {describe_client(service.llm)}")
+        print(f"  视觉模型 : {service.vision.model if service.vision else '未配置（影像/舌象工具不可用）'}")
+    else:
+        print(f"  对话模型 : {'已连接' if getattr(service.llm, 'available', False) else '未配置（走确定性规则路径）'}"
+              f"   （设 YAOBI_SHOW_MODEL=1 显示厂商与模型名）")
+        print(f"  视觉模型 : {'已连接' if service.vision else '未配置（影像/舌象工具不可用）'}")
     print(f"  知识库   : {service.knowledge_store_path or '未配置（指南/药典证据为占位数据）'}")
-    print(f"  视觉模型 : {service.vision.model if service.vision else '未配置（影像/舌象工具不可用）'}")
     print(f"  会诊并发 : {service.panel_concurrency or _env_concurrency()} 线程（页面可逐次调整；1 为顺序执行）")
     print("  按 Ctrl+C 停止")
     tunnel = None

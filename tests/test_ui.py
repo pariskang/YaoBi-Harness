@@ -21,6 +21,7 @@ os.environ.setdefault("YAOBI_DEID_KEY", "unit-test-fixed-key")
 os.environ["no_proxy"] = "localhost,127.0.0.1"
 os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 
+from yaobi_harness.llm.base import LLMResponse
 from yaobi_harness.render import console_payload
 from yaobi_harness.ui.server import EXAMPLE_CASES, ConsoleService, create_server
 
@@ -78,7 +79,11 @@ class ConsoleApiTests(unittest.TestCase):
     def test_bootstrap_describes_the_deployment(self):
         status, data = get(self.base + "/api/bootstrap")
         self.assertEqual(status, 200)
-        self.assertIn("provider", data["llm"])
+        # The vendor and model are redacted; what the page needs is whether a
+        # model is driving the run at all.
+        self.assertIn("configured", data["llm"])
+        self.assertNotIn("provider", data["llm"])
+        self.assertNotIn("model", data["llm"])
         self.assertFalse(data["knowledge"]["configured"])
         self.assertTrue(data["license"]["sources"])
         self.assertEqual(data["rules"]["rule_count"], 18)
@@ -1058,6 +1063,148 @@ class ProductSurfaceTests(unittest.TestCase):
     def test_a_removed_or_sent_image_releases_its_preview(self):
         # Removed from the tray, sent with a turn, and cleared by reset.
         self.assertEqual(self.page.count("URL.revokeObjectURL"), 4)
+
+
+class ModelIdentityRedactionTests(unittest.TestCase):
+    """The vendor and model names never reach a screen.
+
+    Which model sits behind a clinical assistant is a procurement and
+    contractual matter, not something a screen share, a demo or a Colab notebook
+    committed with its cell outputs should settle — and it is of no use to the
+    clinician reading the answer. It stays available everywhere an operator
+    actually works: the CLI, the logs, and the journal file, which needs the real
+    name because it is part of every request's content address.
+
+    Written as a sweep over whole response bodies rather than as assertions on
+    known fields. The field-by-field version of this passed while
+    ``journal.meta.llm_model`` was still going out on two routes.
+    """
+
+    VENDOR = "acmevendor"
+    MODEL = "AcmeModel-XYZ-9"
+    VISION_MODEL = "AcmeVision-Secret"
+
+    class Named:
+        available = True
+
+        def __init__(self, name, model):
+            self.name, self.model = name, model
+
+        def chat(self, messages, **kwargs):
+            return LLMResponse(text=json.dumps({
+                "triage": "routine", "adequate": True, "workup_now": True,
+                "questions": [], "facts": {}, "message": "好的", "reply": "好的",
+                "differentials": ["腰肌劳损"], "primary_pattern": "气滞血瘀证",
+                "evidence": ["刺痛"], "differential_patterns": ["寒湿"],
+                "counter_evidence_needed": ["舌脉"], "similar": ["12例"],
+                "counterexamples": [], "limitation": "单一专家经验",
+            }, ensure_ascii=False), model=self.model)
+
+    class Vision:
+        available = True
+        phi_precheck = True
+        borrowed = True
+
+        def __init__(self, model, chat_client):
+            self.model, self.chat_client = model, chat_client
+
+        def read(self, image, kind="other", context="", budget=None):
+            from yaobi_harness.vision.client import ImageRead
+
+            return ImageRead(image_sha256="a" * 64, image_kind=kind, readable=True,
+                             observations=["骨皮质连续"], model=self.model)
+
+    @classmethod
+    def setUpClass(cls):
+        from yaobi_harness.ui.server import _CountingLLM
+
+        cls.service = ConsoleService()
+        client = cls.Named(cls.VENDOR, cls.MODEL)
+        cls.service.llm = _CountingLLM(client)
+        cls.service.vision = cls.Vision(cls.VISION_MODEL, client)
+        cls.service.tools.vision = cls.service.vision
+        cls.httpd = create_server(cls.service, "127.0.0.1", 0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def bodies(self):
+        """Every response a browser can obtain, as raw text."""
+        out = {"GET /": get(self.base + "/")[1],
+               "GET /api/bootstrap": json.dumps(get(self.base + "/api/bootstrap")[1],
+                                                ensure_ascii=False)}
+        _, run = post(self.base + "/api/run", {
+            "complaint": "腰痛3月，刺痛固定，夜间不痛醒，大小便正常", "role": "physician",
+            "allow_prescription": True, "record_journal": True,
+            "images": [{"kind": "radiograph", "deidentified": True,
+                        "ref": "data:image/png;base64,AA=="}]})
+        out["POST /api/run"] = json.dumps(run, ensure_ascii=False)
+        run_id = (run.get("journal") or {}).get("run_id")
+        if run_id:
+            _, replay = post(self.base + "/api/replay", {"run_id": run_id})
+            out["POST /api/replay"] = json.dumps(replay, ensure_ascii=False)
+        _, chat = post(self.base + "/api/chat", {"message": "腰痛3个月", "role": "patient"})
+        out["POST /api/chat"] = json.dumps(chat, ensure_ascii=False)
+        return out
+
+    def test_no_response_a_browser_can_obtain_names_the_model(self):
+        for label, body in self.bodies().items():
+            for needle in (self.VENDOR, self.MODEL, self.VISION_MODEL):
+                with self.subTest(route=label, needle=needle):
+                    self.assertNotIn(needle.lower(), body.lower())
+
+    def test_a_replay_of_a_recorded_run_does_not_leak_it_either(self):
+        """The route that kept publishing ``journal.meta.llm_model`` after the
+        other two were fixed."""
+        bodies = self.bodies()
+        self.assertIn("POST /api/replay", bodies, "the replay route did not run")
+
+    def test_the_page_answers_whether_a_model_is_driving_the_run(self):
+        """Redacting must not cost the one thing the badge is for: a
+        deterministic run and a model-driven one produce very different
+        consultations, and confusing them is a real error."""
+        _, data = get(self.base + "/api/bootstrap")
+        self.assertTrue(data["llm"]["available"])
+        self.assertTrue(data["llm"]["configured"])
+        self.assertTrue(data["vision"]["configured"])
+
+    def test_the_operator_paths_keep_the_real_name(self):
+        from yaobi_harness.llm.factory import describe_client
+
+        described = describe_client(self.Named(self.VENDOR, self.MODEL))
+        self.assertEqual(described["provider"], self.VENDOR)
+        self.assertEqual(described["model"], self.MODEL)
+
+    def test_the_journal_file_keeps_the_real_name(self):
+        """It is part of every request's content address; an offline replay
+        diverges on the name alone without it."""
+        import tempfile
+
+        from yaobi_harness.journal import Journal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Journal(Path(tmp) / "run.jsonl", mode="record")
+            journal.write_meta({"llm_model": self.MODEL, "llm_provider": self.VENDOR})
+            self.assertEqual(journal.meta["llm_model"], self.MODEL)
+            self.assertNotIn("llm_model", journal.summary()["meta"])
+
+    def test_an_operator_can_opt_back_in(self):
+        import os
+
+        from yaobi_harness.llm.factory import SHOW_MODEL_ENV, public_client_info
+
+        os.environ[SHOW_MODEL_ENV] = "1"
+        try:
+            info = public_client_info(self.Named(self.VENDOR, self.MODEL))
+            self.assertEqual(info["model"], self.MODEL)
+        finally:
+            os.environ.pop(SHOW_MODEL_ENV, None)
+        self.assertNotIn("model", public_client_info(self.Named(self.VENDOR, self.MODEL)))
 
 
 if __name__ == "__main__":

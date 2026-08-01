@@ -25,7 +25,7 @@ from .agent.agents import (
 )
 from .agent.planner import AGENT_CATALOG, PlannerAgent
 from .llm.base import NullLLMClient
-from .llm.factory import describe_client
+from .llm.factory import public_client_info
 from .skills.loader import SkillRegistry
 from .state import ClinicalRunState, Task
 from .tools import CapabilityBroker, ToolHealth, ToolRegistry
@@ -436,9 +436,14 @@ class YaobiGraphRunner:
                 state.release_status = "needs_more_information"
             elif state.outputs.get("biomedical"):
                 state.release_status = "treatment_advice_only"
+        # ``run_meta`` is the one object that reaches every surface — the console's
+        # meta panel, the physician and researcher views, the raw-JSON tab — so it
+        # is where the vendor name is dropped. Redacting at each display instead
+        # would mean the raw-JSON tab quietly keeps leaking it.
+        journal_meta = self.journal.summary() if self.journal is not None else {"mode": "off"}
         state.outputs["run_meta"] = {
             "planner_mode": state.planner_mode,
-            "llm": describe_client(self.llm),
+            "llm": public_client_info(self.llm),
             "loops_used": state.loop_index + 1,
             "budget": {
                 "tool_calls": f"{state.budget.used_tool_calls}/{state.budget.max_tool_calls}",
@@ -447,7 +452,10 @@ class YaobiGraphRunner:
             },
             "tool_health": self.health.snapshot(),
             "knowledge": self._knowledge_meta(),
-            "journal": self.journal.summary() if self.journal is not None else {"mode": "off"},
+            # ``Journal.summary()`` redacts its own meta; the journal *file*
+            # keeps the true model name, because it is part of every request's
+            # content address and a replay diverges without it.
+            "journal": journal_meta,
         }
         self._summarise(state)
 

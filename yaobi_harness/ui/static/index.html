@@ -900,9 +900,18 @@ async function boot() {
   try { BOOT = await api("/api/bootstrap"); }
   catch (e) { $("#runHint").textContent = "无法连接后端: " + e.message; return; }
 
+  /* The badges answer "is a model driving this run", not "which one".
+     `provider` and `model` are redacted server-side unless YAOBI_SHOW_MODEL is
+     set, so these fall back cleanly when they are absent — the page never has
+     to know the policy, and a panel that forgot about it has nothing to leak. */
   const llm = BOOT.llm || {};
-  $("#badgeLlm").textContent = llm.available ? `LLM ${llm.provider}/${llm.model}` : "LLM 未配置";
+  const named = [llm.provider, llm.model].filter(Boolean).join("/");
+  $("#badgeLlm").textContent = llm.available
+    ? (named ? `对话模型 ${named}` : "对话模型 已连接")
+    : "对话模型 未配置";
   $("#badgeLlm").className = "badge mono" + (llm.available ? " b-accent" : "");
+  $("#badgeLlm").title = llm.available
+    ? "由模型驱动分诊、追问与回复" : "走确定性规则路径";
   if (!llm.available) {
     // At the point of use, not only in a header badge that is hidden below 720px
     // anyway. Without a model the conversation still runs — on the deterministic
@@ -914,7 +923,7 @@ async function boot() {
     $("#llmOff").hidden = false;
     $("#llmOff").innerHTML = `<span class="ico">◎</span><div><b>未配置对话模型，本页走确定性规则路径</b>
       <br><small>问诊会用固定题库、回复由模板生成，分诊完全由关键词决定。
-      设置 <code>POE_API_KEY</code>（或 Azure / MiniMax / LiteLLM 的等价变量）后重启控制台即可启用。
+      配置对话模型的环境变量后重启控制台即可启用（见 <code>docs/CONSOLE.md</code>）。
       规则路径下的安全边界与放行状态机完全相同。</small></div>`;
   }
 
@@ -925,7 +934,7 @@ async function boot() {
 
   const vis = BOOT.vision || {};
   $("#badgeVision").textContent = vis.configured
-    ? `视觉 ${vis.model}${vis.borrowed_chat_model ? "（借用对话模型）" : ""}`
+    ? `视觉 ${vis.model || "已连接"}${vis.borrowed_chat_model ? "（借用对话模型）" : ""}`
     : "视觉 未配置";
   $("#badgeVision").className = "badge mono" + (vis.configured ? " b-accent" : "");
   $("#badgeVision").title = vis.borrowed_chat_model
@@ -1077,7 +1086,7 @@ function renderRun() {
         ${(audit.consult_panel?.concurrency || 0) > 1
           ? badge("会诊并发 " + audit.consult_panel.concurrency, "accent") : ""}
         ${LAST.journal ? badge("已录制 " + LAST.journal.entries + " 次调用", "ok") : ""}
-        ${meta.llm?.available ? badge("模型 " + meta.llm.provider, "accent") : ""}
+        ${meta.llm?.available ? badge(meta.llm.provider ? "模型 " + meta.llm.provider : "模型驱动", "accent") : ""}
         ${badge(meta.knowledge?.configured ? "知识库 " + (meta.knowledge.enabled_sources || []).length + " 源" : "知识库未配置",
                 meta.knowledge?.configured ? "ok" : "warn")}
       </div>

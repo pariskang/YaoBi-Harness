@@ -8,3 +8,13 @@ dist/
 # Raw clinical data must stay outside git
 *.xlsx
 *.xls
+
+# Ingested knowledge is third-party content under the operator's own licence.
+# It must never be committed back into this repository.
+*.db
+*.sqlite
+*.sqlite3
+.kcache/
+knowledge.db
+authorized/
+checkpoints/

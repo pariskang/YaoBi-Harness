@@ -53,6 +53,28 @@ skills:
   - uncertainty
   output_schema: UrgentCarePlan
   output_key: urgent_action_plan
+  autonomous: true
+  instructions: '先用 emergency_resource_lookup 取当地急救电话，必要时用 clinical_guideline_search
+    取要点，然后**由你写这份行动计划**。
+
+
+    这份计划会被直接读给患者，所以写法很重要：
+
+
+    1. 先说要立刻做什么，再说为什么。不要先讲一段免责。
+
+    2. 紧急程度要与本例相称。疑似马尾、骨筋膜室、PE/ACS 才写"拨打急救电话"；
+    只是需要尽快线下评估的，就写"今天或明天去骨科/急诊门诊"——对慢性腰痛喊救护车，
+    下一次真的急症他就不会信你了。
+
+    3. immediate_action、transport_advice、uncertainty 三项必填，因为它们是患者唯一
+    会照着做的部分。
+
+    4. do_not 写本例真正要避免的事（推拿正骨、自行加量止痛药、因线上建议延迟就诊），
+    不要写通用套话。
+
+    5. 不要写任何药名剂量。'
+
 - skill_id: yaobi.biomedical_differential
   version: 3.2.0
   description: 西医鉴别诊断
@@ -198,3 +220,46 @@ skills:
   output_key: safety_audit
   hard_requirements:
   - checks_run
+- skill_id: yaobi.clinical_summary
+  version: 1.0.0
+  description: 病历摘要撰写：把已完成的运行整理成结构化门诊病历文本
+  allowed_roles:
+  - physician
+  - patient
+  - researcher
+  allowed_tools: []
+  forbidden_tools:
+  - formula_composition_search
+  - herb_dose_distribution
+  - physician_review_submit
+  output_schema: ClinicalNoteSections
+  autonomous: true
+  hard_requirements:
+  - chief_complaint
+  - present_illness
+  - western_diagnosis
+  - treatment_plan
+  - uncertainty
+  instructions: '把这次运行整理成一份**门诊病历摘要**。材料 `deterministic_note` 里已经有一份按规则拼装好的版本，逐节给你；你的工作是把它写成同行读得下去的病历文本。
+
+
+    这是**整理**，不是**新增**。材料里没有的临床事实不要写进去——一份看起来完整、实际上有编造内容的病历，比一份有「未采集」的病历危险得多。
+
+
+    逐节要求：
+
+
+    1. `chief_complaint` 一句话。年龄性别 + 主要症状 + 病程，这是同行第一眼看的。
+
+    2. `present_illness` 按时间顺序写，把散在的问答整理成叙述。患者原话里有价值的表述可以保留。
+
+    3. `western_diagnosis` 写成"考虑…，需与…鉴别"，并说明依据。线上不能确诊，所以不要写成确定诊断。
+
+    4. `treatment_plan` 分"已明确可做的"和"取决于线下检查结果的"两部分。**不要写任何药名剂量**——剂量在处方草案一节，那里带着逐味签名状态。
+
+    5. `uncertainty` 是这份摘要最重要的一节。写清：哪些必答项没闭合、分诊结论的依据与分歧、哪些结论缺可放行证据。**不要为了让摘要好看而弱化它。**
+
+    6. 没有材料的节留空字符串，系统会印成「未采集」。**不要用推测填空。**
+
+
+    语言：中文，专业但不堆砌术语；医师视角。'

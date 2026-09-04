@@ -58,17 +58,26 @@
    produced by `render()` for the selected role, and the reasoning record is
    returned in a separate `audit` object labelled operator-only in the UI. See
    [CONSOLE.md](CONSOLE.md).
-8. **Chat is not a generation path.** Each dialogue turn is a fresh, fully
-   audited run over the accumulated narrative and facts; the model may extract
-   facts (through an allowlist that excludes `physician_review`) and rephrase
-   the released answer, nothing more. The urgent script is never rephrased and
-   replies are dose-scanned before they leave. See [CONVERSATION.md](CONVERSATION.md).
-9. **Asking is an action, and its scope is not the model's to choose.** The model
-   composes questions through the ``ask_patient`` tool, but which axes are
-   *required* is rule-derived; a skipped required axis is added back from the
-   probe bank. An interview may only end on an :class:`AdequacyJudge` verdict,
-   and a ``blocked`` verdict — a red-flag axis still unanswered — can never be
-   waived by the model, a round cap, or a verifier outage. See [INTERVIEW.md](INTERVIEW.md).
+8. **Chat runs on top of a governed run, but the model writes it.** Each dialogue
+   turn is a fresh, fully audited run over the accumulated narrative and facts —
+   and that run produces *material* for the model rather than a script for it to
+   read out. The agent opens the consultation, triages, composes the enquiry,
+   decides when the enquiry is over, and writes every reply including the urgent
+   one. Two things a message can never do: assert a physician's signature
+   (`physician_review` is refused outright), and publish a dose — a gram count in
+   a reply is **redacted in place**, leaving the model's sentence intact. Every
+   other extracted fact is kept, governed keys through the typed allowlist and the
+   rest in `facts["_extra"]`. See [CONVERSATION.md](CONVERSATION.md).
+9. **Asking is an action, and the model's questions are never substituted.** The
+   model composes questions through the ``ask_patient`` tool and they reach the
+   patient as written: an unlabelled axis does not discard the question, a required
+   axis it declined is not back-filled, and a dose inside a question is redacted
+   rather than costing the enquiry. Stopping is the model's decision too — it ends
+   the interview by returning no questions, with the :class:`AdequacyJudge`
+   verdict supplied as advice. What the verdict still governs is the *dose
+   pipeline*: a ``blocked`` verdict withholds dose-bearing output, and the
+   reviewer may only clear a required axis by quoting the history that answered
+   it. See [INTERVIEW.md](INTERVIEW.md).
 10. **No subagent is prescriptive.** ``consult_mode`` intersects with a skill's
     grant rather than unioning, so no persona or site ``SKILL.md`` can reach
     ``formula_composition_search``, ``herb_dose_distribution`` or
@@ -105,13 +114,13 @@
 | Capability | Model may | Model may not |
 | --- | --- | --- |
 | Planning | propose a task graph | invent agents, exceed skill tool lists, add prescriptive agents in urgent mode, create cycles |
-| Red flags | add signals | clear or downgrade a rule-based hit |
-| Questions | rewrite/reorder | exceed `Budget.max_questions` |
+| Triage | decide the level, having been given the screen's hits, the soft hits and its own semantic findings as material | do so silently — every disagreement with the keyword screen is recorded in both directions |
+| Questions | compose them; they reach the patient as written | exceed the LLM budget; more than the per-round readability limit is deferred, not dropped |
 | Critique | add issues (`block`/`warn`) | clear an existing safety issue or change release status directly |
 | Tool use | choose tools and arguments from its skill's set, self-correct | see or reach a tool outside the skill; skip the broker |
 | Outputs | any shape the skill's schema allows | violate the schema; emit a gram value |
-| Dialogue | extract allowlisted facts, rephrase a released answer | set `physician_review`, add clinical content, rephrase the urgent script, emit a dose |
-| Interview | word/order/deepen the enquiry, add axes, propose that it is complete | skip a required axis, embed advice or a dose in a question, decide that asking may stop |
+| Dialogue | open the consultation, extract facts (governed keys typed, the rest kept in `_extra`), write every reply including the urgent one | set `physician_review`; publish a gram value — it is redacted in place, leaving the sentence intact |
+| Interview | word, order and deepen the enquiry, add axes, decline a required one, **end the enquiry by asking nothing** | reach a dose draft while a required axis is open — the reviewer may clear one only by quoting the history that answered it |
 | Consult panel | reason inside a speciality view, raise urgency, add concerns | reach a prescriptive tool, convene a nested consult, lower urgency or overspend its slice |
 | Vision | describe what is visible, raise a red flag, suggest questions and examinations | diagnose, claim to replace a formal read, emit a dose, read an image carrying identifiers |
 | Doses | nothing | anything |
@@ -128,8 +137,13 @@ errors, timeouts and budget exhaustion degrade the same way.
 
 ```
 bootstrap(IntakeAgent) → plan → ┌ execute tasks ┐
+                                │  T4 VisionAgent   (only when images attached;
+                                │                    before the interview, so the
+                                │                    findings steer this round's
+                                │                    questions — and usually a
+                                │                    cache hit: the console
+                                │                    pre-reads at upload time)
                                 │  T3 InterviewAgent (every path, urgent too)
-                                │  T4 VisionAgent   (only when images attached)
                                 │  N8 ConsultPanelAgent (opt-in, or LLM-planned)
                                 │               │
                                 └── critic ─────┘  repair_requests & budget.can_loop("repair")

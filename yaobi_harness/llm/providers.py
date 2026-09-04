@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .base import LLMError, LLMResponse, ToolCall, ToolSpec
+from .base import LLMError, LLMResponse, ToolCall, ToolSpec, split_reasoning
 
 DEFAULT_TIMEOUT = float(os.environ.get("YAOBI_LLM_TIMEOUT", "60"))
 DEFAULT_RETRIES = int(os.environ.get("YAOBI_LLM_RETRIES", "3"))
@@ -141,9 +141,17 @@ class OpenAICompatibleClient:
                 except ValueError:
                     arguments = {"_raw": arguments}
             calls.append(ToolCall(str(function.get("name", "")), arguments or {}, str(call.get("id", ""))))
+        # Separated here, at the one boundary every provider passes through, so no
+        # consumer can forget: a reasoning trace must never be displayed and must
+        # never be parsed. Some gateways also return it in its own field.
+        answer, reasoning = split_reasoning(text)
+        side_channel = message.get("reasoning_content") or message.get("reasoning") or ""
+        if isinstance(side_channel, str) and side_channel.strip():
+            reasoning = f"{reasoning}\n{side_channel}".strip()
         usage = data.get("usage") or {}
         return LLMResponse(
-            text=text,
+            text=answer,
+            reasoning=reasoning,
             tool_calls=calls,
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),

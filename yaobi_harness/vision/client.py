@@ -151,7 +151,16 @@ class ImageRead:
     phi_kinds: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        """The finding, as it enters the evidence ledger and the console audit.
+
+        The reading model's name is redacted by the shared policy: this dict is
+        rendered in the console's image panel and in the raw-JSON tab, which is
+        exactly the class of surface the policy covers. The digest still pins
+        *which image* produced the finding, which is what the audit needs.
+        """
+        from ..llm.factory import redact_model_identity
+
+        return redact_model_identity({
             "image_sha256": self.image_sha256, "image_kind": self.image_kind,
             "readable": self.readable, "observations": self.observations,
             "not_assessable": self.not_assessable, "urgent_signals": self.urgent_signals,
@@ -160,7 +169,7 @@ class ImageRead:
             "requires_formal_read": True,
             "phi_detected": self.phi_detected, "phi_kinds": self.phi_kinds,
             "not_a_radiology_report": True,
-        }
+        })
 
 
 def encode_image(path: str | Path) -> tuple[str, str, str]:
@@ -213,6 +222,9 @@ class VisionClient:
         #: Model override, so a text-only run can still borrow a vision model.
         self.model = model or getattr(chat_client, "model", "")
         self.phi_precheck = phi_precheck
+        #: Set by the caller when this client is the session's ordinary chat
+        #: model standing in for an unconfigured vision provider.
+        self.borrowed = False
 
     @property
     def available(self) -> bool:
@@ -375,15 +387,29 @@ def build_vision_client(chat_client: Any | None = None, **overrides: Any) -> Vis
 
 
 def describe_vision(client: VisionClient | None) -> dict[str, Any]:
+    """What a screen is told about the vision model.
+
+    Redacted by the same policy as the chat model — see
+    :func:`~yaobi_harness.llm.factory.redact_model_identity`. Which vendor reads
+    the films is a procurement matter, and a demo screenshot is not where it
+    should be settled.
+    """
+    from ..llm.factory import redact_model_identity
+
     if client is None or not client.available:
         return {"configured": False, "note": "未配置视觉模型；影像与舌象工具不可用"}
-    return {
+    return redact_model_identity({
         "configured": True,
         "model": client.model,
         "provider": getattr(client.chat_client, "name", "unknown"),
         "phi_precheck": client.phi_precheck,
         "kinds": list(IMAGE_KINDS),
-    }
+        # True when no vision-specific provider was configured and the session's
+        # chat model is being used instead. Worth surfacing rather than hiding:
+        # if that model turns out not to be multimodal, this is the line that
+        # explains the failure.
+        "borrowed_chat_model": bool(getattr(client, "borrowed", False)),
+    })
 
 
 def read_to_json(read: ImageRead) -> str:

@@ -413,10 +413,19 @@ class AutonomousAgentTests(unittest.TestCase):
         self.assertTrue(any("配伍禁忌" in i for i in out.safety_issues), out.safety_issues)
 
     def test_dose_generation_is_never_delegated_to_the_model(self):
+        """Two skills stay deterministic, and only two.
+
+        Dose generation is a legal boundary — a gram count needs a signature, not
+        a model. The safety critic is deliberately adversarial to whatever the
+        model produced, so having the model write it would defeat it. Everything
+        else, including the emergency plan, is the model's to write: a fixed
+        emergency template is what told a chronic-back-pain patient to call an
+        ambulance, and an alarm that fires on routine cases stops being read.
+        """
         skills = SkillRegistry.from_file(MANIFEST)
         self.assertFalse(skills.specs["yaobi.dose_generation"].autonomous)
-        self.assertFalse(skills.specs["yaobi.urgent_triage"].autonomous)
         self.assertFalse(skills.specs["yaobi.safety_critic"].autonomous)
+        self.assertTrue(skills.specs["yaobi.urgent_triage"].autonomous)
 
     def test_autonomous_run_still_produces_a_deterministic_dose_draft(self):
         registry = ToolRegistry(records=corpus(), deid_key=TEST_KEY,
@@ -611,6 +620,14 @@ class InformalModelDrivesTheWholeRunTests(unittest.TestCase):
         ("primary_pattern", {"primary_pattern": "气滞血瘀证", "candidate_patterns": ["寒湿痹阻证"]}),
         ("counterexamples", {"similar": [], "counterexamples": [], "limitation": "样本有限"}),
         ("findings", {"findings": [], "overall": "无重大相互作用"}),
+        # The clinical note, written last over the deterministic assembly.
+        ("chief_complaint", {
+            "chief_complaint": "63岁男性，腰痛3月，久坐加重，右下肢麻木",
+            "present_illness": "3个月前无明显外伤起病，久坐后加重，近期出现右下肢麻木",
+            "western_diagnosis": "考虑腰椎间盘突出伴神经根病，需与腰椎管狭窄鉴别",
+            "treatment_plan": "先完成神经定位体检与必要影像；用药方案取决于检查结果",
+            "uncertainty": "线上问诊，未查体；部分必答项尚未闭合",
+        }),
     )
     PLAN = {
         "reasoning": "先筛红旗，再做西医鉴别与辨证",
@@ -685,6 +702,20 @@ class InformalModelDrivesTheWholeRunTests(unittest.TestCase):
             with self.subTest(agent=agent):
                 self.assertEqual(info["mode"], "llm_tool_loop", info.get("error"))
                 self.assertEqual(info["repairs"], 0, "a trailing comma must not cost a repair turn")
+
+    def test_an_agent_with_tools_actually_used_one(self):
+        """Scoped to skills that grant tools. Writing the clinical note grants none
+        and needs none — it composes over material the run already gathered, and a
+        skill with no tools is not a skill that cannot think."""
+        from yaobi_harness.agent.planner import AGENT_CATALOG
+
+        skills = SkillRegistry.from_file(MANIFEST)
+        for agent, info in self.out.outputs.get("autonomy", {}).items():
+            spec = AGENT_CATALOG.get(agent)
+            grant = skills.specs.get(getattr(spec, "skill_id", "") or "")
+            if grant is None or not grant.allowed_tools:
+                continue
+            with self.subTest(agent=agent):
                 self.assertTrue([s for s in info["steps"] if s.get("tool")],
                                 "the model chose no tool")
 

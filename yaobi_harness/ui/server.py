@@ -21,28 +21,60 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .. import progress
 from ..graph import YaobiGraphRunner
 from ..knowledge import ortho_interactions
 from ..llm.base import LLMError, NullLLMClient
-from ..llm.factory import build_client, describe_client
+from ..llm.factory import (
+    build_client, describe_client, public_client_info, show_model_identity,
+)
 from ..render import console_payload
 from ..state import Budget, ClinicalRunState
 from ..tools import DeidentificationKeyError, ToolRegistry
 
 STATIC_DIR = Path(__file__).parent / "static"
+#: Cap for ordinary JSON control traffic. Small on purpose — a chat turn is a few
+#: kilobytes, and anything approaching this is a mistake worth failing on.
 MAX_BODY_BYTES = 256 * 1024
+#: Cap for ``/api/image/upload``, which carries raw image bytes and nothing else.
+#: Comfortably above the vision client's own 12 MB ceiling so an oversized film
+#: is rejected by the *image* validator, with a message about images, rather than
+#: by a transport limit with a message about request bodies.
+MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+#: Uploaded images held in memory. Never written to disk: an X-ray is clinical
+#: content, and a demo console that persisted one would be the wrong default to
+#: discover later.
+#:
+#: Bounded by **total bytes**, not by count. A count bound over a variable-size
+#: object is not a bound: twenty-four films at the 12 MB ceiling is 288 MB of
+#: resident memory, which a Colab kernel notices. Sixty megabytes is a dozen
+#: phone photos and a number an operator can reason about.
+MAX_UPLOAD_STORE_BYTES = 60 * 1024 * 1024
 #: Live conversations kept in memory before the oldest is evicted.
 MAX_SESSIONS = 50
+#: Background chat turns retained before the oldest is evicted. Each holds one
+#: turn's result, so a small window is plenty.
+MAX_JOBS = 40
 #: Recorded journals kept for replay before the oldest is evicted. Journals hold
 #: tool payloads and model text — clinical content — so the console keeps a short
 #: window in memory and never writes one to disk.
 MAX_RECORDINGS = 20
+#: Pre-read image findings kept before the oldest is evicted. Findings are small
+#: (structured text, no bytes) so the bound is about hygiene, not memory.
+MAX_PREREADS = 16
+#: How long a turn will wait for a pre-read that is still running. The pre-read
+#: started strictly earlier than the turn's own read would have, so waiting is
+#: never slower than reading fresh; the timeout only exists so a hung vision
+#: endpoint cannot hold a turn hostage forever.
+PREREAD_WAIT_S = 180.0
 
 logger = logging.getLogger("yaobi.ui")
 
@@ -80,9 +112,9 @@ class ConsoleService:
         self._sessions_lock = threading.Lock()
 
         try:
-            self.llm = build_client(llm_provider, **({"model": llm_model} if llm_model else {}))
+            self.llm = _CountingLLM(build_client(llm_provider, **({"model": llm_model} if llm_model else {})))
         except LLMError as exc:
-            self.llm = NullLLMClient()
+            self.llm = _CountingLLM(NullLLMClient())
             self.llm_error = str(exc)
 
         self.knowledge = self._open_knowledge()
@@ -94,6 +126,139 @@ class ConsoleService:
         #: Recorded runs available for offline re-derivation, keyed by run id.
         #: Also in-memory only, and for the same reason.
         self.recordings: dict[str, dict[str, Any]] = {}
+        #: Background chat turns, keyed by job id. A turn is far too slow to hold
+        #: an HTTP request open for; the page starts one and polls.
+        self.jobs: dict[str, dict[str, Any]] = {}
+        #: Uploaded images, keyed by handle. In memory only, and for the same
+        #: reason transcripts are: an X-ray is clinical content.
+        self.uploads: dict[str, dict[str, Any]] = {}
+        #: Resident bytes allowed in :attr:`uploads`. An instance attribute rather
+        #: than a constant read at the call site, so a long-lived deployment can
+        #: size it to its own memory and a test can exercise eviction without
+        #: allocating sixty megabytes to do it.
+        self.max_upload_store_bytes = MAX_UPLOAD_STORE_BYTES
+        #: Findings pre-read at upload time, keyed by the conversation's image id.
+        #: Each record is ``{"done": Event, "read": dict|None, "error": str}``;
+        #: ``done`` is set when the background read finished either way.
+        self.image_prereads: dict[str, dict[str, Any]] = {}
+
+    def store_image(self, raw: bytes, *, mime: str, kind: str) -> dict[str, Any]:
+        """Accept one uploaded image and return a handle to it.
+
+        Validated here, once, rather than on every turn that carries it: the
+        handle is what the chat payload sends afterwards, so a 12 MB film costs
+        12 MB on upload and about forty bytes on each subsequent question. That
+        is the whole point — the browser used to re-send the entire base64 blob
+        with every message, and the second one is what failed.
+
+        The **raw bytes** are kept, not the ``data:`` URI. Base64 inflates by a
+        third, and the URI is needed once per conversation, so building it on
+        demand trades a millisecond for a quarter of the memory.
+
+        The handle covers the content *and* the kind. Keying on content alone made
+        the same photo uploaded as a radiograph and then as a tongue image collide
+        on one entry, and the second upload silently rewrote the first one's kind.
+        """
+        import hashlib
+
+        from ..vision.client import MAX_IMAGE_BYTES, SUPPORTED_SUFFIXES
+
+        if not raw:
+            raise ValueError("上传内容为空")
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"图片 {len(raw) // (1024 * 1024)} MB，超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MB 上限")
+        if mime not in {f"image/{s.lstrip('.')}" for s in SUPPORTED_SUFFIXES} | {"image/jpg"}:
+            raise ValueError(f"不支持的图片类型 {mime or '(未提供)'}；支持 {sorted(SUPPORTED_SUFFIXES)}")
+
+        digest = hashlib.sha256(raw).hexdigest()
+        handle = f"img_{hashlib.sha256(f'{kind}:{digest}'.encode()).hexdigest()[:16]}"
+        entry = {"raw": raw, "kind": kind, "sha256": digest,
+                 "bytes": len(raw), "mime": mime}
+        with self._sessions_lock:
+            self.uploads.pop(handle, None)   # re-upload counts as most recent
+            self.uploads[handle] = entry
+            resident = sum(e["bytes"] for e in self.uploads.values())
+            while resident > self.max_upload_store_bytes and len(self.uploads) > 1:
+                resident -= self.uploads.pop(next(iter(self.uploads)))["bytes"]
+        return {"handle": handle, "sha256": digest, "bytes": len(raw),
+                "kind": kind, "mime": mime,
+                "vision_available": bool(getattr(self.vision, "available", False)),
+                "preread": self._start_preread(entry)}
+
+    @staticmethod
+    def _image_id_for(kind: str, ref: str) -> str:
+        """The conversation's attachment id, computed the same way it computes it.
+
+        Must match :meth:`ConversationSession.attach_image` byte for byte — the
+        pre-read cache is keyed by this id, and a drifted formula would not fail,
+        it would silently stop ever hitting.
+        """
+        import hashlib
+
+        return f"{kind}:{hashlib.sha256(ref.encode('utf-8')).hexdigest()[:16]}"
+
+    def _start_preread(self, entry: dict[str, Any]) -> bool:
+        """Read an upload in the background, so the finding is ready before the question.
+
+        The earliest the vision model can be activated is the upload itself:
+        between clicking 上传 and finishing the question there are usually tens of
+        seconds, which is enough for the PHI pre-check and the read to complete.
+        By the time ``VisionAgent`` runs, the turn hits the cache instead of
+        paying a serial multimodal call mid-turn.
+
+        The attestation gate still holds — ``/api/image/upload`` refuses any
+        upload without the de-identification header, so everything stored here
+        was attested before it could be read. The PHI pre-check inside the read
+        is the second line, exactly as on the in-turn path.
+        """
+        vision = self.vision
+        if vision is None or not getattr(vision, "available", False):
+            return False
+        ref = self._data_uri(entry)
+        image_id = self._image_id_for(entry["kind"], ref)
+        record = {"done": threading.Event(), "read": None, "error": ""}
+        with self._sessions_lock:
+            if image_id in self.image_prereads:
+                return True  # same bytes, same kind: the earlier read stands
+            self.image_prereads[image_id] = record
+            while len(self.image_prereads) > MAX_PREREADS:
+                evicted = self.image_prereads.pop(next(iter(self.image_prereads)))
+                evicted["done"].set()  # a waiter on an evicted slot must not hang
+
+        def work() -> None:
+            try:
+                read = vision.read(ref, kind=entry["kind"])
+                record["read"] = {**read.to_dict(), "_image_id": image_id}
+            except Exception as exc:  # noqa: BLE001 - a failed pre-read just means a fresh read later
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                logger.warning("image pre-read failed: %s", record["error"])
+            finally:
+                record["done"].set()
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _adopt_preread(self, image_id: str, *, timeout: float = PREREAD_WAIT_S) -> dict[str, Any] | None:
+        """The pre-read finding for ``image_id``, waiting briefly if still running.
+
+        ``None`` means no pre-read exists or it failed; the caller falls through
+        to the ordinary in-turn read, which reports its own errors in the run.
+        """
+        with self._sessions_lock:
+            record = self.image_prereads.get(image_id)
+        if record is None:
+            return None
+        record["done"].wait(timeout)
+        read = record.get("read")
+        return dict(read) if isinstance(read, dict) else None
+
+    @staticmethod
+    def _data_uri(entry: dict[str, Any]) -> str:
+        """Build the transport encoding for a stored upload, on demand."""
+        import base64
+
+        return f"data:{entry['mime']};base64,{base64.b64encode(entry['raw']).decode('ascii')}"
 
     def _open_knowledge(self):
         if not self.knowledge_store_path:
@@ -102,18 +267,48 @@ class ConsoleService:
 
         return open_store(self.knowledge_store_path)
 
-    @staticmethod
-    def _open_vision(enabled: bool):
-        """Build the vision client, tolerating an unconfigured environment."""
+    def _open_vision(self, enabled: bool):
+        """Build the vision client, falling back to the chat model already configured.
+
+        ``build_vision_client`` looks for a *separate* vision provider, defaulting
+        to Poe. On a console started with, say, an OpenAI-compatible endpoint and
+        no ``YAOBI_VISION_*`` set, that lookup finds nothing and image reading is
+        silently off — which is what 「上传 X 片无法自动解析」 actually was. The
+        image uploaded fine, the graph scheduled ``VisionAgent``, and the tool it
+        needed had never been built.
+
+        So when nothing vision-specific is configured, the session's own chat
+        client is offered instead. Every endpoint this harness speaks to is
+        OpenAI-shaped and takes an ``image_url`` content part, so a multimodal
+        chat model is a working vision model. If it is not multimodal the read
+        fails at call time with the provider's own error — visible, in the run's
+        evidence, which is the right place for it. Guessing "probably not
+        multimodal" and staying dark is how the silence happened in the first
+        place.
+        """
         if not enabled:
             return None
         from ..vision.client import build_vision_client
 
         try:
-            return build_vision_client()
+            client = build_vision_client()
         except Exception as exc:  # noqa: BLE001 - the console must still start
             logger.warning("vision client unavailable: %s", exc)
+            client = None
+        if client is not None or not getattr(self.llm, "available", False):
+            return client
+        if os.environ.get("YAOBI_VISION_PROVIDER"):
+            return None  # explicitly configured and it did not build; do not paper over it
+        try:
+            borrowed = build_vision_client(
+                chat_client=self.llm, model=getattr(self.llm, "model", "") or None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("vision fallback to chat client failed: %s", exc)
             return None
+        if borrowed is not None:
+            borrowed.borrowed = True
+            logger.info("vision: borrowing the chat model %s", getattr(self.llm, "model", "?"))
+        return borrowed
 
     def _runner(
         self,
@@ -160,7 +355,7 @@ class ConsoleService:
         from ..vision.client import IMAGE_KINDS, describe_vision
 
         return {
-            "llm": {**describe_client(self.llm), "error": self.llm_error},
+            "llm": {**public_client_info(self.llm), "error": self.llm_error},
             "vision": {**describe_vision(self.vision), "kinds": list(IMAGE_KINDS)},
             "skills": skills,
             "interview": {
@@ -193,7 +388,10 @@ class ConsoleService:
 
     def run_case(self, payload: dict[str, Any]) -> dict[str, Any]:
         role = self._role_of(payload, default="physician")
-        state = self._state_from(payload, role)
+        # A recorded run must make its vision calls for real so the journal holds
+        # them; see ``_state_from`` on why a pre-read cache hit cannot be replayed.
+        state = self._state_from(payload, role,
+                                 seed_prereads=not payload.get("record_journal"))
         journal = None
         if payload.get("record_journal"):
             from ..journal import Journal
@@ -258,7 +456,7 @@ class ConsoleService:
             case["facts"] = payload["facts"]
             against = "modified"
 
-        state = self._state_from(case, role)
+        state = self._state_from(case, role, seed_prereads=False)
         runner = self._runner(
             bool(case.get("use_llm", True)),
             journal=replay,
@@ -303,9 +501,19 @@ class ConsoleService:
             raise ValueError(f"未知角色: {role}")
         return role
 
-    def _state_from(self, payload: dict[str, Any], role: str) -> ClinicalRunState:
+    def _state_from(
+        self, payload: dict[str, Any], role: str, *, seed_prereads: bool = True
+    ) -> ClinicalRunState:
         """Build the run state. Shared by a live run and by its replay, so a
-        replay cannot accidentally be given different inputs than the recording."""
+        replay cannot accidentally be given different inputs than the recording.
+
+        ``seed_prereads`` attaches upload-time vision findings as cached reads.
+        It must be off for any journaled run — recording or replay — because the
+        pre-read cache is ephemeral process state: a recording that skipped the
+        vision call because a pre-read happened to exist would replay differently
+        on a process where it does not, and a replay must re-derive from the
+        journal alone.
+        """
         complaint = str(payload.get("complaint") or "").strip()
         if not complaint:
             raise ValueError("请填写主诉")
@@ -319,7 +527,14 @@ class ConsoleService:
             max_llm_calls=int(payload.get("max_llm_calls", 40)),
         )
         state.enable_panel = bool(payload.get("enable_panel"))
-        state.images = _coerce_images(payload.get("images"))
+        state.images = _coerce_images(payload.get("images"), self.uploads)
+        if seed_prereads:
+            for image in state.images:
+                image_id = self._image_id_for(image["kind"], image["ref"])
+                image.setdefault("image_id", image_id)
+                preread = self._adopt_preread(image_id)
+                if preread is not None:
+                    image["cached_read"] = preread
         return state
 
     def _keep_recording(self, state: ClinicalRunState, payload: dict[str, Any], journal: Any) -> None:
@@ -332,6 +547,89 @@ class ConsoleService:
             }
             while len(self.recordings) > MAX_RECORDINGS:
                 self.recordings.pop(next(iter(self.recordings)))
+
+    def start_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Begin a turn in the background and return a job id to poll.
+
+        A turn is 13 sequential model calls. With a reasoning model at 15–30s each
+        that is three to seven minutes in one HTTP request, and the reported
+        symptom was exactly what that produces: 「出错了：Failed to fetch」 — the
+        browser's own message for a connection that died, not an error this server
+        ever sent. Colab's iframe proxy in particular will not hold a request open
+        that long.
+
+        Polling also buys the thing a multi-minute wait most needs: something to
+        look at. Each job carries its own :class:`~yaobi_harness.progress.ProgressSink`,
+        and the poll returns every event since the client's cursor — which agent
+        started, which tool it called, what came back, and what the model was
+        thinking. That is the stream; the reply itself still arrives whole at the
+        end, because it is composed by the last call of the turn and there is
+        nothing to stream before it exists.
+        """
+        job_id = f"job_{secrets.token_hex(8)}"
+        sink = progress.ProgressSink()
+        with self._sessions_lock:
+            # Runs are serialised by ``self._lock``, so a delta on one shared
+            # counter is this job's call count — plus any upload pre-read that
+            # happens to land mid-turn, which slightly overcounts a display
+            # number and nothing else.
+            self.jobs[job_id] = {"status": "running", "started": time.monotonic(),
+                                 "calls_at_start": self.llm.calls, "result": None,
+                                 "error": "", "sink": sink}
+            while len(self.jobs) > MAX_JOBS:
+                self.jobs.pop(next(iter(self.jobs)))
+
+        def work() -> None:
+            # Bound for the whole turn, on this thread. Everything the turn does
+            # — including the wave workers, which re-bind it explicitly — reports
+            # here and nowhere else, so two concurrent turns cannot cross-talk.
+            with progress.bound(sink):
+                try:
+                    result = self.chat(payload)
+                    with self._sessions_lock:
+                        self.jobs[job_id].update(status="done", result=result,
+                                                 calls_at_end=self.llm.calls)
+                except Exception as exc:  # noqa: BLE001 - a failed turn must not kill the thread
+                    logger.exception("chat job failed")
+                    sink.emit("error", "本轮失败", f"{type(exc).__name__}: {exc}")
+                    with self._sessions_lock:
+                        self.jobs[job_id].update(status="error", error=f"{type(exc).__name__}: {exc}",
+                                                 calls_at_end=self.llm.calls)
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"job_id": job_id, "status": "running"}
+
+    def poll_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Where a background turn has got to, and everything it has done since ``cursor``."""
+        job_id = str(payload.get("job_id") or "")
+        try:
+            cursor = int(payload.get("cursor") or 0)
+        except (TypeError, ValueError):
+            cursor = 0
+        with self._sessions_lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise ValueError("没有这个任务；可能已超时被清理，请重新发送")
+            snapshot = dict(job)
+        sink: progress.ProgressSink = snapshot["sink"]
+        elapsed = round(time.monotonic() - snapshot["started"], 1)
+        done = snapshot.get("calls_at_end", self.llm.calls) - snapshot["calls_at_start"]
+        events = sink.since(cursor)
+        out = {
+            "status": snapshot["status"],
+            "progress": {"llm_calls": max(0, done), "elapsed_s": elapsed},
+            "events": events,
+            # The client's next cursor. Taken from the last event actually sent
+            # rather than the sink's head, so an event emitted between the read
+            # and the response is delivered next time instead of being skipped.
+            "cursor": events[-1]["seq"] if events else cursor,
+            "dropped_events": sink.dropped,
+        }
+        if snapshot["status"] == "done":
+            out.update(snapshot["result"] or {})
+        elif snapshot["status"] == "error":
+            out["error"] = snapshot["error"]
+        return out
 
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """One conversation turn. Creates the session on the first message."""
@@ -361,8 +659,15 @@ class ConsoleService:
                 while len(self.sessions) > MAX_SESSIONS:  # bound memory on a long-lived console
                     self.sessions.pop(next(iter(self.sessions)))
 
-        for image in _coerce_images(payload.get("images")):
-            session.attach_image(image["ref"], kind=image["kind"], deidentified=image["deidentified"])
+        for image in _coerce_images(payload.get("images"), self.uploads):
+            entry = session.attach_image(image["ref"], kind=image["kind"],
+                                         deidentified=image["deidentified"])
+            # If the film was pre-read when it was uploaded, hand the finding to
+            # the session before the run starts: this turn's VisionAgent then
+            # replays it instead of making the read the turn's slowest step.
+            preread = self._adopt_preread(str(entry.get("image_id") or ""))
+            if preread is not None:
+                session.seed_image_read(entry["image_id"], preread)
 
         with self._lock:
             reply = session.send(message)
@@ -370,8 +675,45 @@ class ConsoleService:
             "session_id": session.session_id,
             "interview": session.interview.summary(session.facts, session.complaint, role=session.role),
             "reply": reply.to_dict(),
+            # Surfaced at the top level as well as inside ``reply``: the page opens
+            # its upload module from this, and a client that only reads the envelope
+            # should not have to know where the request came from.
+            "image_requests": reply.image_requests,
+            "clinical_note": reply.clinical_note,
             "audit": console_payload(session.state, session.role)["audit"] if session.state else {},
             "meta": console_payload(session.state, session.role)["meta"] if session.state else {},
+            "turn_count": len(session.turns),
+        }
+
+    def open_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Start a conversation with the agent speaking first.
+
+        The page calls this before the patient has typed anything. A blank box and
+        a blinking cursor is the worst possible history-taking prompt: it gets
+        「腰」 where an opening question gets 「腰痛一个月，还乏力」.
+        """
+        from ..conversation import ConversationSession
+
+        role = self._role_of(payload, default="patient")
+        with self._sessions_lock:
+            session = ConversationSession(
+                role=role,
+                runner=self._runner(
+                    bool(payload.get("use_llm", True)),
+                    panel_concurrency=_coerce_concurrency(payload.get("panel_concurrency")),
+                ),
+                allow_prescription=bool(payload.get("allow_prescription")),
+            )
+            self.sessions[session.session_id] = session
+            while len(self.sessions) > MAX_SESSIONS:
+                self.sessions.pop(next(iter(self.sessions)))
+        reply = session.open()
+        return {
+            "session_id": session.session_id,
+            "reply": reply.to_dict(),
+            "interview": session.interview.summary({}, "", role=session.role),
+            "audit": {},
+            "meta": {},
             "turn_count": len(session.turns),
         }
 
@@ -417,6 +759,56 @@ class ConsoleService:
             ],
             "classes": {name: list(members) for name, members in ortho_interactions.DRUG_CLASSES.items()},
         }
+
+
+class _CountingLLM:
+    """Counts completed model calls and publishes each one to the progress stream.
+
+    Installed **once**, around the service's own client, because that is the only
+    object every caller shares. Wrapping the session's client instead counted 1 of
+    13: the runner binds the client into each agent at construction, so eleven of
+    the calls never went through the session's reference at all.
+
+    The call is labelled with whatever agent is bound to the calling thread, which
+    is what turns 「13 次调用」 from a number into a readable trace. The model's own
+    reasoning rides along on the closing event: a non-streaming endpoint cannot
+    give a thought stream, but it can give the thought.
+
+    A pass-through on every other attribute — the runner reads ``available``,
+    ``name`` and ``model`` off the client, and a wrapper that hid them would change
+    which path the run takes, which is the last thing a progress indicator should do.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._lock = threading.Lock()
+        self.calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def chat(self, *args: Any, **kwargs: Any) -> Any:
+        who = progress.label() or "模型"
+        started = time.monotonic()
+        progress.emit("llm", who, "思考中…")
+        response = None
+        try:
+            response = self._inner.chat(*args, **kwargs)
+            return response
+        finally:
+            with self._lock:
+                self.calls += 1
+            progress.emit(
+                "llm_done", who,
+                # The answer itself is not streamed here; it reaches the page as
+                # the turn's reply. What the stream adds is the part that is
+                # otherwise invisible — that the call landed, and what the model
+                # was thinking while it did.
+                "已返回" if response is not None else "调用失败",
+                reasoning=getattr(response, "reasoning", "") or "",
+                elapsed_s=round(time.monotonic() - started, 2),
+                tokens=getattr(response, "total_tokens", 0) or None,
+            )
 
 
 def _env_concurrency() -> int:
@@ -475,18 +867,37 @@ def _persona_catalog() -> list[dict[str, Any]]:
     ]
 
 
-def _coerce_images(raw: Any) -> list[dict[str, Any]]:
+def _coerce_images(raw: Any, uploads: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Validate inbound image attachments from the browser.
+
+    Two shapes are accepted. A ``handle`` refers to something already uploaded
+    through ``/api/image/upload`` and is what the console sends — the bytes never
+    travel again. An inline ``ref`` (a ``data:`` URI or a local path) still works
+    for the CLI, for tests, and for a notebook that has a file on disk; it is
+    bounded by the ordinary body limit, which is why the console does not use it
+    for films.
 
     The de-identification attestation must be explicit: a payload that omits it is
     rejected rather than defaulted, because defaulting it to ``true`` would let a
-    forgotten checkbox send an identifiable image to a third-party model.
+    forgotten checkbox send an identifiable image to a third-party model. An
+    uploaded handle already carries the attestation made at upload time.
     """
     from ..vision.client import IMAGE_KINDS, MAX_IMAGE_BYTES
 
     images: list[dict[str, Any]] = []
     for entry in (raw or [])[:6]:
         if not isinstance(entry, dict):
+            continue
+        handle = str(entry.get("handle") or "").strip()
+        if handle:
+            stored = (uploads or {}).get(handle)
+            if stored is None:
+                raise ValueError(f"图片 {handle} 已失效，请重新上传（控制台只在内存里保留最近若干张）")
+            # The kind is the stored one, not the caller's: it is part of what the
+            # handle identifies, and the de-identification attestation was made
+            # against *that* kind at upload time.
+            images.append({"kind": stored["kind"], "ref": ConsoleService._data_uri(stored),
+                           "deidentified": True})
             continue
         ref = str(entry.get("ref") or "").strip()
         if not ref:
@@ -595,11 +1006,53 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._json({"error": message}, status)
 
-    def _read_json(self) -> dict[str, Any]:
+    def _read_body(self, limit: int) -> bytes:
+        """Read exactly ``Content-Length`` bytes, refusing anything over ``limit``.
+
+        Read in chunks rather than one ``rfile.read(length)``: an upload is tens
+        of megabytes and a single read of that size on a blocking socket is how
+        you get a request that appears to hang.
+
+        An over-limit body is **drained before the error is raised**. Rejecting on
+        the header alone and replying immediately leaves the client still writing
+        into a socket nobody is reading, which surfaces as a broken pipe on that
+        side — and in a browser that is another 「Failed to fetch」, the least
+        useful message available, in place of the one sentence that would have
+        explained it. Draining is bounded by :data:`MAX_UPLOAD_BYTES`; past that
+        the connection is closed instead, because at that point the sender is not
+        making a mistake worth being polite about.
+        """
         length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_BODY_BYTES:
-            raise ValueError("请求体过大")
-        raw = self.rfile.read(length) if length else b"{}"
+        if length > limit:
+            if length <= MAX_UPLOAD_BYTES:
+                self._drain(length)
+            else:
+                self.close_connection = True
+            raise ValueError(
+                f"请求体过大（{length // 1024} KB，上限 {limit // 1024} KB）。"
+                "图片请改用 /api/image/upload 上传后按 handle 引用。"
+            )
+        chunks: list[bytes] = []
+        remaining = length
+        while remaining > 0:
+            block = self.rfile.read(min(remaining, 1 << 20))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        return b"".join(chunks)
+
+    def _drain(self, length: int) -> None:
+        """Discard a request body we are about to refuse, so the reply gets through."""
+        remaining = length
+        while remaining > 0:
+            block = self.rfile.read(min(remaining, 1 << 20))
+            if not block:
+                return
+            remaining -= len(block)
+
+    def _read_json(self) -> dict[str, Any]:
+        raw = self._read_body(MAX_BODY_BYTES) or b"{}"
         try:
             payload = json.loads(raw.decode("utf-8") or "{}")
         except ValueError as exc:
@@ -628,10 +1081,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if not self._authorized():
             return self._error(401, "缺少或错误的访问令牌")
+        # Uploads are read before the JSON path: an X-ray is megabytes of raw
+        # bytes with no JSON envelope at all, and running it through
+        # ``_read_json`` is precisely the bug this endpoint exists to fix —
+        # 「出错了：请求体过大」 on the first question after attaching a film.
+        if path == "/api/image/upload":
+            return self._upload_image()
         try:
             payload = self._read_json()
         except ValueError as exc:
-            return self._error(400, str(exc))
+            # 413 for a size refusal, 400 for malformed JSON: a client that can
+            # retry smaller should be able to tell which it hit without parsing
+            # the message.
+            return self._error(413 if "请求体过大" in str(exc) else 400, str(exc))
         if path == "/api/run":
             return self._safely(lambda: self.service.run_case(payload))
         if path == "/api/replay":
@@ -640,9 +1102,50 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return self._safely(lambda: self.service.check_interactions(payload))
         if path == "/api/chat":
             return self._safely(lambda: self.service.chat(payload))
+        if path == "/api/chat/start":
+            return self._safely(lambda: self.service.start_chat(payload))
+        if path == "/api/chat/poll":
+            return self._safely(lambda: self.service.poll_chat(payload))
+        if path == "/api/chat/open":
+            return self._safely(lambda: self.service.open_chat(payload))
         if path == "/api/chat/reset":
             return self._safely(lambda: self.service.reset_chat(payload))
         return self._error(404, f"未知路径 {path}")
+
+    def _upload_image(self) -> None:
+        """Take one image as raw bytes and hand back a handle.
+
+        Raw, not base64-in-JSON. Base64 inflates by a third and the browser has
+        to build the whole string in memory first; a 12 MB film became a 16 MB
+        JSON body that the console rejected at its 256 KB control-traffic limit.
+        Sending the ``File`` blob straight through avoids both.
+
+        The de-identification attestation rides in a header because it must be
+        made *per upload* by whoever picked the file. It is the one thing on this
+        path a model cannot assert on someone's behalf.
+        """
+        from ..vision.client import IMAGE_KINDS
+
+        # The body is read *before* the headers are judged. Replying to a bad
+        # header while the client is still writing megabytes leaves it with a
+        # broken pipe instead of the explanation — which in a browser is another
+        # 「Failed to fetch」, the least useful message available.
+        try:
+            raw = self._read_body(MAX_UPLOAD_BYTES)
+        except ValueError as exc:
+            return self._error(413, str(exc))
+
+        kind = (self.headers.get("X-Image-Kind") or "other").strip()
+        if kind not in IMAGE_KINDS:
+            return self._error(400, f"未知图片类型: {kind}；支持 {list(IMAGE_KINDS)}")
+        if (self.headers.get("X-Deidentified") or "").strip().lower() not in ("1", "true", "yes"):
+            return self._error(
+                400, "上传前必须声明「已去标识化」：请先遮盖姓名、各类编号、日期、条码与人脸")
+        mime = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        try:
+            return self._json(self.service.store_image(raw, mime=mime, kind=kind))
+        except ValueError as exc:
+            return self._error(400, str(exc))
 
     def _safely(self, action) -> None:
         try:
@@ -723,9 +1226,17 @@ def serve(
     print(f"Yaobi 控制台已启动: {entry}")
     if token:
         print(f"  访问令牌 : {token}   （链接已包含；也可用 X-Yaobi-Token 头调用 API）")
-    print(f"  LLM      : {describe_client(service.llm)}")
+    # Colab prints this into a cell whose output is routinely committed to a
+    # repository, so the banner follows the same policy as the page: it answers
+    # "is a model driving this" without naming the vendor, unless asked to.
+    if show_model_identity():
+        print(f"  对话模型 : {describe_client(service.llm)}")
+        print(f"  视觉模型 : {service.vision.model if service.vision else '未配置（影像/舌象工具不可用）'}")
+    else:
+        print(f"  对话模型 : {'已连接' if getattr(service.llm, 'available', False) else '未配置（走确定性规则路径）'}"
+              f"   （设 YAOBI_SHOW_MODEL=1 显示厂商与模型名）")
+        print(f"  视觉模型 : {'已连接' if service.vision else '未配置（影像/舌象工具不可用）'}")
     print(f"  知识库   : {service.knowledge_store_path or '未配置（指南/药典证据为占位数据）'}")
-    print(f"  视觉模型 : {service.vision.model if service.vision else '未配置（影像/舌象工具不可用）'}")
     print(f"  会诊并发 : {service.panel_concurrency or _env_concurrency()} 线程（页面可逐次调整；1 为顺序执行）")
     print("  按 Ctrl+C 停止")
     tunnel = None

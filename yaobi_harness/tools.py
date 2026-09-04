@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import progress
 from .knowledge import ortho_interactions
 from .knowledge.store import KnowledgeStore
 from .llm.base import ToolSpec
@@ -104,6 +105,72 @@ class ToolResult:
         if self.is_stub:
             return EvidenceLevel.STUB.value
         return self.evidence_level
+
+
+#: Items of a list argument to show before summarising the rest as a count.
+SHOWN_ARG_ITEMS = 3
+
+_VOCABULARIES: dict[str, frozenset[str]] | None = None
+
+
+def _vocabularies() -> dict[str, frozenset[str]]:
+    """Closed vocabularies whose members are safe to print, by argument name.
+
+    Built lazily: ``interview.axes`` and the knowledge package both import from
+    here, so resolving these at module scope would be a cycle.
+    """
+    global _VOCABULARIES
+    if _VOCABULARIES is None:
+        from .interview.axes import AXES_BY_ID, TIERS
+        from .vision.client import IMAGE_KINDS
+
+        axis_ids = frozenset(AXES_BY_ID)
+        _VOCABULARIES = {
+            "axis_id": axis_ids,
+            "axis": axis_ids,
+            "tier": frozenset(TIERS),
+            "kind": frozenset(IMAGE_KINDS),
+            "conditions": frozenset(ortho_interactions.KNOWN_CONDITIONS),
+            "level": frozenset(e.value for e in EvidenceLevel),
+        }
+    return _VOCABULARIES
+
+
+def _tool_arg_preview(kwargs: dict[str, Any]) -> str:
+    """A one-line rendering of a tool call's arguments for the progress stream.
+
+    A value is printed only when it is a **member of a closed vocabulary this
+    code owns** — an axis id, an image kind, a tier, a known condition. Anything
+    else is reported by name and shape.
+
+    The earlier version allowlisted argument *names* (``topic``, ``pattern``,
+    ``medications``) and truncated their values. Both halves were wrong. The
+    names were a guess about which fields stay clean, and a model-driven tool
+    loop chooses its own arguments, so any field can receive anything. And the
+    truncation was measured in characters: twenty-four characters of Chinese is a
+    whole sentence, so 「我叫张三，住城东，身份证110101，腰痛三个月」 passed through
+    a 24-character cap completely intact — name, address and ID number.
+
+    Membership is checkable rather than guessable, and it fails in the safe
+    direction: an argument that is not in the vocabulary is simply not printed.
+    The tool's own name is what makes the stream readable anyway; a pharmacist
+    who needs the actual arguments has the evidence ledger, which is the
+    operator-only surface built for it.
+    """
+    vocabularies = _vocabularies()
+    parts: list[str] = []
+    for key, value in kwargs.items():
+        vocabulary = vocabularies.get(key)
+        items = list(value) if isinstance(value, (list, tuple)) else [value]
+        if vocabulary is not None and items and all(str(v) in vocabulary for v in items):
+            shown = "、".join(str(v) for v in items[:SHOWN_ARG_ITEMS])
+            rest = len(items) - SHOWN_ARG_ITEMS
+            parts.append(f"{key}={shown}" + (f"+{rest}" if rest > 0 else ""))
+        elif isinstance(value, (list, tuple, dict)):
+            parts.append(f"{key}[{len(value)}]")
+        elif value not in (None, "", False):
+            parts.append(key)
+    return ", ".join(parts)[:200]
 
 
 def _tool_result_to_dict(result: ToolResult) -> dict[str, Any]:
@@ -304,15 +371,23 @@ class ToolRegistry:
         cannot hand a patient-role replay a formula result, because the broker
         denies the call before the recorded result is ever reached. The journal
         supplies data, never permission.
+
+        Every exit reports itself to the progress stream — including the denied
+        and unknown-tool paths, which is the point: 「为什么模型没调用工具」 is
+        usually 「调用了，被技能策略拒了」, and a stream that showed only the
+        successful calls would hide exactly the case worth seeing.
         """
         allowed, reason = broker.allow(name)
         if not allowed:
             # Policy denials and budget exhaustion are *not* tool failures: they
             # must not trip the circuit breaker or consume budget.
+            progress.emit("tool_denied", name, reason, agent=progress.label())
             return ToolResult(name, False, reason, {"denied_reason": reason}, error=reason)
         if name not in self.tools:
+            progress.emit("tool_denied", name, "unknown_tool", agent=progress.label())
             return ToolResult(name, False, "unknown_tool", error="unknown_tool", recoverable=True)
 
+        progress.emit("tool", name, _tool_arg_preview(kwargs), agent=progress.label())
         journal = getattr(broker, "journal", None)
         if journal is not None:
             hit, recorded = journal.next_result("tool", name, kwargs)
@@ -323,9 +398,11 @@ class ToolRegistry:
                     broker.health.record_success(name)
                 elif not replayed.recoverable:
                     broker.health.record_failure(name)
+                progress.emit("tool_done", name, f"（重放）{replayed.summary}", ok=replayed.ok)
                 return replayed
 
         final = self._execute_with_retry(broker, name, kwargs)
+        progress.emit("tool_done", name, final.summary or final.error or "", ok=final.ok)
         if journal is not None:
             # Recorded once, on every exit path, and only the *final* result: a
             # replay reproduces the outcome the run acted on, not the transient

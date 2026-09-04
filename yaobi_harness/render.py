@@ -126,6 +126,9 @@ def _physician_view(state: ClinicalRunState) -> dict[str, Any]:
         "dose_safety": outputs.get("dose_safety"),
         "prescription_draft": outputs.get("prescription_draft"),
         "physician_review": outputs.get("physician_review"),
+        # The structured note. Present only once the consultation concluded; a
+        # note over an unfinished history would be a misleading document.
+        "clinical_note": outputs.get("clinical_note"),
         "urgent_action_plan": outputs.get("urgent_action_plan"),
         "safety_audit": outputs.get("safety_audit"),
         "safety_issues": state.safety_issues,
@@ -213,6 +216,7 @@ def console_payload(state: ClinicalRunState, role: str | None = None) -> dict[st
             # show "规则" and the operator cannot tell an unconfigured model from
             # a rejected proposal from output that failed to parse.
             "plan": state.outputs.get("plan", {}),
+            "clinical_note": state.outputs.get("clinical_note"),
             # Per-agent record of the model-driven tool loop: which tools it
             # chose, with what arguments, and whether it fell back.
             "autonomy": state.outputs.get("autonomy", {}),
@@ -226,6 +230,10 @@ def console_payload(state: ClinicalRunState, role: str | None = None) -> dict[st
             "safety_audit": state.outputs.get("safety_audit", {}),
             "safety_issues": state.safety_issues,
             "warnings": state.warnings,
+            # Informational remarks, kept out of ``warnings`` so a routine case
+            # does not read as alarming. This is where a triage disagreement lands:
+            # "the keyword screen said infection, the model said no, here is why".
+            "notes": list(getattr(state, "notes", [])),
             "citations": citation_bundle(state),
             "medication_safety": state.outputs.get("medication_safety", {}),
             "dose_safety": state.outputs.get("dose_safety", {}),

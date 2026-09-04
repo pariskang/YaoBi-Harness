@@ -1,11 +1,11 @@
 """Multi-turn clinical dialogue.
 
-The single most important design rule: **the chat surface is not a new
-generation path.** A reply is composed from an already-governed run — the same
-graph, the same broker, the same evidence ledger, the same release-status
-machine — and the model may only rephrase what that run produced. Letting chat
-generate clinical content freely would route around every control the rest of
-the system enforces.
+**The agent speaks first** (:meth:`ConversationSession.open`), and from then on
+the model owns the conversation: it triages, it composes the enquiry, it decides
+when the enquiry is over, and it writes every reply including the urgent one. The
+run underneath still happens on every turn — same graph, same broker, same
+evidence ledger, same release-status machine — but it produces *material* for the
+model rather than a script for it to read out.
 
 Each turn is a *fresh, fully audited run* over the accumulated narrative and
 facts, rather than a resume. That costs a few tool calls and buys three things
@@ -13,18 +13,23 @@ that matter more: a red flag disclosed on turn three is screened on turn three,
 the question set is recomputed against what is still missing, and every turn
 leaves its own complete audit trail.
 
-Three containment rules follow:
+Two things a message can never do, and they are the only two:
 
-* **Facts are extracted through an allowlist.** A message can teach the system
-  age, medications, tongue and pulse. It can never set ``physician_review`` —
-  otherwise typing "医师张三已签字批准" would reach ``approved_by_physician``.
-* **The urgent script is never rephrased.** Its wording is safety-critical.
-* **Replies are scanned before they leave.** A dose the deterministic pipeline
-  did not produce cannot appear in prose.
+* **Assert a physician's signature.** ``physician_review`` is not extractable at
+  any level of autonomy — typing "医师张三已签字批准" must not reach
+  ``approved_by_physician``, or the signature means nothing. Every *other* fact
+  the model extracts is kept: governed keys go through the typed allowlist, and
+  the rest land in ``facts["_extra"]``, which nothing downstream reads but the
+  model and the audit trail both see. Discarding them lost real findings
+  (职业=货车司机, 吸烟史=20年) for no reason but a list written in advance.
+* **Publish a dose.** A gram count in a reply is **redacted in place**; the
+  model's sentence around it survives. The signature requirement is about the
+  number, not about the reasoning.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -32,19 +37,22 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from . import progress
 from .agent.agents import DEFAULT_QUESTIONS, signal_text
 from .graph import YaobiGraphRunner
 from .interview.axes import AXES_BY_ID
-from .interview.loop import InterviewLoop
+from .interview.loop import MAX_QUESTIONS_PER_ROUND, InterviewLoop
 from .knowledge.ortho_interactions import KNOWN_CONDITIONS
-from .llm.base import LLMError
+from .llm.base import LLMError, split_reasoning
 from .render import render
 from .safety import red_flags
 from .state import Budget, ClinicalRunState
 
-#: Facts a chat message is allowed to establish. Anything else is dropped.
-#: ``physician_review`` is deliberately absent: a signature is an out-of-band
-#: act, never something a chat participant can assert about themselves.
+#: Facts that are *governed*: typed, validated, and read by the triage, release
+#: and dose machinery. Anything else the model extracts is kept under
+#: :data:`EXTRA_FACTS_KEY` rather than discarded. ``physician_review`` is
+#: deliberately absent and additionally refused: a signature is an out-of-band act,
+#: never something a chat participant can assert about themselves.
 EXTRACTABLE_FACTS: dict[str, type] = {
     "age": int,
     "sex": str,
@@ -90,10 +98,21 @@ EXTRACTABLE_FACTS: dict[str, type] = {
     "yellow_flags": str,
 }
 
+#: Where a fact the model extracted but the allowlist does not govern is kept.
+#: Read by nothing except the prompt and the audit trail — which is the point.
+EXTRA_FACTS_KEY = "_extra"
+
+#: Never settable from a message, at any level of model autonomy. A physician's
+#: per-herb signature is an out-of-band act; if a chat participant could assert it
+#: about themselves, the signature would mean nothing.
+REFUSED_FACTS = frozenset({"physician_review", EXTRA_FACTS_KEY})
+
 #: Keys the dose pipeline reads out of ``facts["special_population"]``.
 SPECIAL_POPULATION_KEYS = ("age", "pregnancy", "renal", "liver")
 
-#: Statuses where the conversation has nothing further to ask.
+#: Statuses where the *run* has reached an end state. Not the same as "the
+#: clinician has nothing left to ask" — the agent may still put a question during
+#: an emergency, and 「你现在还能自己走吗？」 is triage, not small talk.
 TERMINAL_STATUSES = {
     "urgent_action_plan", "draft_for_physician", "approved_by_physician",
     "blocked", "failed_closed",
@@ -136,20 +155,66 @@ yellow_flags
 - conditions 只能取自：{conditions}
 - **否定回答也是回答**：用户说"没有大小便问题"要抽成 bowel_bladder="否认"，
   说"晚上不痛"要抽成 night_pain="否认"。漏掉否定回答会让系统反复追问同一件事。
-- 绝不要输出上面列表以外的键。
+- 上面的字段有类型校验，会进入分诊与剂量链路，所以键名要写对。
+- **抽到清单以外但临床上有价值的信息，照样写出来**（如 smoking、bmi、
+  previous_imaging、family_history、work_posture 之类，键名你自己起）。
+  它们会作为补充信息保留下来并在后续轮次回到你手上，不会被丢弃。
 
 只输出 JSON 对象，例如：{{"age": 63, "medications": ["布洛芬"], "medications_confirmed": true}}"""
 
-REPLY_SYSTEM_PROMPT = """你是骨科智能体的对话表达层。把系统**已经产出**的结论改写成自然、得体的中文，面向{role}。
+REPLY_SYSTEM_PROMPT = """你是骨科智能体，正在直接和{role}对话。**这段回复由你写**，不是让你润色模板。
 
-绝对约束：
-1. 只能复述给定材料里的内容。**不得新增任何诊断、治疗建议或药物。**
-2. **不得出现任何剂量数值**（克/g/mg）。
-3. 不得弱化或省略安全提示与免责声明。
-4. 材料里有待追问的问题时，自然地引出，不要生硬罗列编号。
-5. 简洁：正文控制在 6 句以内。
+材料里给了你这一轮运行的结果：分诊判断、鉴别方向、用药筛查、待追问的问题、安全提示。
+这些是**你的工作产物和参考资料**，你按临床判断决定说什么、按什么顺序说、哪些值得强调、
+哪些这一轮不必提。你可以补充材料里没有但你认为该说的临床解释、鉴别思路、自我照护要点。
 
-只输出改写后的正文纯文本，不要 JSON，不要 markdown 标题。"""
+写法：
+
+1. **像医生说话。** 先回应对方最关心的事，再讲你的判断和理由。不要罗列编号清单。
+2. **说清不确定性。** 线上不能确诊，该说的就说；但不要每句都加免责套话。
+3. **该紧急就紧急。** 如果分诊是急症，第一句就要让对方知道要立刻做什么；
+   如果不是急症，不要用急症口吻——对慢性腰痛说"立即拨打120"会让人不再相信你。
+4. **把要问的问题自然带进去。** 材料里的 `questions` 是你上一步自己拟的，
+   照你的原话问，不要改写成别的问题。
+   材料里如果有 `image_requests`，说明你上一步请求了图片——在回复里自然地说明
+   要拍什么、为什么，并提醒对方**上传前先遮盖姓名、各类编号、日期、条码与人脸**。
+   界面会自动打开上传模块并预选类型。
+5. **不写具体药名剂量。** 处方必须走医师逐味审核签名的流程，这是法定环节，
+   不是表达偏好。其余内容你怎么写都可以。
+6. 长度自便，通常 4–8 句最合适。
+
+只输出正文纯文本，不要 JSON，不要 markdown 标题。"""
+
+OPENING_SYSTEM_PROMPT = """你是骨科门诊的问诊智能体，现在是**你先开口**——对方还没有说任何话。
+
+写一段简短的开场：说明你是谁、能帮什么、然后问出第一个问题。第一个问题应当是开放的
+（"你哪里不舒服？是什么时候开始的？"这一类），让对方能自己讲，而不是让他做选择题。
+
+要求：不超过 3 句；不要罗列免责条款；不要在还不知道任何情况时就提任何诊断或药物。
+只输出正文纯文本。"""
+
+#: Used when there is no model to write the opening. Deliberately the same shape
+#: as what the model is asked for: a greeting and one open question.
+DEFAULT_OPENING = (
+    "你好，我是骨科问诊助手，先了解一下你的情况，再帮你判断需不需要线下检查。\n"
+    "你哪里不舒服？是什么时候开始的？"
+)
+
+
+#: Sentence boundaries that end a Chinese or English sentence. Used to pull the
+#: questions out of an opening the model wrote as flowing prose — splitting on
+#: lines would fuse "你好，我是骨科助手。你哪里不舒服？" into a single "question".
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?\n])")
+
+
+def questions_in(text: str) -> list[str]:
+    """The interrogative sentences in a block of prose, in order."""
+    found = []
+    for part in _SENTENCE_SPLIT_RE.split(text or ""):
+        sentence = part.strip()
+        if sentence.endswith(("？", "?")) and sentence not in found:
+            found.append(sentence)
+    return found
 
 
 def now() -> str:
@@ -188,34 +253,68 @@ class AgentReply:
     interview: dict[str, Any] = field(default_factory=dict)
     #: Questions with their axis and tier, for a surface that wants to group them.
     structured_questions: list[dict[str, Any]] = field(default_factory=list)
+    #: Images the model asked for this turn. A surface should open its upload
+    #: module with ``kind`` preselected; the de-identification attestation stays
+    #: with the person uploading.
+    image_requests: list[dict[str, Any]] = field(default_factory=list)
+    #: The structured clinical note, once the consultation has concluded.
+    #: ``None`` on every earlier turn.
+    clinical_note: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 def coerce_facts(raw: Any, known_conditions: set[str] | None = None) -> tuple[dict[str, Any], list[str]]:
-    """Filter a proposed fact dict down to the allowlist.
+    """Sort a proposed fact dict into governed keys and everything else.
 
-    Returns ``(accepted, ignored_keys)``. Type mismatches are dropped rather
-    than coerced: a wrong type here would silently corrupt the triage or dose
-    inputs downstream, and a missing fact is far safer than a wrong one.
+    Returns ``(accepted, ignored_keys)``. Two different things happen to a key
+    that is not in :data:`EXTRACTABLE_FACTS`:
+
+    * :data:`REFUSED_FACTS` — ``physician_review`` and friends — is **dropped**.
+      A signature is an out-of-band act; typing "医师张三已签字批准" must not reach
+      ``approved_by_physician``, and that is the one place a hard filter earns its
+      keep.
+    * Anything else is kept under ``_extra``. It used to be thrown away, which
+      meant a model that correctly extracted 职业=货车司机 or 吸烟史=20年 had that
+      finding deleted — real clinical information, lost because it was not on a
+      list written before the conversation happened. ``_extra`` is never read by
+      the dose pipeline or the release-status machine; it goes back to the model
+      next turn and into the audit trail, which is where it belongs.
+
+    Type mismatches on a *governed* key are still dropped rather than coerced: a
+    wrong type there would silently corrupt triage or dose inputs, and a missing
+    fact is far safer than a wrong one. The rejected value still lands in
+    ``_extra`` so the information itself survives.
     """
     accepted: dict[str, Any] = {}
+    extra: dict[str, Any] = {}
     ignored: list[str] = []
     if not isinstance(raw, dict):
         return accepted, ignored
     conditions = known_conditions if known_conditions is not None else KNOWN_CONDITIONS
 
     for key, value in raw.items():
+        if key in REFUSED_FACTS:
+            ignored.append(key)
+            continue
         expected = EXTRACTABLE_FACTS.get(key)
-        if expected is None or value is None:
+        if expected is None:
+            if value is not None:
+                extra[key] = value
+            else:
+                ignored.append(key)
+            continue
+        if value is None:
             ignored.append(key)
             continue
         if expected is int and isinstance(value, bool):
             ignored.append(key)          # booleans are ints in Python; not here
+            extra[key] = value
             continue
         if not isinstance(value, expected):
             ignored.append(key)
+            extra[key] = value
             continue
         if key == "conditions":
             value = [c for c in value if isinstance(c, str) and c in conditions]
@@ -224,6 +323,8 @@ def coerce_facts(raw: Any, known_conditions: set[str] | None = None) -> tuple[di
         elif key in ("medications", "allergies"):
             value = [str(v).strip() for v in value if str(v).strip()]
         accepted[key] = value
+    if extra:
+        accepted[EXTRA_FACTS_KEY] = extra
     return accepted, ignored
 
 
@@ -518,6 +619,10 @@ class ConversationSession:
         self.turns: list[Turn] = []
         self.asked: list[str] = []
         self.images: list[dict[str, Any]] = []
+        #: Vision findings already obtained, keyed by attachment id. An image is
+        #: the one input to this system that cannot change between turns, so it
+        #: is read once and replayed thereafter.
+        self.image_reads: dict[str, dict[str, Any]] = {}
         self.state: ClinicalRunState | None = None
         self.llm = getattr(self.runner, "llm", None)
         # One interview loop for the whole conversation. This is what makes
@@ -529,11 +634,76 @@ class ConversationSession:
             skill_spec=getattr(self.runner, "skill_registry", None)
             and self.runner.skill_registry.specs.get("yaobi.interview"),
         )
+        # The interview needs to know whether an image it asks for can be read.
+        # Asking for an upload that nothing will look at wastes the patient's
+        # effort and their trust.
+        vision = getattr(getattr(self.runner, "tools", None), "vision", None)
+        self.interview.vision_available = bool(getattr(vision, "available", False))
         interview_agent = getattr(self.runner, "agents", {}).get("InterviewAgent")
         if interview_agent is not None:
             interview_agent.loop = self.interview
 
     # ------------------------------------------------------------------ public
+    def open(self) -> AgentReply:
+        """Speak first. The agent opens the consultation; nobody has said anything yet.
+
+        A clinician does not sit in silence waiting for the patient to start
+        reciting symptoms — they ask. Making the patient produce the first
+        complaint unprompted is not just cold, it produces worse histories: an
+        opening question gets "腰痛一个月，还乏力" where an empty box gets "腰".
+
+        No graph run happens here. There is nothing to screen yet, so screening
+        would be theatre, and a run over an empty narrative would emit a risk
+        judgement about no information at all.
+        """
+        if self.turns:
+            raise ValueError("对话已经开始，开场只能在第一轮之前调用")
+        text = self._authored_opening() or DEFAULT_OPENING
+        composer = "llm" if text != DEFAULT_OPENING else "template"
+        questions = questions_in(text)
+        self.asked += [q for q in questions if q not in self.asked]
+        self.turns.append(Turn("agent", text))
+        return AgentReply(
+            message=text,
+            questions=questions,
+            release_status="needs_more_information",
+            risk_mode="routine",
+            awaiting_answer=True,
+            composer=composer,
+            structured_questions=[
+                {"axis_id": "", "label": "开场", "tier": "CORE", "question": q,
+                 "why": "开放式开场，让对方自己讲", "options": [], "origin": composer}
+                for q in questions
+            ],
+        )
+
+    def _authored_opening(self) -> str | None:
+        """Ask the model for the opening. Budget and failures fall back silently."""
+        if self.llm is None or not getattr(self.llm, "available", False):
+            return None
+        # No run has happened yet, so there is no run state to charge. A scratch
+        # budget keeps the opening from being free — a session that opens itself a
+        # thousand times should still hit a wall.
+        budget = self.state.budget if self.state else self.budget_factory()
+        if budget is not None and not budget.reserve_llm():
+            return None
+        try:
+            with progress.activity("开场白"):
+                response = self.llm.chat(
+                    [
+                        {"role": "system", "content": OPENING_SYSTEM_PROMPT},
+                        {"role": "user", "content": json.dumps(
+                            {"role": self.role, "specialty": "骨科 / 腰痹"}, ensure_ascii=False)},
+                    ],
+                    temperature=0.5, max_tokens=300,
+                )
+            if budget is not None:
+                budget.charge_llm_tokens(response.total_tokens)
+        except (LLMError, Exception):  # noqa: BLE001 - an opening must never fail a session
+            return None
+        text, _ = split_reasoning(response.text or "")
+        return text.strip() or None
+
     def send(self, message: str) -> AgentReply:
         """Take one user message, run the graph, and return the agent's reply."""
         text = (message or "").strip()
@@ -613,6 +783,12 @@ class ConversationSession:
             if key == "conditions":
                 self.facts["conditions"] = sorted(set(self.facts.get("conditions", [])) | set(value))
                 continue
+            if key == EXTRA_FACTS_KEY:
+                # Accumulate across turns rather than replace. A finding from turn
+                # two must still be visible on turn five, or keeping it bought
+                # nothing.
+                self.facts[key] = {**self.facts.get(key, {}), **value}
+                continue
             self.facts[key] = value
         if population:
             self.facts["special_population"] = population
@@ -623,21 +799,84 @@ class ConversationSession:
         The attestation is stored with the attachment rather than assumed, so the
         run records who asserted de-identification. Bytes are not copied anywhere:
         ``ref`` is a path or a ``data:`` URI that the vision tool reads once.
+
+        Once. Each turn is a fresh run over the accumulated case, which is what
+        makes a red flag disclosed on turn three get screened on turn three — but
+        applied to images it meant the film attached on turn two was sent to the
+        multimodal model again on turns three, four and five. An image is the one
+        input in this system that cannot change, so re-reading it buys nothing and
+        costs a paid vision call every single turn. The finding is cached against
+        the attachment by :meth:`_remember_image_reads` and replayed instead.
         """
-        from .vision.client import IMAGE_KINDS
+        from .vision.client import IMAGE_KINDS  # noqa: PLC0415 - optional stack
 
         if kind not in IMAGE_KINDS:
             raise ValueError(f"未知图片类型 {kind!r}；支持 {list(IMAGE_KINDS)}")
-        entry = {"kind": kind, "ref": ref, "deidentified": bool(deidentified)}
+        entry = {"kind": kind, "ref": ref, "deidentified": bool(deidentified),
+                 "image_id": f"{kind}:{hashlib.sha256(ref.encode('utf-8')).hexdigest()[:16]}"}
+        # Attaching the same bytes as the same kind twice is one attachment. A
+        # client that re-sends its handles (a retried turn, a naive API caller)
+        # must not grow the list — six duplicates would crowd real images out of
+        # the per-run cap and repeat every finding in the aggregate.
+        for existing in self.images:
+            if existing.get("image_id") == entry["image_id"]:
+                return existing
         self.images.append(entry)
+        # So the model can see it already has the tongue photo and ask for the
+        # radiograph instead of asking for the same thing again.
+        if kind not in self.interview.attached_image_kinds:
+            self.interview.attached_image_kinds.append(kind)
         return entry
+
+    def seed_image_read(self, image_id: str, read: dict[str, Any]) -> None:
+        """Adopt a finding produced outside a run — e.g. pre-read at upload time.
+
+        The earliest moment the vision model can look at a film is the moment it
+        is uploaded, which is usually while the user is still typing their
+        question. A finding obtained then is cached here exactly as if a turn
+        had produced it, so ``VisionAgent`` replays it instead of paying for a
+        serial multimodal call in the middle of the turn. First finding wins:
+        a seed never overwrites what a run already recorded.
+        """
+        if image_id and isinstance(read, dict) and read:
+            self.image_reads.setdefault(str(image_id), dict(read))
+
+    def clinical_note(self) -> dict[str, Any] | None:
+        """The structured note for this conversation, or ``None`` if not concluded.
+
+        A convenience over ``state.outputs``: the note is produced by the run, so
+        this reads rather than recomputes. Recomputing would risk a second answer
+        that differs from the one already delivered.
+        """
+        return (self.state.outputs.get("clinical_note") if self.state else None)
+
+    def note_text(self) -> str:
+        note = self.clinical_note()
+        return (note or {}).get("text", "")
 
     def _run(self) -> ClinicalRunState:
         state = ClinicalRunState(complaint=self.complaint, role=self.role)
         state.facts.update(self.facts)
-        state.images = [dict(i) for i in self.images]
+        # The note wants the patient's own words per turn, not one fused string.
+        state.outputs["_narrative"] = list(self.narrative)
+        # Each attachment carries the finding from the turn it was read on, so the
+        # vision model sees each image exactly once per conversation.
+        state.images = [{**image, "cached_read": self.image_reads.get(image.get("image_id", ""))}
+                        for image in self.images]
+        # There is a next turn, so the graph may hold the diagnostic workup back
+        # until the interview has something worth reasoning from.
+        state.interactive = True
         state.budget = self.budget_factory()
-        return self.runner.run(state, allow_prescription=self.allow_prescription)
+        state = self.runner.run(state, allow_prescription=self.allow_prescription)
+        self._remember_image_reads(state)
+        return state
+
+    def _remember_image_reads(self, state: ClinicalRunState) -> None:
+        """Keep this turn's image findings so later turns replay rather than re-read."""
+        for read in (state.outputs.get("image_findings") or {}).get("reads", []):
+            image_id = str(read.get("_image_id") or "")
+            if image_id and image_id not in self.image_reads:
+                self.image_reads[image_id] = dict(read)
 
     def _hits(self) -> list[dict[str, Any]]:
         if not self.state:
@@ -650,14 +889,15 @@ class ConversationSession:
         budget = self.state.budget if self.state else self.budget_factory()
         if self.llm is not None and getattr(self.llm, "available", False) and budget.reserve_llm():
             try:
-                response = self.llm.chat(
-                    [
-                        {"role": "system", "content": EXTRACT_SYSTEM_PROMPT.format(
-                            conditions=", ".join(sorted(KNOWN_CONDITIONS)))},
-                        {"role": "user", "content": text},
-                    ],
-                    temperature=0.0, max_tokens=400, response_format_json=True,
-                )
+                with progress.activity("信息抽取"):
+                    response = self.llm.chat(
+                        [
+                            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT.format(
+                                conditions=", ".join(sorted(KNOWN_CONDITIONS)))},
+                            {"role": "user", "content": text},
+                        ],
+                        temperature=0.0, max_tokens=400, response_format_json=True,
+                    )
                 proposed = response.json(None)
             except (LLMError, Exception):  # noqa: BLE001 - extraction must never break a turn
                 proposed = None
@@ -676,7 +916,7 @@ class ConversationSession:
             accepted.setdefault(key, value)
         return accepted, sorted(set(ignored))
 
-    def _next_questions(self, limit: int = 3) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _next_questions(self, limit: int = MAX_QUESTIONS_PER_ROUND) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """The interview's questions for this turn, plus its own record.
 
         The questions come from :class:`~yaobi_harness.interview.loop.InterviewLoop`,
@@ -690,7 +930,11 @@ class ConversationSession:
         if questions:
             return questions, record
 
-        # An interview that ran and was satisfied has nothing to ask. Only fall
+        # The model was asked and chose to stop: respect that, and do not let the
+        # probe bank restart an enquiry the clinician just closed.
+        if record.get("composer") == "llm_complete":
+            return [], record
+        # No model, and the rules are satisfied: nothing left to ask. Only fall
         # back when no interview produced a decision at all — an LLM plan that
         # omitted the node, or a run that failed closed before reaching it.
         if (record.get("verdict") or {}).get("verdict") in ("achieved", "stalled", "cap_reached"):
@@ -707,19 +951,25 @@ class ConversationSession:
     def _compose(self, *, escalated: bool, extracted: dict[str, Any], ignored: list[str]) -> AgentReply:
         state = self.state
         delivered = render(state, self.role)
-        awaiting = state.release_status not in TERMINAL_STATUSES
-        # The interview record is read on every turn, including terminal ones: the
-        # interview node still ran, and its coverage and verdict belong in the
-        # audit trail even when there is nothing further to ask.
+        # The model's questions go out whatever the release status. Discarding
+        # them on a terminal status silenced the agent in exactly the situations
+        # where a question matters most — "你现在还能自己走吗？" during an emergency
+        # is triage, not small talk. Whether the *run* is finished and whether the
+        # *clinician* has more to ask are two different questions.
         record = dict(state.outputs.get("interview") or {})
-        structured = self._next_questions()[0] if awaiting else []
+        structured = self._next_questions()[0]
         questions = [q["question"] for q in structured]
+        awaiting = bool(questions) or state.release_status not in TERMINAL_STATUSES
 
-        body = self._template_reply(delivered, structured, escalated)
-        composer = "template"
-        rephrased = self._rephrase(body, delivered, questions)
-        if rephrased:
-            body, composer = rephrased, "llm_rephrase"
+        # The model writes the reply; the template is what happens when there is
+        # no model. The old order — template first, model allowed only to polish —
+        # is why an emergency read like a leaflet and a routine case read like an
+        # emergency: the words were never the model's.
+        template = self._template_reply(delivered, structured, escalated)
+        body, composer = template, "template"
+        authored = self._author(delivered, structured, escalated)
+        if authored:
+            body, composer = authored, "llm"
 
         return AgentReply(
             message=body,
@@ -736,6 +986,8 @@ class ConversationSession:
             composer=composer,
             interview=self._interview_meta(record),
             structured_questions=structured,
+            image_requests=[dict(r) for r in record.get("image_requests") or []],
+            clinical_note=state.outputs.get("clinical_note"),
         )
 
     def _interview_meta(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -752,13 +1004,18 @@ class ConversationSession:
             # Ids as well as labels: the console marks a required-but-open axis
             # differently from a merely open one, and it keys off the id.
             "blocking_axis_ids": verdict.get("blocking_axes", []),
+            # Required axes the reviewer closed against the keyword screen, with
+            # the quote each rests on. Surfaced because closing one is what lets a
+            # run reach a dose draft.
+            "closed_by_reviewer": verdict.get("closed_by_reviewer", []),
+            "image_requests": record.get("image_requests", []),
             "still_missing_axes": verdict.get("missing_labels", []),
             "contradictions": verdict.get("contradictions", []),
             "coverage_ratio": coverage.get("ratio", 0.0),
             "answered_axes": [AXES_BY_ID[a].label for a in coverage.get("answered", []) if a in AXES_BY_ID],
             "open_axes": [AXES_BY_ID[a].label for a in coverage.get("open", []) if a in AXES_BY_ID],
             "model_claimed_complete": bool(record.get("model_claimed_complete")),
-            "rejected": record.get("rejected", []),
+            "notes": record.get("notes", []),
         }
 
     def _template_reply(self, delivered: dict[str, Any], questions: list[dict[str, Any]], escalated: bool) -> str:
@@ -806,47 +1063,96 @@ class ConversationSession:
             lines.append(delivered["disclaimer"])
         return "\n".join(line for line in lines if line)
 
-    def _rephrase(self, body: str, delivered: dict[str, Any], questions: list[str]) -> str | None:
-        """Let the model polish wording — never add content.
+    def _author(
+        self, delivered: dict[str, Any], structured: list[dict[str, Any]], escalated: bool
+    ) -> str | None:
+        """Let the model write this turn's reply. ``None`` means it did not run.
 
-        Rejected outright if it contains a dose or comes back empty; rejection
-        simply keeps the template text, so the conversation never depends on the
-        model behaving. The urgent script is never sent here at all: its wording
-        is safety-critical and must not drift.
+        The whole run is handed over as material — triage, differentials,
+        medication findings, the questions the model itself composed a step
+        earlier, the safety notices. What comes back is used as written, with two
+        additions and no substitutions: a dose is redacted in place (the
+        prescription signature flow is a legal gate, not a wording preference),
+        and the emergency instruction is appended if the model wrote an urgent
+        reply without one.
         """
         if self.llm is None or not getattr(self.llm, "available", False):
             return None
-        if self.state.risk_mode == "urgent":
-            return None
         if not self.state.budget.reserve_llm():
             return None
+
+        intake = dict(self.state.outputs.get("intake") or {})
+        screening = dict(intake.get("screening") or {})
+        material = {
+            "role": self.role,
+            "narrative_so_far": self.narrative[-6:],
+            "known_facts": {k: v for k, v in self.facts.items() if k != "physician_review"},
+            "triage": {
+                "level": screening.get("triage_level", self.state.risk_mode),
+                "decided_by": screening.get("triage_by", "rule"),
+                "reason": screening.get("triage_reason", ""),
+                "rule_keyword_hits": [h.get("signal") for h in screening.get("hits") or []],
+                "your_own_signals": screening.get("model_signals") or [],
+                "escalated_this_turn": escalated,
+            },
+            "release_status": self.state.release_status,
+            "differentials": (delivered.get("what_this_might_be")
+                              or (delivered.get("biomedical") or {}).get("differentials") or []),
+            "next_steps": delivered.get("what_to_do_next") or [],
+            "medication_findings": delivered.get("medication_warnings") or [],
+            "urgent_plan": delivered.get("urgent") or {},
+            "questions": [q["question"] for q in structured],
+            "image_requests": [
+                dict(r) for r in
+                ((self.state.outputs.get("interview") or {}).get("image_requests") or [])
+            ],
+            "safety_notices": list(self.state.safety_issues),
+            "notes": list(getattr(self.state, "notes", [])),
+            "disclaimer": delivered.get("disclaimer", ""),
+        }
         try:
-            response = self.llm.chat(
-                [
-                    {"role": "system", "content": REPLY_SYSTEM_PROMPT.format(role=self.role)},
-                    {"role": "user", "content": json.dumps(
-                        {
-                            "release_status": self.state.release_status,
-                            "draft_reply": body,
-                            "questions": questions,
-                            "disclaimer": delivered.get("disclaimer", ""),
-                        },
-                        ensure_ascii=False,
-                    )},
-                ],
-                temperature=0.2, max_tokens=600,
-            )
+            with progress.activity("撰写回复"):
+                response = self.llm.chat(
+                    [
+                        {"role": "system", "content": REPLY_SYSTEM_PROMPT.format(role=self.role)},
+                        {"role": "user", "content": json.dumps(material, ensure_ascii=False)},
+                    ],
+                    temperature=0.4, max_tokens=900,
+                )
             self.state.budget.charge_llm_tokens(response.total_tokens)
         except (LLMError, Exception):  # noqa: BLE001
-            self.state.warn("回复改写失败，使用模板回复")
+            self.state.warn("模型撰写回复失败，使用模板回复")
             return None
 
-        text = (response.text or "").strip()
+        # A reasoning model's scratch pad must not reach a patient. Providers
+        # already split it off; this covers a custom client that does not.
+        text, reasoning = split_reasoning(response.text or "")
+        text = text.strip()
+        if reasoning and not text:
+            self.state.warn("模型只返回了思考过程，没有正文，已使用模板回复")
+            return None
         if not text:
             return None
+        return self._finalise(text, delivered)
+
+    def _finalise(self, text: str, delivered: dict[str, Any]) -> str:
+        """Additions only. Nothing the model wrote is removed except a dose.
+
+        Redacting the number rather than discarding the reply is the whole
+        difference between a legal gate and censorship: the patient still gets the
+        model's reasoning, they just do not get a gram count nobody has signed for.
+        """
         if DOSE_RE.search(text):
-            self.state.warn("模型改写的回复中出现剂量数值，已丢弃并使用模板回复")
-            return None
+            text = DOSE_RE.sub("（具体剂量需医师审核后给出）", text)
+            self.state.note("回复中的剂量数值已隐去：含剂量内容必须经医师逐味审核签名后发布")
+        urgent = delivered.get("urgent") or {}
+        if self.state.risk_mode == "urgent" and urgent.get("immediate_action"):
+            # Appended, not substituted: if the model already said it, this adds
+            # nothing; if it did not, the instruction still reaches the patient.
+            if urgent["immediate_action"][:8] not in text:
+                text = f"{text}\n{urgent['immediate_action']}"
+            if urgent.get("transport_advice") and urgent["transport_advice"][:8] not in text:
+                text = f"{text}\n{urgent['transport_advice']}"
         disclaimer = delivered.get("disclaimer", "")
         if disclaimer and disclaimer[:12] not in text:
             text = f"{text}\n{disclaimer}"

@@ -102,12 +102,16 @@ def rule_plan(state: ClinicalRunState) -> list[Task]:
     tasks = [
         Task("T1", "TimelineAgent", "标准化病历与时间线", ["patient_timeline_search"]),
         Task("T2", "IntakeAgent", "识别信息缺口和红旗", ["red_flag_evidence_search"]),
-        # The interview runs on every path, urgent included: an emergency still
-        # needs its cauda-equina questions asked, just fewer of everything else.
-        Task("T3", "InterviewAgent", "自主追问，评估病史充分性", ["interview_axis_lookup"], ["T2"]),
     ]
     if state.images:
+        # Before the interview, not after it. The read depends only on intake,
+        # and its ``suggest_ask`` exists to steer the questioning — scheduled
+        # after ``InterviewAgent`` it arrived one full turn late, so the model
+        # composed its questions blind to a film it already had.
         tasks.append(Task("T4", "VisionAgent", "判读随诊图片（非诊断）", ["medical_image_read"], ["T2"]))
+    # The interview runs on every path, urgent included: an emergency still
+    # needs its cauda-equina questions asked, just fewer of everything else.
+    tasks.append(Task("T3", "InterviewAgent", "自主追问，评估病史充分性", ["interview_axis_lookup"], ["T2"]))
     if state.risk_mode == "urgent":
         tasks += [
             Task("U1", "UrgentPlannerAgent", "急症假设、追问与资源预算"),
@@ -203,6 +207,10 @@ PLANNER_SYSTEM_PROMPT = """你是骨科临床决策系统的规划器。你只�
 3. depends_on 只能引用本次计划中已存在的 task_id，且不得构成环。
 4. 任务总数不超过 {max_tasks}。
 5. 安全审查节点由系统强制追加，你不需要也不应该省略其它必要的证据收集步骤。
+6. `attached_images` 非空时，患者已经上传了图片并在等你看。除非你有明确理由跳过，
+   否则请安排 VisionAgent（工具 medical_image_read）——上传了却没人看，比没上传更糟。
+   并且请把它排在 InterviewAgent **之前**：判读所见（可疑点、值得追问的问题）
+   要用来驱动本轮追问，排在问诊之后就晚了一整轮。
 
 只输出 JSON：{{"reasoning": "一句话说明取舍", "tasks": [
   {{"task_id": "P1", "agent": "AgentName", "objective": "本任务目标", "required_tools": [...], "depends_on": [...]}}
@@ -230,6 +238,16 @@ def build_planner_prompt(state: ClinicalRunState, skill_registry: Any | None = N
         "soft_signals": screening.get("soft_hits", []),
         "missing_information": state.missing_information,
         "known_facts": {k: v for k, v in state.facts.items() if k != "raw"},
+        # Attached images were missing from this context entirely, and the
+        # consequence was not subtle: a model-authored plan never scheduled
+        # ``VisionAgent``, so an uploaded X-ray was accepted, stored, and never
+        # looked at — 「上传 X 片无法自动解析」, with nothing anywhere saying why.
+        # The rule plan schedules the read whenever images exist; the model needs
+        # the same fact to make the same call.
+        "attached_images": [
+            {"kind": str(i.get("kind") or "other"), "deidentified": bool(i.get("deidentified"))}
+            for i in (state.images or [])
+        ],
         "agent_catalog": catalog,
         # What each skill is for, so the planner reasons about capabilities
         # rather than guessing from agent names alone.
@@ -401,7 +419,18 @@ class PlannerAgent:
             return [], f"llm_error:{type(exc).__name__}", []
         state.budget.charge_llm_tokens(response.total_tokens)
         diagnostics: list[str] = []
-        payload = response.json({})
+        from ..llm.base import extract_json_with_repairs
+
+        payload, repairs = extract_json_with_repairs(response.text, {})
+        if repairs:
+            # Noted on the state, not just in the diagnostics, because a *successful*
+            # plan that needed repairing is the interesting case: "unclosed" almost
+            # always means the plan hit max_tokens, which is a configuration fix
+            # rather than a model failure, and the operator cannot infer that from a
+            # task list that came out looking fine.
+            message = "规划输出经 JSON 修复后才可解析: " + "、".join(repairs)
+            diagnostics.append(message)
+            state.note(message)
         tasks = parse_plan(payload, diagnostics)
         if not tasks and not diagnostics:
             diagnostics.append(f"响应不含可解析内容（前 120 字）: {(response.text or '')[:120]!r}")

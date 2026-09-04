@@ -88,9 +88,62 @@ def build_client(provider: str | None = None, **overrides: Any) -> LLMClient:
     raise LLMError(f"unknown YAOBI_LLM_PROVIDER: {name!r}; expected azure|poe|minimax|litellm|none")
 
 
+#: Set to reveal which provider and model a run used in the console, the
+#: notebook and the startup banner. Off by default.
+#:
+#: Those three surfaces are the ones other people see — a screen share, a
+#: demo, a Colab notebook committed to a repository with its cell outputs still
+#: in it. Which vendor is behind a clinical assistant is a procurement and
+#: contractual matter, not something a passing screenshot should settle, and it
+#: is of no use whatsoever to the clinician reading the answer.
+#:
+#: What stays unredacted is everything an operator uses to *work*: the CLI, the
+#: logs, the journal file on disk. The journal in particular must keep the real
+#: model name — it is part of every request's content address, so an offline
+#: replay diverges on the name alone without it.
+SHOW_MODEL_ENV = "YAOBI_SHOW_MODEL"
+
+#: Keys that name a model or a vendor. Redaction works by key so a payload
+#: gains protection by being routed through :func:`redact_model_identity`,
+#: rather than by every new caller remembering which fields to strip.
+MODEL_IDENTITY_KEYS = frozenset({
+    "model", "provider", "llm_model", "llm_provider", "deployment", "base_url",
+})
+
+
+def show_model_identity() -> bool:
+    return os.environ.get(SHOW_MODEL_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def describe_client(client: LLMClient) -> dict[str, Any]:
+    """Full identity. For the CLI, the logs and the journal — never for a screen."""
     return {
         "provider": getattr(client, "name", "unknown"),
         "model": getattr(client, "model", "unknown"),
         "available": bool(getattr(client, "available", False)),
     }
+
+
+def redact_model_identity(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop vendor and model names from a payload bound for a screen.
+
+    A no-op when :data:`SHOW_MODEL_ENV` is set, so a developer can still see what
+    they are talking to without editing code.
+    """
+    data = dict(payload or {})
+    if show_model_identity():
+        return data
+    return {k: v for k, v in data.items() if k not in MODEL_IDENTITY_KEYS}
+
+
+def public_client_info(client: LLMClient) -> dict[str, Any]:
+    """What a browser or a notebook is told about the configured model.
+
+    Deliberately still answers the question that actually matters at a glance —
+    *is a model driving this run, or is it the deterministic path?* — because the
+    two produce very different consultations and confusing them is a real error.
+    It just does not name the vendor.
+    """
+    available = bool(getattr(client, "available", False))
+    return {**redact_model_identity(describe_client(client)),
+            "available": available, "configured": available}

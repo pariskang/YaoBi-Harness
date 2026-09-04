@@ -301,6 +301,19 @@ class Journal:
         }
 
     def summary(self) -> dict[str, Any]:
+        """A description of this journal, safe to hand to a screen.
+
+        ``meta`` is redacted here rather than at each caller, because there are
+        three of them — ``run_meta``, ``/api/run``'s journal block and
+        ``/api/replay``'s — and the first two were covered while the third
+        quietly kept publishing ``llm_model``. One seam, no exceptions.
+
+        :attr:`meta` itself is untouched: the recorded model name is part of
+        every request's content address, so :class:`JournaledLLM` needs the real
+        one and a replay diverges on the name alone without it.
+        """
+        from .llm.factory import redact_model_identity
+
         with self._lock:
             return {
                 "mode": self.mode,
@@ -310,7 +323,7 @@ class Journal:
                 "replayed": self.replayed,
                 "live_after_exhaustion": self.live_after_exhaustion,
                 "exhausted": self.mode == "replay" and self._cursor >= len(self.entries),
-                "meta": dict(self.meta),
+                "meta": redact_model_identity(self.meta),
             }
 
 

@@ -227,24 +227,46 @@ class IntakeAgent(BaseAgent):
 
         screening = dict(result.data)
         rule_hits = list(screening.get("hits", []))
+        soft_hits = list(screening.get("soft_hits", []))
 
-        # The model may only *add* signals; it can never clear a rule-based hit.
-        llm_signals = cognition.semantic_red_flag_signals(state, self.llm, rule_hits)
-        if llm_signals:
-            merged = red_flags.merge_llm_hits(
-                red_flags.ScreenResult(
-                    hits=[red_flags.RedFlagHit(**{**h, "source": h.get("source", "rule")}) for h in rule_hits],
-                    soft_hits=[],
-                ),
-                llm_signals,
+        # Triage is a clinical judgement, so the model makes it and the keyword
+        # screen supplies material. Treating a screen hit as the decision is what
+        # sent "腰痛1个月，乏力" to the emergency script: "乏力" matched a
+        # constitutional-symptom pattern for infection/tumour, and one month of
+        # back pain with fatigue is a clinic visit, not an ambulance.
+        decision = cognition.triage(state, self.llm, rule_hits, soft_hits)
+        rule_mode = "urgent" if rule_hits else "routine"
+
+        if decision and decision["triage"]:
+            state.risk_mode = "urgent" if decision["triage"] in ("urgent", "emergency") else "routine"
+            screening["triage_by"] = "llm"
+            screening["triage_level"] = decision["triage"]
+            screening["triage_reason"] = decision["reason"]
+            # Every disagreement in both directions is recorded. An auditor needs
+            # "the screen said infection, the model said no, here is why" far more
+            # than a tidy single verdict.
+            screening["disputed_rule_hits"] = decision["disputed"]
+            if state.risk_mode != rule_mode:
+                state.note(
+                    f"分诊由模型判定为 {decision['triage']}（规则关键词筛查倾向 {rule_mode}）："
+                    f"{decision['reason'] or '模型未给出理由'}"
+                )
+            # The model's own findings are its findings, kept apart from the
+            # screen's so the ledger never blurs a keyword match with a clinical
+            # inference.
+            screening["model_signals"] = decision["signals"]
+        else:
+            state.risk_mode = rule_mode
+            screening["triage_by"] = "rule"
+            screening["triage_level"] = "urgent" if rule_hits else "routine"
+            screening["triage_reason"] = (
+                "未配置模型或模型未作答，按规则关键词筛查结论处置" if rule_hits or soft_hits else ""
             )
-            screening["hits"] = [h.to_dict() for h in merged.hits]
-            screening["llm_added"] = len(merged.hits) - len(rule_hits)
+            screening["model_signals"] = []
+            screening["disputed_rule_hits"] = []
 
-        if screening.get("hits"):
-            state.risk_mode = "urgent"
-        elif screening.get("soft_hits"):
-            state.warn("存在待证实的弱风险信号，建议线下评估以排除结构性病因")
+        if state.risk_mode == "routine" and (soft_hits or screening["model_signals"]):
+            state.note("存在待证实的风险线索，已作为线索记录；如症状变化请线下评估")
 
         state.missing_information = missing_information(state.facts)
         # Questioning belongs to InterviewAgent, which composes it from the axis
@@ -309,6 +331,9 @@ class InterviewAgent(BaseAgent):
             state.facts, state.complaint,
             role=state.role, risk_mode=state.risk_mode,
             prescriptive=prescriptive, budget=state.budget,
+            # The rule plan runs the vision read before this node precisely so
+            # what the film shows can steer this round's questions.
+            image_findings=state.outputs.get("image_findings"),
         )
         verdict = round_result.verdict
         report = coverage(state.facts, state.complaint, role=state.role)
@@ -319,7 +344,10 @@ class InterviewAgent(BaseAgent):
             "verdict": verdict.to_dict() if verdict else {},
             "rounds_used": loop.rounds_used,
             "composer": round_result.composer,
-            "rejected": round_result.rejected,
+            "notes": round_result.notes,
+            # Images the model asked for. A surface opens its upload module from
+            # this; the de-identification attestation stays with the uploader.
+            "image_requests": [r.to_dict() for r in round_result.image_requests],
             "model_claimed_complete": round_result.model_claimed_complete,
             "_produced_by": "llm_interview_loop" if round_result.composer == "llm" else "probe_bank",
         }
@@ -438,6 +466,30 @@ class VisionAgent(BaseAgent):
         reads: list[dict[str, Any]] = []
         evidence_ids: list[str] = []
         for image in images[:6]:
+            cached = image.get("cached_read")
+            if cached:
+                # Read on an earlier turn. An image is the one input here that
+                # cannot change, so re-sending it to a paid multimodal endpoint on
+                # every subsequent turn bought nothing at all. The finding still
+                # enters this run's ledger — a citation must resolve inside the run
+                # that made it — but says which turn actually produced it.
+                from ..state import EvidenceLevel  # noqa: PLC0415 - avoid a cycle
+
+                evidence_ids.append(state.add_evidence(
+                    EvidenceLevel.MODEL.value, "medical_image_read",
+                    f"沿用已完成的判读（{cached.get('image_kind', 'other')}）",
+                    {**cached, "carried_forward": True},
+                ))
+                reads.append(dict(cached))
+                if cached.get("phi_detected"):
+                    # A PHI rejection is cached like any other read, so without
+                    # this the film stayed unread forever while every later turn
+                    # reported "image findings present" and said nothing.
+                    state.warn(
+                        "此前上传的图片因含可识别身份信息被拒绝判读，至今未被读取。"
+                        "请遮盖姓名/ID/日期/条码/人脸后重新上传。"
+                    )
+                continue
             result = tools.call(
                 broker, "medical_image_read",
                 image=str(image.get("ref") or ""),
@@ -452,6 +504,20 @@ class VisionAgent(BaseAgent):
                 state.warn(f"图片判读未完成: {result.summary}")
                 continue
             payload = dict(result.data)
+            if payload.get("configured") is False:
+                # A missing vision model returns ``ok=True`` — it is not a tool
+                # failure, nothing was retried, nothing broke. But it also means
+                # nobody looked at the film, and this agent recording a clean
+                # "read" of it was how an uploaded X-ray came to be accepted,
+                # stored and silently ignored. Say it out loud.
+                state.warn(
+                    f"未配置视觉模型，{len(images)} 张图片未被判读。"
+                    f"{payload.get('how_to_fix', '')}"
+                )
+                continue
+            # Stamped so the conversation can cache this finding against the
+            # attachment that produced it and never pay for the read twice.
+            payload["_image_id"] = str(image.get("image_id") or "")
             reads.append(payload)
             if payload.get("phi_detected"):
                 state.warn(
@@ -583,10 +649,44 @@ class UrgentPlannerAgent(BaseAgent):
 
 
 class UrgentCareAgent(BaseAgent):
+    """The emergency action plan. Written by the model when one is available.
+
+    It used to be a fixed template, and the template was the complaint: a patient
+    with one month of back pain and fatigue was told to call an ambulance in
+    wording that could not adapt, because the wording was not produced by anything
+    that had looked at the case. An emergency instruction that fires on routine
+    presentations trains people to ignore it, which is the opposite of safe.
+    """
+
     name = "UrgentCareAgent"
     skill_id = "yaobi.urgent_triage"
+    output_schema = "UrgentCarePlan"
+    output_key = "urgent_action_plan"
 
     def run(self, state, tools, broker):
+        screening = state.outputs.get("intake", {}).get("screening", {})
+        result = self.autonomous(
+            state, tools, broker,
+            objective="为本例撰写急症行动计划。紧急程度要与本例相称，写法见技能说明。",
+            context={
+                "chief_complaint": state.complaint,
+                "triage_level": screening.get("triage_level", state.risk_mode),
+                "triage_reason": screening.get("triage_reason", ""),
+                "triage_decided_by": screening.get("triage_by", "rule"),
+                "rule_keyword_hits": screening.get("hits", []),
+                "model_signals": screening.get("model_signals", []),
+                "disputed_rule_hits": screening.get("disputed_rule_hits", []),
+                "known_facts": {k: v for k, v in state.facts.items() if k != "physician_review"},
+                "location": state.facts.get("location", "中国大陆"),
+            },
+        )
+        if result is not None:
+            self.bind_autonomous_output(state, result, "urgent_action")
+            state.add_claim("urgent_action", "存在红旗信号，需线下急诊评估",
+                            result.citations or result.evidence_ids, confidence=0.85, origin="llm")
+            state.release_status = "urgent_action_plan"
+            return state
+
         guideline = tools.call(broker, "clinical_guideline_search", topic="acute low back pain and non-spine emergency red flags")
         guideline_id = record_tool(state, guideline)
         resource = tools.call(broker, "emergency_resource_lookup", location=state.facts.get("location", "中国大陆"))
@@ -1177,7 +1277,23 @@ class CriticAgent(BaseAgent):
         checks_run.append("red_flag_recheck")
         if state.risk_mode == "routine":
             rescreen = red_flags.screen(" ".join([state.complaint, json.dumps(state.facts, ensure_ascii=False)]))
-            if rescreen.hits:
+            screening = (state.outputs.get("intake") or {}).get("screening") or {}
+            already_weighed = {h.get("signal") for h in screening.get("hits") or []}
+            # A signal triage already looked at is not an unhandled one. Blocking on
+            # it here re-litigates a clinical decision that was made and recorded —
+            # the exact pattern that sent 「跌倒扭伤3个月」 to 「未通过安全审查」 after
+            # the model had weighed the fall and called it routine.
+            fresh = [h.signal for h in rescreen.hits if h.signal not in already_weighed]
+            if fresh:
+                issues.append(f"复核阶段发现未处理的红旗信号: {fresh[:3]}")
+                repair_requests.append({"agent": "IntakeAgent", "reason": "late_red_flag_detected"})
+            elif rescreen.hits and screening.get("triage_by") == "llm":
+                state.note(
+                    f"复核：规则关键词仍命中 {sorted(already_weighed)[:3]}，"
+                    f"分诊时模型已权衡并判为 {screening.get('triage_level', 'routine')}"
+                    f"（{screening.get('triage_reason', '')[:60]}）")
+            elif rescreen.hits:
+                # No model weighed them, so nobody did. Still a block.
                 issues.append(f"复核阶段发现未处理的红旗信号: {[h.signal for h in rescreen.hits][:3]}")
                 repair_requests.append({"agent": "IntakeAgent", "reason": "late_red_flag_detected"})
 
@@ -1225,3 +1341,80 @@ class CriticAgent(BaseAgent):
             if rng and dose is not None and not (rng[0] <= float(dose) <= rng[1]):
                 out.append(f"{herb.get('herb_name')}:{dose}g∉{rng}")
         return out
+
+
+# -------------------------------------------------------------------- summary
+
+class SummaryAgent(BaseAgent):
+    """Writes the structured clinical note, once the consultation has concluded.
+
+    Runs last and skips itself when the run has not concluded — a note over an
+    unfinished history is a misleading document, and producing one on every turn of
+    a dialogue would mean the note that matters is buried under five that do not.
+
+    The deterministic note is assembled first and handed to the model as material.
+    That ordering matters: it means the model is *editing a record built from the
+    run* rather than writing a record from a prompt, so a section it leaves out
+    falls back to what the run established instead of vanishing.
+    """
+
+    name = "SummaryAgent"
+    skill_id = "yaobi.clinical_summary"
+    output_schema = "ClinicalNoteSections"
+    output_key = "clinical_note"
+
+    def run(self, state, tools, broker):
+        from ..summary import build_note, is_concluded, redact_doses
+
+        if not is_concluded(state):
+            state.trace(self.name, "summary_skipped",
+                        output_summary=f"未结束（{state.release_status}），不生成病历摘要")
+            return state
+
+        note = build_note(state, narrative=state.outputs.get("_narrative"))
+        # The deterministic note is free and always produced. The *authored* one
+        # costs a model call, so in a dialogue it waits until the enquiry has
+        # actually stopped — otherwise a six-turn conversation pays for six notes
+        # and only the last is ever read. ``_narrative`` is present exactly when a
+        # conversation is driving the run, so a single-shot run (which has no next
+        # turn to wait for) is authored immediately.
+        mid_dialogue = state.outputs.get("_narrative") is not None and bool(state.open_questions)
+        if mid_dialogue:
+            state.outputs[self.output_key] = note.to_dict()
+            state.outputs[self.output_key]["text"] = note.to_text()
+            state.trace(self.name, "clinical_note_draft",
+                        output_summary="问诊仍在进行，先给确定性摘要；收尾时再由模型撰写")
+            return state
+
+        material = note.to_dict()
+        # ``run_id`` is bookkeeping the model has no use for, and putting it in a
+        # prompt makes the call unreplayable: request hashes cover content, so a
+        # per-run identifier means the same decision hashes differently every time.
+        # Same reasoning that kept the model name out of the request body.
+        material.pop("run_id", None)
+        result = self.autonomous(
+            state, tools, broker,
+            objective="把本次运行整理成结构化门诊病历摘要。逐节要求见技能说明。",
+            context={
+                "deterministic_note": material,
+                "release_status": state.release_status,
+                "risk_mode": state.risk_mode,
+                "role": state.role,
+            },
+        )
+        if result is not None and isinstance(result.output, dict):
+            # Section by section, and only where the model actually wrote something:
+            # an empty string from the model must not erase what the run knew.
+            for key, value in result.output.items():
+                if key in note.sections and isinstance(value, str) and value.strip():
+                    note.sections[key] = redact_doses(value.strip())
+            note.composed_by = "llm"
+
+        state.outputs[self.output_key] = note.to_dict()
+        state.outputs[self.output_key]["text"] = note.to_text()
+        state.trace(
+            self.name, "clinical_note",
+            output_summary=f"{note.composed_by} 撰写；{len(note.evidence_ids)} 条可放行证据",
+            evidence_ids=note.evidence_ids[:6],
+        )
+        return state

@@ -49,6 +49,8 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="replay a recorded journal instead of calling anything; diverging calls fail the run closed")
     run.add_argument("--panel-concurrency", type=int, metavar="N",
                      help="threads for the consult panel (default 4; 1 forces sequential)")
+    run.add_argument("--summary", action="store_true",
+                     help="print the structured clinical note as text instead of the JSON view")
 
     resume = sub.add_parser("resume", help="resume a checkpointed run")
     resume.add_argument("checkpoint")
@@ -373,16 +375,37 @@ def _chat_command(args) -> int:
             )
             if interview.get("blocking"):
                 print(f"   ↳ 必答未闭合: {'、'.join(interview['blocking'])}")
-            for note in interview.get("rejected", [])[:2]:
-                print(f"   ↳ 提问被拦下: {note}")
+            for note in interview.get("notes", [])[:2]:
+                print(f"   ↳ 提问记录: {note}")
+        for request in reply.image_requests or []:
+            print(f"   📷 请上传【{request.get('kind')}】: {request.get('why', '')}")
+            print("      上传前请遮盖姓名、各类编号、日期、条码与人脸；"
+                  "命令行用 --image kind:path 附加")
+        screening = ((reply.delivered or {}).get("intake") or {}).get("screening") or {}
+        if screening.get("triage_by") == "llm":
+            print(f"   ↳ 分诊: {screening.get('triage_level')}（模型判定）{screening.get('triage_reason', '')[:80]}")
+
+    # The agent opens. Waiting for the patient to recite a complaint into an
+    # empty prompt is both colder and worse at collecting a history.
+    opening = session.open()
+    print(f"\n🤖 {opening.message}")
+
+    def show_note() -> None:
+        note = session.clinical_note()
+        if not note:
+            return
+        print("\n" + "=" * 68)
+        print(session.note_text())
+        print("=" * 68)
 
     if args.message:
         for message in args.message:
             print(f"\n👤 {message}")
             show(session.send(message))
+        show_note()
     else:
-        print(f"腰痹智能体对话（角色={args.role}，模型={describe_client(llm)['provider']}）")
-        print("直接输入症状开始；输入 /quit 结束，/facts 查看已知信息。\n")
+        print(f"\n（角色={args.role}，模型={describe_client(llm)['provider']}）")
+        print("输入 /quit 结束，/facts 查看已知信息，/note 查看病历摘要。\n")
         while True:
             try:
                 message = input("👤 ").strip()
@@ -393,6 +416,12 @@ def _chat_command(args) -> int:
                 break
             if message == "/facts":
                 print(json.dumps(session.facts, ensure_ascii=False, indent=2))
+                continue
+            if message in ("/note", "/summary"):
+                if session.clinical_note():
+                    print(session.note_text())
+                else:
+                    print("本次问诊还没有得出结论，暂无病历摘要。")
                 continue
             if not message:
                 continue
@@ -656,7 +685,15 @@ def main(argv=None) -> int:
                               skill_dirs=getattr(args, "skill_dir", None), journal=journal,
                               panel_concurrency=getattr(args, "panel_concurrency", None))
     out = runner.run(state, allow_prescription=args.allow_prescription)
-    print(json.dumps(render(out, debug=args.debug_state), ensure_ascii=False, indent=2))
+    if getattr(args, "summary", False):
+        note = out.outputs.get("clinical_note")
+        if note:
+            print(note["text"])
+        else:
+            print(f"本次运行未得出结论（{out.release_status}），暂不生成病历摘要。", file=sys.stderr)
+            return 2
+    else:
+        print(json.dumps(render(out, debug=args.debug_state), ensure_ascii=False, indent=2))
     # A diverged replay has not reproduced the recording, so it must not exit 0:
     # a script that treats exit status as "the replay confirmed the decision"
     # would otherwise be told yes.

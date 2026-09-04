@@ -814,12 +814,32 @@ class ConversationSession:
             raise ValueError(f"未知图片类型 {kind!r}；支持 {list(IMAGE_KINDS)}")
         entry = {"kind": kind, "ref": ref, "deidentified": bool(deidentified),
                  "image_id": f"{kind}:{hashlib.sha256(ref.encode('utf-8')).hexdigest()[:16]}"}
+        # Attaching the same bytes as the same kind twice is one attachment. A
+        # client that re-sends its handles (a retried turn, a naive API caller)
+        # must not grow the list — six duplicates would crowd real images out of
+        # the per-run cap and repeat every finding in the aggregate.
+        for existing in self.images:
+            if existing.get("image_id") == entry["image_id"]:
+                return existing
         self.images.append(entry)
         # So the model can see it already has the tongue photo and ask for the
         # radiograph instead of asking for the same thing again.
         if kind not in self.interview.attached_image_kinds:
             self.interview.attached_image_kinds.append(kind)
         return entry
+
+    def seed_image_read(self, image_id: str, read: dict[str, Any]) -> None:
+        """Adopt a finding produced outside a run — e.g. pre-read at upload time.
+
+        The earliest moment the vision model can look at a film is the moment it
+        is uploaded, which is usually while the user is still typing their
+        question. A finding obtained then is cached here exactly as if a turn
+        had produced it, so ``VisionAgent`` replays it instead of paying for a
+        serial multimodal call in the middle of the turn. First finding wins:
+        a seed never overwrites what a run already recorded.
+        """
+        if image_id and isinstance(read, dict) and read:
+            self.image_reads.setdefault(str(image_id), dict(read))
 
     def clinical_note(self) -> dict[str, Any] | None:
         """The structured note for this conversation, or ``None`` if not concluded.

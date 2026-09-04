@@ -1869,7 +1869,8 @@ function syncImgLock() {
 
 function renderImages() {
   $("#imgList").replaceChildren(...PENDING_IMAGES.map((img, index) => {
-    const state = img.error ? `⚠ ${img.error}` : (img.handle ? img.kindLabel : "上传中…");
+    const state = img.error ? `⚠ ${img.error}`
+      : (img.handle ? (img.preread ? `${img.kindLabel} · 判读中` : img.kindLabel) : "上传中…");
     const fig = el(`<figure${img.error ? ' class="failed"' : ""}>
       <img alt="${esc(img.name)}" src="${img.preview}">
       <figcaption>${esc(state)}</figcaption>
@@ -1909,6 +1910,10 @@ async function addImages(files) {
       // after a three-minute turn that nothing could read the film is worse.
       if (data.vision_available === false) {
         entry.error = "已上传，但未配置视觉模型，本次不会判读";
+      } else if (data.preread) {
+        // The read started the moment the upload landed; by the time the
+        // question is typed the finding is usually already cached.
+        entry.preread = true;
       }
     } catch (e) {
       entry.error = e.message || "上传失败";

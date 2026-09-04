@@ -343,8 +343,14 @@ class InterviewLoop:
         risk_mode: str = "routine",
         prescriptive: bool = False,
         budget: Any | None = None,
+        image_findings: dict[str, Any] | None = None,
     ) -> InterviewRound:
         """Produce the next set of questions plus the adequacy verdict.
+
+        ``image_findings`` is what :class:`VisionAgent` saw on the attached
+        images this run — it is handed to the composing model so a film that
+        shows a suspicious cortical line changes what gets asked *this* round,
+        not the next one.
 
         The model is consulted on **every** round, including rounds the judge
         thinks are over. It used to be skipped whenever the verdict was
@@ -381,7 +387,7 @@ class InterviewLoop:
                 plan.suggested_probes.setdefault(axis_id, list(AXES_BY_ID[axis_id].probes))
 
         composed = self._compose(plan, facts, complaint, role=role, risk_mode=risk_mode,
-                                 budget=budget, verdict=verdict)
+                                 budget=budget, verdict=verdict, image_findings=image_findings)
         if composed is not None:
             questions, claimed, reasoning, notes = composed
             result.composer = "llm"
@@ -499,6 +505,7 @@ class InterviewLoop:
         risk_mode: str,
         budget: Any | None,
         verdict: Any | None = None,
+        image_findings: dict[str, Any] | None = None,
     ) -> tuple[list[InterviewQuestion], bool, str, list[str]] | None:
         """Ask the model to compose the round. ``None`` means it did not run."""
         if self.llm is None or not getattr(self.llm, "available", False):
@@ -524,6 +531,16 @@ class InterviewLoop:
             "round": self.rounds_used + 1,
             "vision_available": self.vision_available,
             "images_already_attached": list(self.attached_image_kinds),
+            # What the vision read saw on this run's images, so the questions can
+            # chase it. Only the parts that steer an enquiry travel: the full
+            # finding (with its non-diagnostic caveats) lives in the run output.
+            "image_findings": {
+                "observations": [str(o) for o in (image_findings.get("observations") or [])][:10],
+                "urgent_signals": [str(u) for u in (image_findings.get("urgent_signals") or [])][:6],
+                "questions_the_image_suggests": [
+                    str(s) for s in (image_findings.get("suggest_ask") or [])][:6],
+                "not_assessable": [str(n) for n in (image_findings.get("not_assessable") or [])][:6],
+            } if image_findings else {},
             # Advice, not an instruction. Nothing checks that the model acts on
             # it; an axis it keeps declining stays in the adequacy verdict, which
             # is where the consequence lives.

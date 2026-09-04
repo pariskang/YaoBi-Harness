@@ -1209,3 +1209,126 @@ class ModelIdentityRedactionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UploadPrereadTests(unittest.TestCase):
+    """The vision model is activated at the earliest possible moment: the upload.
+
+    Between clicking 上传 and finishing the question there are usually tens of
+    seconds — enough for the PHI pre-check and the read to complete in the
+    background. The turn then replays the finding from cache instead of paying a
+    serial multimodal call at its slowest point. The attestation gate is
+    unchanged: nothing reaches the store without the de-identification header.
+    """
+
+    class CountingVision:
+        available = True
+        model = "v"
+        chat_client = None
+        phi_precheck = True
+        borrowed = False
+
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, image, kind="other", context="", budget=None):
+            from yaobi_harness.vision.client import ImageRead
+
+            self.reads += 1
+            return ImageRead(image_sha256="a" * 64, image_kind=kind, readable=True,
+                             observations=["预判读：骨皮质连续"], model="v")
+
+    def _service(self):
+        service = ConsoleService()
+        service.vision = self.CountingVision()
+        service.tools.vision = service.vision
+        return service
+
+    def _upload(self, service, raw=b"fake-png-bytes", kind="radiograph"):
+        out = service.store_image(raw, mime="image/png", kind=kind)
+        # The pre-read runs on a background thread; tests wait for it the same
+        # way a turn does, through the record's completion event.
+        for record in list(service.image_prereads.values()):
+            record["done"].wait(5)
+        return out
+
+    def test_an_upload_starts_the_read_immediately(self):
+        service = self._service()
+        out = self._upload(service)
+        self.assertTrue(out["preread"])
+        self.assertEqual(service.vision.reads, 1)
+        (record,) = service.image_prereads.values()
+        self.assertIn("预判读：骨皮质连续", record["read"]["observations"])
+
+    def test_the_first_turn_replays_the_upload_read_for_free(self):
+        service = self._service()
+        out = self._upload(service)
+        result = service.chat({"message": "帮我看看片子，腰痛3个月", "use_llm": False,
+                               "images": [{"kind": "radiograph", "handle": out["handle"]}]})
+        self.assertEqual(service.vision.reads, 1, "the turn re-read a film pre-read at upload")
+        session = service.sessions[result["session_id"]]
+        self.assertIn("预判读：骨皮质连续",
+                      session.state.outputs["image_findings"]["observations"])
+
+    def test_a_one_shot_run_adopts_the_upload_read_too(self):
+        service = self._service()
+        out = self._upload(service)
+        result = service.run_case({"complaint": "腰痛3月，请看片子", "use_llm": False,
+                                   "images": [{"kind": "radiograph", "handle": out["handle"]}]})
+        self.assertEqual(service.vision.reads, 1)
+        self.assertIn("预判读：骨皮质连续",
+                      json.dumps(result, ensure_ascii=False))
+
+    def test_a_recorded_run_reads_fresh_so_the_journal_holds_the_call(self):
+        """A pre-read cache hit cannot be replayed: the cache is process state,
+        not journal content. A journaled run must make its calls for real."""
+        service = self._service()
+        out = self._upload(service)
+        service.run_case({"complaint": "腰痛3月，请看片子", "use_llm": False,
+                          "record_journal": True,
+                          "images": [{"kind": "radiograph", "handle": out["handle"]}]})
+        self.assertEqual(service.vision.reads, 2, "the recorded run silently used the pre-read")
+
+    def test_re_uploading_the_same_film_does_not_read_it_again(self):
+        service = self._service()
+        self._upload(service)
+        self._upload(service)
+        self.assertEqual(service.vision.reads, 1)
+
+    def test_no_vision_model_means_no_preread_and_says_so(self):
+        service = ConsoleService()
+        service.vision = None
+        service.tools.vision = None
+        out = service.store_image(b"fake", mime="image/png", kind="radiograph")
+        self.assertFalse(out["preread"])
+        self.assertEqual(service.image_prereads, {})
+
+    def test_the_preread_cache_is_bounded(self):
+        from yaobi_harness.ui.server import MAX_PREREADS
+
+        service = self._service()
+        for index in range(MAX_PREREADS + 4):
+            self._upload(service, raw=b"film-%d" % index)
+        self.assertLessEqual(len(service.image_prereads), MAX_PREREADS)
+
+    def test_a_preread_failure_falls_through_to_the_ordinary_read(self):
+        """A flaky endpoint at upload time must cost nothing but the retry."""
+        service = self._service()
+
+        original = service.vision.read
+        calls = {"n": 0}
+
+        def flaky(image, kind="other", context="", budget=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("端点抖动")
+            return original(image, kind=kind, context=context, budget=budget)
+
+        service.vision.read = flaky
+        out = self._upload(service)
+        self.assertTrue(out["preread"])
+        result = service.chat({"message": "帮我看看片子", "use_llm": False,
+                               "images": [{"kind": "radiograph", "handle": out["handle"]}]})
+        session = service.sessions[result["session_id"]]
+        self.assertIn("骨皮质连续",
+                      json.dumps(session.state.outputs.get("image_findings") or {}, ensure_ascii=False))

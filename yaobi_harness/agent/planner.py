@@ -102,12 +102,16 @@ def rule_plan(state: ClinicalRunState) -> list[Task]:
     tasks = [
         Task("T1", "TimelineAgent", "标准化病历与时间线", ["patient_timeline_search"]),
         Task("T2", "IntakeAgent", "识别信息缺口和红旗", ["red_flag_evidence_search"]),
-        # The interview runs on every path, urgent included: an emergency still
-        # needs its cauda-equina questions asked, just fewer of everything else.
-        Task("T3", "InterviewAgent", "自主追问，评估病史充分性", ["interview_axis_lookup"], ["T2"]),
     ]
     if state.images:
+        # Before the interview, not after it. The read depends only on intake,
+        # and its ``suggest_ask`` exists to steer the questioning — scheduled
+        # after ``InterviewAgent`` it arrived one full turn late, so the model
+        # composed its questions blind to a film it already had.
         tasks.append(Task("T4", "VisionAgent", "判读随诊图片（非诊断）", ["medical_image_read"], ["T2"]))
+    # The interview runs on every path, urgent included: an emergency still
+    # needs its cauda-equina questions asked, just fewer of everything else.
+    tasks.append(Task("T3", "InterviewAgent", "自主追问，评估病史充分性", ["interview_axis_lookup"], ["T2"]))
     if state.risk_mode == "urgent":
         tasks += [
             Task("U1", "UrgentPlannerAgent", "急症假设、追问与资源预算"),
@@ -205,6 +209,8 @@ PLANNER_SYSTEM_PROMPT = """你是骨科临床决策系统的规划器。你只�
 5. 安全审查节点由系统强制追加，你不需要也不应该省略其它必要的证据收集步骤。
 6. `attached_images` 非空时，患者已经上传了图片并在等你看。除非你有明确理由跳过，
    否则请安排 VisionAgent（工具 medical_image_read）——上传了却没人看，比没上传更糟。
+   并且请把它排在 InterviewAgent **之前**：判读所见（可疑点、值得追问的问题）
+   要用来驱动本轮追问，排在问诊之后就晚了一整轮。
 
 只输出 JSON：{{"reasoning": "一句话说明取舍", "tasks": [
   {{"task_id": "P1", "agent": "AgentName", "objective": "本任务目标", "required_tools": [...], "depends_on": [...]}}

@@ -331,6 +331,9 @@ class InterviewAgent(BaseAgent):
             state.facts, state.complaint,
             role=state.role, risk_mode=state.risk_mode,
             prescriptive=prescriptive, budget=state.budget,
+            # The rule plan runs the vision read before this node precisely so
+            # what the film shows can steer this round's questions.
+            image_findings=state.outputs.get("image_findings"),
         )
         verdict = round_result.verdict
         report = coverage(state.facts, state.complaint, role=state.role)
@@ -474,10 +477,18 @@ class VisionAgent(BaseAgent):
 
                 evidence_ids.append(state.add_evidence(
                     EvidenceLevel.MODEL.value, "medical_image_read",
-                    f"沿用本次对话中已完成的判读（{cached.get('image_kind', 'other')}）",
+                    f"沿用已完成的判读（{cached.get('image_kind', 'other')}）",
                     {**cached, "carried_forward": True},
                 ))
                 reads.append(dict(cached))
+                if cached.get("phi_detected"):
+                    # A PHI rejection is cached like any other read, so without
+                    # this the film stayed unread forever while every later turn
+                    # reported "image findings present" and said nothing.
+                    state.warn(
+                        "此前上传的图片因含可识别身份信息被拒绝判读，至今未被读取。"
+                        "请遮盖姓名/ID/日期/条码/人脸后重新上传。"
+                    )
                 continue
             result = tools.call(
                 broker, "medical_image_read",

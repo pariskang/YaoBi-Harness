@@ -1,7 +1,7 @@
 # YaoBi-Harness
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/psknlr/YaoBi-Harness/blob/main/notebooks/Yaobi_Harness_Colab.ipynb)
-[![Tests](https://img.shields.io/badge/tests-728%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-746%20passing-brightgreen)](tests/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -521,5 +521,5 @@ LangGraph 原生 interrupt/resume、医师审批 UI、中文指南的结构化�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests    # 728 个用例，无需 pytest 与网络
+python -m unittest discover -s tests    # 746 个用例，无需 pytest 与网络
 ```

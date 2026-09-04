@@ -67,6 +67,14 @@ MAX_JOBS = 40
 #: tool payloads and model text — clinical content — so the console keeps a short
 #: window in memory and never writes one to disk.
 MAX_RECORDINGS = 20
+#: Pre-read image findings kept before the oldest is evicted. Findings are small
+#: (structured text, no bytes) so the bound is about hygiene, not memory.
+MAX_PREREADS = 16
+#: How long a turn will wait for a pre-read that is still running. The pre-read
+#: started strictly earlier than the turn's own read would have, so waiting is
+#: never slower than reading fresh; the timeout only exists so a hung vision
+#: endpoint cannot hold a turn hostage forever.
+PREREAD_WAIT_S = 180.0
 
 logger = logging.getLogger("yaobi.ui")
 
@@ -129,6 +137,10 @@ class ConsoleService:
         #: size it to its own memory and a test can exercise eviction without
         #: allocating sixty megabytes to do it.
         self.max_upload_store_bytes = MAX_UPLOAD_STORE_BYTES
+        #: Findings pre-read at upload time, keyed by the conversation's image id.
+        #: Each record is ``{"done": Event, "read": dict|None, "error": str}``;
+        #: ``done`` is set when the background read finished either way.
+        self.image_prereads: dict[str, dict[str, Any]] = {}
 
     def store_image(self, raw: bytes, *, mime: str, kind: str) -> dict[str, Any]:
         """Accept one uploaded image and return a handle to it.
@@ -161,16 +173,85 @@ class ConsoleService:
 
         digest = hashlib.sha256(raw).hexdigest()
         handle = f"img_{hashlib.sha256(f'{kind}:{digest}'.encode()).hexdigest()[:16]}"
+        entry = {"raw": raw, "kind": kind, "sha256": digest,
+                 "bytes": len(raw), "mime": mime}
         with self._sessions_lock:
             self.uploads.pop(handle, None)   # re-upload counts as most recent
-            self.uploads[handle] = {"raw": raw, "kind": kind, "sha256": digest,
-                                    "bytes": len(raw), "mime": mime}
-            resident = sum(entry["bytes"] for entry in self.uploads.values())
+            self.uploads[handle] = entry
+            resident = sum(e["bytes"] for e in self.uploads.values())
             while resident > self.max_upload_store_bytes and len(self.uploads) > 1:
                 resident -= self.uploads.pop(next(iter(self.uploads)))["bytes"]
         return {"handle": handle, "sha256": digest, "bytes": len(raw),
                 "kind": kind, "mime": mime,
-                "vision_available": bool(getattr(self.vision, "available", False))}
+                "vision_available": bool(getattr(self.vision, "available", False)),
+                "preread": self._start_preread(entry)}
+
+    @staticmethod
+    def _image_id_for(kind: str, ref: str) -> str:
+        """The conversation's attachment id, computed the same way it computes it.
+
+        Must match :meth:`ConversationSession.attach_image` byte for byte — the
+        pre-read cache is keyed by this id, and a drifted formula would not fail,
+        it would silently stop ever hitting.
+        """
+        import hashlib
+
+        return f"{kind}:{hashlib.sha256(ref.encode('utf-8')).hexdigest()[:16]}"
+
+    def _start_preread(self, entry: dict[str, Any]) -> bool:
+        """Read an upload in the background, so the finding is ready before the question.
+
+        The earliest the vision model can be activated is the upload itself:
+        between clicking 上传 and finishing the question there are usually tens of
+        seconds, which is enough for the PHI pre-check and the read to complete.
+        By the time ``VisionAgent`` runs, the turn hits the cache instead of
+        paying a serial multimodal call mid-turn.
+
+        The attestation gate still holds — ``/api/image/upload`` refuses any
+        upload without the de-identification header, so everything stored here
+        was attested before it could be read. The PHI pre-check inside the read
+        is the second line, exactly as on the in-turn path.
+        """
+        vision = self.vision
+        if vision is None or not getattr(vision, "available", False):
+            return False
+        ref = self._data_uri(entry)
+        image_id = self._image_id_for(entry["kind"], ref)
+        record = {"done": threading.Event(), "read": None, "error": ""}
+        with self._sessions_lock:
+            if image_id in self.image_prereads:
+                return True  # same bytes, same kind: the earlier read stands
+            self.image_prereads[image_id] = record
+            while len(self.image_prereads) > MAX_PREREADS:
+                evicted = self.image_prereads.pop(next(iter(self.image_prereads)))
+                evicted["done"].set()  # a waiter on an evicted slot must not hang
+
+        def work() -> None:
+            try:
+                read = vision.read(ref, kind=entry["kind"])
+                record["read"] = {**read.to_dict(), "_image_id": image_id}
+            except Exception as exc:  # noqa: BLE001 - a failed pre-read just means a fresh read later
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                logger.warning("image pre-read failed: %s", record["error"])
+            finally:
+                record["done"].set()
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _adopt_preread(self, image_id: str, *, timeout: float = PREREAD_WAIT_S) -> dict[str, Any] | None:
+        """The pre-read finding for ``image_id``, waiting briefly if still running.
+
+        ``None`` means no pre-read exists or it failed; the caller falls through
+        to the ordinary in-turn read, which reports its own errors in the run.
+        """
+        with self._sessions_lock:
+            record = self.image_prereads.get(image_id)
+        if record is None:
+            return None
+        record["done"].wait(timeout)
+        read = record.get("read")
+        return dict(read) if isinstance(read, dict) else None
 
     @staticmethod
     def _data_uri(entry: dict[str, Any]) -> str:
@@ -307,7 +388,10 @@ class ConsoleService:
 
     def run_case(self, payload: dict[str, Any]) -> dict[str, Any]:
         role = self._role_of(payload, default="physician")
-        state = self._state_from(payload, role)
+        # A recorded run must make its vision calls for real so the journal holds
+        # them; see ``_state_from`` on why a pre-read cache hit cannot be replayed.
+        state = self._state_from(payload, role,
+                                 seed_prereads=not payload.get("record_journal"))
         journal = None
         if payload.get("record_journal"):
             from ..journal import Journal
@@ -372,7 +456,7 @@ class ConsoleService:
             case["facts"] = payload["facts"]
             against = "modified"
 
-        state = self._state_from(case, role)
+        state = self._state_from(case, role, seed_prereads=False)
         runner = self._runner(
             bool(case.get("use_llm", True)),
             journal=replay,
@@ -417,9 +501,19 @@ class ConsoleService:
             raise ValueError(f"未知角色: {role}")
         return role
 
-    def _state_from(self, payload: dict[str, Any], role: str) -> ClinicalRunState:
+    def _state_from(
+        self, payload: dict[str, Any], role: str, *, seed_prereads: bool = True
+    ) -> ClinicalRunState:
         """Build the run state. Shared by a live run and by its replay, so a
-        replay cannot accidentally be given different inputs than the recording."""
+        replay cannot accidentally be given different inputs than the recording.
+
+        ``seed_prereads`` attaches upload-time vision findings as cached reads.
+        It must be off for any journaled run — recording or replay — because the
+        pre-read cache is ephemeral process state: a recording that skipped the
+        vision call because a pre-read happened to exist would replay differently
+        on a process where it does not, and a replay must re-derive from the
+        journal alone.
+        """
         complaint = str(payload.get("complaint") or "").strip()
         if not complaint:
             raise ValueError("请填写主诉")
@@ -434,6 +528,13 @@ class ConsoleService:
         )
         state.enable_panel = bool(payload.get("enable_panel"))
         state.images = _coerce_images(payload.get("images"), self.uploads)
+        if seed_prereads:
+            for image in state.images:
+                image_id = self._image_id_for(image["kind"], image["ref"])
+                image.setdefault("image_id", image_id)
+                preread = self._adopt_preread(image_id)
+                if preread is not None:
+                    image["cached_read"] = preread
         return state
 
     def _keep_recording(self, state: ClinicalRunState, payload: dict[str, Any], journal: Any) -> None:
@@ -469,7 +570,9 @@ class ConsoleService:
         sink = progress.ProgressSink()
         with self._sessions_lock:
             # Runs are serialised by ``self._lock``, so a delta on one shared
-            # counter is exactly this job's call count.
+            # counter is this job's call count — plus any upload pre-read that
+            # happens to land mid-turn, which slightly overcounts a display
+            # number and nothing else.
             self.jobs[job_id] = {"status": "running", "started": time.monotonic(),
                                  "calls_at_start": self.llm.calls, "result": None,
                                  "error": "", "sink": sink}
@@ -557,7 +660,14 @@ class ConsoleService:
                     self.sessions.pop(next(iter(self.sessions)))
 
         for image in _coerce_images(payload.get("images"), self.uploads):
-            session.attach_image(image["ref"], kind=image["kind"], deidentified=image["deidentified"])
+            entry = session.attach_image(image["ref"], kind=image["kind"],
+                                         deidentified=image["deidentified"])
+            # If the film was pre-read when it was uploaded, hand the finding to
+            # the session before the run starts: this turn's VisionAgent then
+            # replays it instead of making the read the turn's slowest step.
+            preread = self._adopt_preread(str(entry.get("image_id") or ""))
+            if preread is not None:
+                session.seed_image_read(entry["image_id"], preread)
 
         with self._lock:
             reply = session.send(message)

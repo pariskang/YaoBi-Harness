@@ -658,3 +658,167 @@ class ImageIsReadOncePerConversationTests(unittest.TestCase):
         session.attach_image("data:image/png;base64,AA==", kind="tongue", deidentified=True)
         session.send("看看这两张")
         self.assertEqual(vision.reads, 2)
+
+
+class VisionRunsBeforeTheInterviewTests(unittest.TestCase):
+    """The film is read before the questions are composed, not after.
+
+    ``VisionAgent`` depends only on intake, and its ``suggest_ask`` exists to
+    steer the questioning. Scheduled after ``InterviewAgent`` — where it sat —
+    the finding arrived one full turn late: the model composed its questions
+    blind to a film it already had, and the patient answered a round of
+    questions the image had already answered.
+    """
+
+    def _plan_agents(self, **state_kwargs):
+        from yaobi_harness.agent.planner import rule_plan, validate_plan
+
+        state = ClinicalRunState(complaint="腰痛3月", role="physician", **state_kwargs)
+        tasks = rule_plan(state)
+        ok, problems = validate_plan(tasks, state)
+        self.assertTrue(ok, problems)
+        return [t.agent for t in tasks]
+
+    def test_vision_is_planned_before_the_interview(self):
+        agents = self._plan_agents(images=[{"kind": "radiograph", "ref": "data:image/png;base64,AA=="}])
+        self.assertIn("VisionAgent", agents)
+        self.assertLess(agents.index("VisionAgent"), agents.index("InterviewAgent"))
+
+    def test_no_images_means_no_vision_task(self):
+        self.assertNotIn("VisionAgent", self._plan_agents())
+
+    def test_the_interview_hands_the_findings_to_the_composer(self):
+        """The compose payload carries what the film showed, so this round's
+        questions can chase it."""
+        from yaobi_harness.interview.loop import InterviewLoop
+
+        seen: list[str] = []
+
+        class Recorder:
+            name, model, available = "r", "r", True
+
+            def chat(self, messages, **kwargs):
+                seen.append(json.dumps(messages, ensure_ascii=False))
+                return LLMResponse(text=json.dumps(
+                    {"adequate": False, "questions": [], "reason": "看过片子了"},
+                    ensure_ascii=False))
+
+        loop = InterviewLoop(Recorder())
+        loop.next_round(
+            {}, "腰痛3月", role="patient", budget=Budget(),
+            image_findings={
+                "observations": ["L1椎体上缘骨皮质可疑中断"],
+                "suggest_ask": ["近期有没有摔倒或搬重物？"],
+                "urgent_signals": [],
+            },
+        )
+        joined = "\n".join(seen)
+        self.assertIn("L1椎体上缘骨皮质可疑中断", joined)
+        self.assertIn("近期有没有摔倒或搬重物", joined)
+
+    def test_a_run_without_findings_sends_an_empty_block_not_a_crash(self):
+        from yaobi_harness.interview.loop import InterviewLoop
+
+        class Recorder:
+            name, model, available = "r", "r", True
+
+            def chat(self, messages, **kwargs):
+                return LLMResponse(text=json.dumps({"adequate": False, "questions": []}))
+
+        result = InterviewLoop(Recorder()).next_round({}, "腰痛3月", budget=Budget())
+        self.assertIsNotNone(result.verdict)
+
+
+class AttachmentIdempotenceTests(unittest.TestCase):
+    """Re-attaching the same image is one attachment, not six.
+
+    The page sends each handle once, but a retried turn or a naive API caller
+    re-sends what it has. Without the guard the duplicates crowd real images out
+    of the per-run cap and repeat every finding in the aggregate output.
+    """
+
+    def _session(self):
+        from yaobi_harness.conversation import ConversationSession
+        from yaobi_harness.graph import YaobiGraphRunner
+
+        return ConversationSession(role="patient", runner=YaobiGraphRunner(tools=ToolRegistry()))
+
+    def test_the_same_ref_and_kind_attach_once(self):
+        session = self._session()
+        first = session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        second = session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        self.assertEqual(len(session.images), 1)
+        self.assertIs(first, second)
+
+    def test_a_different_kind_is_a_different_attachment(self):
+        session = self._session()
+        session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        session.attach_image("data:image/png;base64,AA==", kind="tongue", deidentified=True)
+        self.assertEqual(len(session.images), 2)
+
+
+class SeededPrereadTests(unittest.TestCase):
+    """A finding obtained at upload time is adopted, and the turn pays nothing.
+
+    The earliest the vision model can be activated is the upload itself — the
+    read runs while the user is still typing. What the session needs is a way to
+    adopt that finding as if a turn had produced it.
+    """
+
+    class Quiet:
+        name, model, available = "s", "s", True
+
+        def chat(self, messages, **kwargs):
+            return LLMResponse(text=json.dumps({
+                "triage": "routine", "adequate": False, "workup_now": False,
+                "questions": [], "facts": {}, "message": "好的", "reply": "好的",
+            }, ensure_ascii=False))
+
+    def _session(self):
+        from tests.test_vision import ImageIsReadOncePerConversationTests as Base
+        from yaobi_harness.conversation import ConversationSession
+        from yaobi_harness.graph import YaobiGraphRunner
+
+        vision = Base.CountingVision()
+        runner = YaobiGraphRunner(tools=ToolRegistry(vision=vision), llm=self.Quiet())
+        return ConversationSession(role="patient", runner=runner), vision
+
+    def test_a_seeded_read_means_the_turn_makes_no_vision_call(self):
+        session, vision = self._session()
+        entry = session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        session.seed_image_read(entry["image_id"], {
+            "image_kind": "radiograph", "readable": True,
+            "observations": ["上传时已判读：骨皮质连续"], "requires_formal_read": True,
+        })
+        session.send("这是我的片子")
+        self.assertEqual(vision.reads, 0, "the turn re-read a film that was pre-read at upload")
+        findings = session.state.outputs["image_findings"]
+        self.assertIn("上传时已判读：骨皮质连续", findings["observations"])
+
+    def test_a_seed_never_overwrites_what_a_run_recorded(self):
+        session, _ = self._session()
+        entry = session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        session.send("看片子")
+        recorded = dict(session.image_reads[entry["image_id"]])
+        session.seed_image_read(entry["image_id"], {"observations": ["别的东西"]})
+        self.assertEqual(session.image_reads[entry["image_id"]], recorded)
+
+    def test_an_empty_seed_is_ignored(self):
+        session, _ = self._session()
+        session.seed_image_read("radiograph:abc", {})
+        session.seed_image_read("", {"observations": ["x"]})
+        self.assertEqual(session.image_reads, {})
+
+    def test_a_cached_phi_rejection_keeps_warning_on_later_turns(self):
+        """A PHI rejection is cached like any read; without a warning on replay
+        every later turn reported findings present while the film stayed unread."""
+        session, vision = self._session()
+        entry = session.attach_image("data:image/png;base64,AA==", kind="radiograph", deidentified=True)
+        session.seed_image_read(entry["image_id"], {
+            "image_kind": "rejected_phi", "readable": False, "phi_detected": True,
+            "phi_kinds": ["burned_in_name"], "observations": [],
+        })
+        session.send("帮我看看")
+        self.assertEqual(vision.reads, 0)
+        self.assertTrue(any("拒绝判读" in w for w in session.state.warnings),
+                        session.state.warnings)

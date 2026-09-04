@@ -137,8 +137,13 @@ errors, timeouts and budget exhaustion degrade the same way.
 
 ```
 bootstrap(IntakeAgent) → plan → ┌ execute tasks ┐
+                                │  T4 VisionAgent   (only when images attached;
+                                │                    before the interview, so the
+                                │                    findings steer this round's
+                                │                    questions — and usually a
+                                │                    cache hit: the console
+                                │                    pre-reads at upload time)
                                 │  T3 InterviewAgent (every path, urgent too)
-                                │  T4 VisionAgent   (only when images attached)
                                 │  N8 ConsultPanelAgent (opt-in, or LLM-planned)
                                 │               │
                                 └── critic ─────┘  repair_requests & budget.can_loop("repair")
